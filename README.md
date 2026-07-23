@@ -9,8 +9,12 @@ from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via
 
 - **Any yt-dlp source.** Search YouTube and SoundCloud from the sidebar, or paste
   a URL from any of the 1000+ sites yt-dlp supports (Bandcamp, Vimeo, Mixcloud, …).
-- **Audio and video.** An Audio / Video toggle in the search view decides whether
-  a result plays/downloads as audio or as video (video plays in the theater view).
+- **Audio and video, per action.** In the search view: **Play** / **Queue** listen
+  (audio), **Watch** opens the video in the theater, and **Download** opens a format
+  picker that includes Video (MP4). No global mode to set — YouTube results are
+  videos you choose to consume either way, and audio-only sources just have no
+  "Watch". Rows also carry a `ytdlp://` ref, so right-click (Play / Enqueue / Play
+  Next) and drag-to-queue work like any other track.
 - **Hybrid playback.** Tracks stream directly whenever possible (`yt-dlp -g`, with
   the direct URL validated by a tiny range request), falling back to
   download-then-play when a direct stream isn't usable. Switch to **Download then

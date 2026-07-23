@@ -41,7 +41,8 @@ test("registers all expected handlers", async () => {
     "stream:ytdlp-fallback", "streamuri:ytdlp", "streamuri:youtube",
     "uri:ytdlp-download", "meta:ytdlp-download", "qual:ytdlp-download",
     "isearch:ytdlp-download", "iresolve:ytdlp-download",
-    "action:ytdlp-search-submit", "action:ytdlp-play", "action:ytdlp-download",
+    "action:ytdlp-search-submit", "action:ytdlp-play", "action:ytdlp-watch",
+    "action:ytdlp-queue-video", "action:ytdlp-download",
     "action:ytdlp-playback-mode", "action:ytdlp-cache-size",
   ];
   for (const h of expected) assert.ok(api._handlers[h], "missing handler: " + h);
@@ -105,7 +106,8 @@ test("interactive search parses rows into results with encoded ids", async () =>
   assert.equal(results[0].artistName, "Radiohead");
   assert.equal(results[0].durationSecs, 213);
   assert.equal(results[0].id, plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false));
-  assert.equal(results[1].coverUrl, undefined); // "NA" thumbnail -> undefined
+  // Flat search yields no thumbnail ("NA") -> deterministic per-video fallback.
+  assert.equal(results[1].coverUrl, "https://i.ytimg.com/vi/bbbbbbbbbbb/mqdefault.jpg");
 });
 
 // yt-dlp's own metadata (real artist/album/year) is embedded and returned; the
@@ -158,12 +160,59 @@ test("stream resolve skips cleanly when yt-dlp is unavailable", async () => {
   assert.equal(r, null);
 });
 
-test("sidebar play builds tracks with ytdlp:// paths for the selected kind", async () => {
+test("sidebar Play produces an AUDIO track; Watch produces a VIDEO (.mp4) track", async () => {
   const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
-  // Run a search so the view has results to select from.
   await api._handlers["action:ytdlp-search-submit"]({ query: "radiohead" });
-  const audioId = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false);
-  api._handlers["action:ytdlp-play"]({ selectedIds: [audioId] });
+  const url = "https://www.youtube.com/watch?v=aaaaaaaaaaa";
+  const rowId = plugin._encodeRef(url, false); // rows are keyed by the audio ref
+
+  api._handlers["action:ytdlp-play"]({ selectedIds: [rowId] });
   assert.equal(api.calls.playTracks.length, 1);
-  assert.equal(api.calls.playTracks[0].tracks[0].path, audioId);
+  assert.equal(api.calls.playTracks[0].tracks[0].path, plugin._encodeRef(url, false));
+  assert.ok(!api.calls.playTracks[0].tracks[0].path.endsWith(".mp4"));
+
+  api._handlers["action:ytdlp-watch"]({ selectedIds: [rowId] });
+  assert.equal(api.calls.playTracks.length, 2);
+  assert.equal(api.calls.playTracks[1].tracks[0].path, plugin._encodeRef(url, true));
+  assert.ok(api.calls.playTracks[1].tracks[0].path.endsWith(".mp4"));
+});
+
+test("fallback resolver searches YouTube by default", async () => {
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR), fetch: { "direct.example": { status: 200 } } });
+  await api._handlers["stream:ytdlp-fallback"]("Creep", "Radiohead", null, 213);
+  const searched = api.calls.exec.find((c) => c.args.some((a) => typeof a === "string" && a.indexOf("ytsearch") === 0));
+  assert.ok(searched, "default fallback resolver should use ytsearch:");
+});
+
+test("Fallback source setting switches the resolver to SoundCloud", async () => {
+  const { api } = await activated({
+    exec: toolsPresent(BEHAVIOR),
+    fetch: { "direct.example": { status: 200 } },
+    storage: { kv: { resolverSource: "soundcloud" } },
+  });
+  await api._handlers["stream:ytdlp-fallback"]("Creep", "Radiohead", null, 213);
+  const searched = api.calls.exec.find((c) => c.args.some((a) => typeof a === "string" && a.indexOf("scsearch") === 0));
+  assert.ok(searched, "resolver should use scsearch: when Fallback source is SoundCloud");
+});
+
+test("clicking the SoundCloud source tab switches the search backend to scsearch", async () => {
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  // The tabs control sends { tabId }, not { value }.
+  api._handlers["action:ytdlp-source"]({ tabId: "soundcloud" });
+  await api._handlers["action:ytdlp-search-submit"]({ query: "daft punk" });
+  const searched = api.calls.exec.find(
+    (c) => c.args.some((a) => typeof a === "string" && a.indexOf("scsearch") === 0)
+  );
+  assert.ok(searched, "search should use the scsearch: prefix after selecting SoundCloud");
+});
+
+test("sidebar Queue video enqueues a VIDEO (.mp4) track", async () => {
+  const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  await api._handlers["action:ytdlp-search-submit"]({ query: "radiohead" });
+  const url = "https://www.youtube.com/watch?v=aaaaaaaaaaa";
+  const rowId = plugin._encodeRef(url, false);
+  api._handlers["action:ytdlp-queue-video"]({ selectedIds: [rowId] });
+  assert.equal(api.calls.insertTracks.length, 1);
+  assert.equal(api.calls.insertTracks[0].tracks[0].path, plugin._encodeRef(url, true));
+  assert.ok(api.calls.insertTracks[0].tracks[0].path.endsWith(".mp4"));
 });

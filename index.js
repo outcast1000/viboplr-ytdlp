@@ -23,10 +23,10 @@ var statusLoaded = false;
 var cacheMaxMb = 100;
 var playbackMode = "stream"; // "stream" (hybrid) | "download"
 var searchSource = "youtube"; // default source for the sidebar view + modal search
+var resolverSource = "youtube"; // site the metadata fallback resolver searches (Spotify/library-miss playback + downloads)
 
 // Sidebar search view state.
 var searchQuery = "";
-var searchKind = "audio"; // "audio" | "video" — what Play/Queue/Download produce
 var searchResults = null; // array of candidates, or null before first search
 var searching = false;
 // Bumped on every search start AND on cancel; an in-flight search compares its
@@ -123,6 +123,25 @@ function decodeRef(id) {
 var YT_ID_RE = /^[A-Za-z0-9_-]{11}$/;
 function youtubeWatchUrl(id) { return "https://www.youtube.com/watch?v=" + id; }
 
+// Extract the 11-char YouTube video id from a watch / youtu.be / shorts URL, else null.
+function ytVideoId(url) {
+  if (!url) return null;
+  var m = url.match(/[?&]v=([A-Za-z0-9_-]{11})/) ||
+    url.match(/youtu\.be\/([A-Za-z0-9_-]{11})/) ||
+    url.match(/\/shorts\/([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
+// Best thumbnail for a search candidate. Flat-playlist search returns no
+// thumbnail (%(thumbnail)s == "NA"), and if we pass none the host falls back to
+// name-based artwork (the ARTIST image, not the video). So prefer yt-dlp's
+// thumbnail when present, else a deterministic per-VIDEO YouTube thumbnail.
+function thumbFor(url, ytThumb) {
+  if (isHttpUrl(ytThumb)) return ytThumb;
+  var id = ytVideoId(url);
+  return id ? "https://i.ytimg.com/vi/" + id + "/mqdefault.jpg" : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Title parsing (best-effort "Artist - Song")
 // ---------------------------------------------------------------------------
@@ -172,7 +191,7 @@ function buildTrack(c, isVideo) {
     artist_name: parsed.artist || c.uploader || null,
     duration_secs: c.durationSecs != null ? c.durationSecs : null,
     path: encodeRef(c.url, isVideo),
-    image_url: c.thumbnail || undefined
+    image_url: thumbFor(c.url, c.thumbnail)
   };
 }
 
@@ -271,7 +290,21 @@ async function runSearch(api, source, query, count) {
     var thumb = cols[4] && cols[4] !== "NA" && isHttpUrl(cols[4]) ? cols[4] : null;
     out.push({ url: url, title: title, uploader: uploader, durationSecs: isNaN(dur) ? null : dur, thumbnail: thumb });
   }
-  return out;
+  return dropSoundcloudPreviews(out, source, isHttpUrl(q), api);
+}
+
+// SoundCloud Go+/paid tracks expose only a 30s preview without auth. Real tracks
+// are rarely exactly ~30s, so treat a ~30s SoundCloud result as an "obvious
+// preview" and drop it — but never for a directly pasted URL (there the user
+// asked for that exact item).
+function isPreviewDuration(d) { return d != null && d >= 29 && d <= 31; }
+function dropSoundcloudPreviews(candidates, source, isUrlPaste, api) {
+  if (source !== "soundcloud" || isUrlPaste) return candidates;
+  var kept = candidates.filter(function (c) { return !isPreviewDuration(c.durationSecs); });
+  if (api && kept.length < candidates.length) {
+    api.log("info", "Hid " + (candidates.length - kept.length) + " SoundCloud preview(s) (~30s)", "ytdlp");
+  }
+  return kept;
 }
 
 // Pick the best candidate for a known target duration (fallback resolver path):
@@ -295,7 +328,10 @@ function pickBestCandidate(candidates, durationSecs, api) {
 
 async function searchByMetadata(api, title, artistName, durationSecs) {
   var query = artistName ? title + " " + artistName : title;
-  var candidates = await runSearch(api, "youtube", query, 7);
+  // Uses the configurable fallback source (YouTube by default) — this is what
+  // resolves tracks that have no direct source of their own (e.g. from Spotify,
+  // or a library track missing locally), for both playback and download.
+  var candidates = await runSearch(api, resolverSource, query, 7);
   return pickBestCandidate(candidates, durationSecs, api);
 }
 
@@ -583,11 +619,13 @@ async function activate(api) {
   var stored = await Promise.all([
     api.storage.get("cacheMaxMb"),
     api.storage.get("playbackMode"),
-    api.storage.get("searchSource")
+    api.storage.get("searchSource"),
+    api.storage.get("resolverSource")
   ]);
   if (stored[0] != null && typeof stored[0] === "number") cacheMaxMb = stored[0];
   if (stored[1] === "download" || stored[1] === "stream") playbackMode = stored[1];
   if (stored[2] && SOURCES[stored[2]]) searchSource = stored[2];
+  if (stored[3] && SOURCES[stored[3]]) resolverSource = stored[3];
 
   // Startup cleanup: wipe transcoded temp files; keep cached source downloads.
   scheduleCleanup(api, true).catch(function (e) { api.log("warn", "Startup cache cleanup failed: " + (e && e.message ? e.message : e), "ytdlp"); });
@@ -701,7 +739,7 @@ async function activate(api) {
         title: parsed.title || c.title || c.url,
         artistName: parsed.artist || c.uploader || undefined,
         durationSecs: c.durationSecs != null ? c.durationSecs : undefined,
-        coverUrl: c.thumbnail || undefined
+        coverUrl: thumbFor(c.url, c.thumbnail)
       });
     }
     return out;
@@ -728,12 +766,9 @@ async function activate(api) {
 
   // ---- Sidebar search view ----
   api.ui.onAction("ytdlp-source", function (data) {
-    var s = data && data.value;
+    // The `tabs` control dispatches { tabId }, not { value } (that's `select`).
+    var s = data && (data.tabId || data.value);
     if (s && SOURCES[s]) { searchSource = s; api.storage.set("searchSource", s); renderSearchView(api); }
-  });
-  api.ui.onAction("ytdlp-kind", function (data) {
-    var k = data && data.value;
-    if (k === "audio" || k === "video") { searchKind = k; renderSearchView(api); }
   });
 
   api.ui.onAction("ytdlp-search-submit", async function (data) {
@@ -771,33 +806,51 @@ async function activate(api) {
     return out;
   }
 
+  // Play / Queue / row-click all default to AUDIO (this is a music app). "Watch"
+  // is the explicit per-selection video action (theater view). Downloads are
+  // audio by default too — the download modal's quality picker offers Video (MP4)
+  // for anyone who wants the video file, so no separate video-download action.
   api.ui.onAction("ytdlp-play", function (data) {
     var chosen = selectedResults(data);
     if (chosen.length === 0 || !ytDlpVersion) return;
-    var isVideo = searchKind === "video", tracks = [];
-    for (var i = 0; i < chosen.length; i++) tracks.push(buildTrack(chosen[i], isVideo));
+    var tracks = [];
+    for (var i = 0; i < chosen.length; i++) tracks.push(buildTrack(chosen[i], false));
     api.playback.playTracks(tracks, 0);
   });
   api.ui.onAction("ytdlp-queue", function (data) {
     var chosen = selectedResults(data);
     if (chosen.length === 0 || !ytDlpVersion) return;
-    var isVideo = searchKind === "video", tracks = [];
-    for (var i = 0; i < chosen.length; i++) tracks.push(buildTrack(chosen[i], isVideo));
+    var tracks = [];
+    for (var i = 0; i < chosen.length; i++) tracks.push(buildTrack(chosen[i], false));
+    api.playback.insertTracks(tracks, -1);
+  });
+  api.ui.onAction("ytdlp-watch", function (data) {
+    var chosen = selectedResults(data);
+    if (chosen.length === 0 || !ytDlpVersion) return;
+    var tracks = [];
+    for (var i = 0; i < chosen.length; i++) tracks.push(buildTrack(chosen[i], true));
+    api.playback.playTracks(tracks, 0);
+  });
+  api.ui.onAction("ytdlp-queue-video", function (data) {
+    var chosen = selectedResults(data);
+    if (chosen.length === 0 || !ytDlpVersion) return;
+    var tracks = [];
+    for (var i = 0; i < chosen.length; i++) tracks.push(buildTrack(chosen[i], true));
     api.playback.insertTracks(tracks, -1);
   });
   api.ui.onAction("ytdlp-play-one", function (data) {
     var id = data && data.itemId;
     if (!id || !ytDlpVersion) return;
     var c = findResult(id);
-    if (c) api.playback.playTracks([buildTrack(c, searchKind === "video")], 0);
+    if (c) api.playback.playTracks([buildTrack(c, false)], 0);
   });
   api.ui.onAction("ytdlp-download", function (data) {
     var chosen = selectedResults(data);
     if (chosen.length === 0) return;
     if (!ytDlpVersion) { api.ui.showNotification("yt-dlp isn't installed — see Settings → Dependencies."); return; }
-    var isVideo = searchKind === "video", tracks = [];
+    var tracks = [];
     for (var i = 0; i < chosen.length; i++) {
-      var t = buildTrack(chosen[i], isVideo);
+      var t = buildTrack(chosen[i], false); // audio ref; modal offers Video (MP4)
       tracks.push({ title: t.title, artist_name: t.artist_name, album_title: null, uri: t.path, durationSecs: t.duration_secs });
     }
     api.ui.requestAction("download-tracks", { providerId: "ytdlp:ytdlp-download", providerName: "yt-dlp", tracks: tracks });
@@ -814,6 +867,11 @@ async function activate(api) {
     var v = data && data.value;
     if (v !== "stream" && v !== "download") return;
     playbackMode = v; await api.storage.set("playbackMode", v); renderSettings(api);
+  });
+  api.ui.onAction("ytdlp-resolver-source", async function (data) {
+    var v = data && data.value;
+    if (!v || !SOURCES[v]) return;
+    resolverSource = v; await api.storage.set("resolverSource", v); renderSettings(api);
   });
 
   renderSettings(api);
@@ -847,11 +905,6 @@ function renderSearchView(api) {
   }
   children.push({ type: "tabs", tabs: sourceTabs, activeTab: searchSource, action: "ytdlp-source" });
 
-  // Audio / Video kind toggle.
-  children.push({ type: "tabs", tabs: [
-    { id: "audio", label: "Audio" }, { id: "video", label: "Video" }
-  ], activeTab: searchKind, action: "ytdlp-kind" });
-
   children.push({
     type: "search-input",
     placeholder: "Search " + (SOURCES[searchSource] ? SOURCES[searchSource].label : "") + ", or paste a URL…",
@@ -866,13 +919,20 @@ function renderSearchView(api) {
     var items = [];
     for (var j = 0; j < searchResults.length; j++) {
       var c = searchResults[j], parsed = parseTrackTitle(c.title, c.uploader);
+      var artist = parsed.artist || c.uploader || "";
       items.push({
         id: encodeRef(c.url, false),
         title: parsed.title || c.title || c.url,
-        subtitle: parsed.artist || c.uploader || "",
+        subtitle: artist,
         duration: formatDuration(c.durationSecs),
-        imageUrl: c.thumbnail || undefined,
-        action: "ytdlp-play-one"
+        imageUrl: thumbFor(c.url, c.thumbnail),
+        action: "ytdlp-play-one",
+        // Carry the audio ref + metadata so the host builds a native right-click
+        // menu (Play / Enqueue / Play Next), resolves artwork by name, and allows
+        // drag-to-queue — all without a DB id.
+        path: encodeRef(c.url, false),
+        artistName: artist || null,
+        durationSecs: c.durationSecs != null ? c.durationSecs : null
       });
     }
     children.push({
@@ -882,16 +942,18 @@ function renderSearchView(api) {
       actions: [
         { id: "ytdlp-play", label: "Play", icon: "▶" },
         { id: "ytdlp-queue", label: "Queue", icon: "+" },
+        { id: "ytdlp-watch", label: "Watch", icon: "🎬" },
+        { id: "ytdlp-queue-video", label: "Queue video", icon: "📼" },
         { id: "ytdlp-download", label: "Download", icon: "⬇" }
       ]
     });
   } else if (searchResults && searchResults.length === 0) {
     children.push({ type: "text", content: "No results.", className: "ds-empty" });
   } else {
-    children.push({ type: "text", content: "Search or paste a link to play or download " + searchKind + ".", className: "ds-empty" });
+    children.push({ type: "text", content: "Search or paste a link. Play/Queue listen as audio; Watch opens the video; Download lets you pick the format (incl. MP4).", className: "ds-empty" });
   }
 
-  api.ui.setViewData("ytdlp-search", { type: "layout", direction: "vertical", children: children }, { scrollKey: searchSource + ":" + searchKind });
+  api.ui.setViewData("ytdlp-search", { type: "layout", direction: "vertical", children: children }, { scrollKey: searchSource });
 }
 
 function renderSettings(api) {
@@ -909,6 +971,20 @@ function renderSettings(api) {
             options: [
               { value: "stream", label: "Stream (hybrid)" },
               { value: "download", label: "Download then play" }
+            ]
+          }
+        }]
+      },
+      {
+        type: "section", title: "Fallback resolver", children: [{
+          type: "settings-row",
+          label: "Search source",
+          description: "Where to find a track that has no direct source of its own — e.g. a track played from Spotify, or a library track missing on disk. Used for both playback and download.",
+          control: {
+            type: "select", action: "ytdlp-resolver-source", value: resolverSource,
+            options: [
+              { value: "youtube", label: "YouTube (recommended)" },
+              { value: "soundcloud", label: "SoundCloud" }
             ]
           }
         }]
@@ -952,5 +1028,7 @@ return {
   _cacheStem: cacheStem,
   _buildDownloadArgs: buildDownloadArgs,
   _parseMetadataLine: parseMetadataLine,
+  _thumbFor: thumbFor,
+  _dropSoundcloudPreviews: dropSoundcloudPreviews,
   _loadToolStatus: loadToolStatus
 };
