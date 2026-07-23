@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.2.0
+- **Stream mode no longer falls back to downloading.** A direct-stream failure now
+  fails cleanly instead of downloading the whole file first — that fallback was
+  slow and couldn't fix a codec the player can't decode (that's the mpv engine's
+  job). Use "Download then play" for a guaranteed local copy.
+- Fixed a crash where the (now-removed) fallback / download mode could pass an
+  invalid `-P null` output dir to yt-dlp when the cache path was unavailable.
+
 ## v1.1.0
 - Honor the host's **"Prefer video"** hint (Settings → Playback): when set, the
   fallback resolver returns the music **video** stream and flags it so the host

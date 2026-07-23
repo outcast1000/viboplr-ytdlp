@@ -71,11 +71,13 @@ test("stream URI resolve returns a validated direct URL in stream mode", async (
   assert.equal(url, DIRECT_URL);
 });
 
-test("stream URI resolve falls back to download when the direct URL fails validation", async () => {
+test("stream mode fails cleanly (null) when the direct URL fails validation — no download fallback", async () => {
   const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR), fetch: { "direct.example": { status: 403 } } });
   const id = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
   const url = await api._handlers["streamuri:ytdlp"](id);
-  assert.equal(url, "file:///mock-plugin-data/cache/abc.m4a");
+  assert.equal(url, null);
+  // It must NOT have attempted a download (no after_move:filepath command).
+  assert.ok(!api.calls.exec.some((c) => c.args.includes("after_move:filepath")));
 });
 
 test("download mode skips -g and downloads directly", async () => {

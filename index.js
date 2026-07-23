@@ -516,6 +516,7 @@ async function downloadToCache(api, url, isVideo) {
   if (cached) { api.log("info", "Using cached download: " + cached, "ytdlp"); return cached; }
 
   var cacheDir = await api.storage.files.getPath(["cache"]);
+  if (!cacheDir) { api.log("error", "Cache dir unavailable — cannot download", "ytdlp"); return null; }
   var args;
   if (isVideo) {
     args = ["-f", "bestvideo*+bestaudio/best", "--merge-output-format", "mp4"];
@@ -565,8 +566,13 @@ async function withCacheProtection(api, filePath, work) {
   }
 }
 
-// Resolve a source URL to a PLAYABLE url per the hybrid policy. Returns
-// { url, downloaded } or null. `downloaded` marks a file:// result.
+// Resolve a source URL to a PLAYABLE url. Returns { url, downloaded } or null.
+//
+// "stream" mode returns a direct URL only — it does NOT fall back to downloading
+// on failure. A download of the same source doesn't fix a codec the engine can't
+// play (that's the mpv engine's job), and downloading the whole file first is
+// slow; so a direct-stream failure fails cleanly and the host surfaces an error.
+// Users who want the reliability of a local copy pick "Download then play".
 async function resolvePlayable(api, url, isVideo) {
   if (playbackMode === "stream") {
     var direct = await getDirectUrl(api, url, isVideo);
@@ -574,8 +580,10 @@ async function resolvePlayable(api, url, isVideo) {
       api.log("info", "Streaming directly: " + url, "ytdlp");
       return { url: direct, downloaded: false };
     }
-    api.log("info", "Direct stream unavailable — falling back to download: " + url, "ytdlp");
+    api.log("warn", "Direct stream unavailable: " + url, "ytdlp");
+    return null;
   }
+  // "download" mode: fetch a local copy (browser-friendly m4a / merged mp4).
   var filePath = await downloadToCache(api, url, isVideo);
   if (!filePath) return null;
   return { url: "file://" + filePath, downloaded: true, filePath: filePath };
