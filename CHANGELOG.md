@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.1.0
+- Honor the host's **"Prefer video"** hint (Settings → Playback): when set, the
+  fallback resolver returns the music **video** stream and flags it so the host
+  plays it in the theater — so a Spotify (or other metadata-only) playlist can be
+  watched as clips. Falls back to audio when no video is available, and is a
+  no-op on hosts without the hint (backward-compatible).
+
 ## v1.0.0
 - Initial release. Successor to the YouTube plugin.
 - Play and download **audio and video** from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other yt-dlp-supported sites.

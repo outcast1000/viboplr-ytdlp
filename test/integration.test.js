@@ -184,6 +184,22 @@ test("fallback resolver searches YouTube by default", async () => {
   assert.ok(searched, "default fallback resolver should use ytsearch:");
 });
 
+test("prefer-video hint → fallback resolver returns a video stream flagged video:true", async () => {
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR), fetch: { "direct.example": { status: 200 } } });
+  const r = await api._handlers["stream:ytdlp-fallback"]("Creep", "Radiohead", null, 213, { preferVideo: true });
+  assert.equal(r.video, true);
+  assert.equal(r.url, DIRECT_URL);
+  // Used the video (muxed) format selector, not bestaudio.
+  assert.ok(api.calls.exec.some((c) => c.args.includes("-g") && c.args.join(" ").includes("best[ext=mp4]/best")));
+});
+
+test("no hint → fallback resolver returns audio (no video flag)", async () => {
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR), fetch: { "direct.example": { status: 200 } } });
+  const r = await api._handlers["stream:ytdlp-fallback"]("Creep", "Radiohead", null, 213);
+  assert.equal(r.url, DIRECT_URL);
+  assert.ok(!r.video);
+});
+
 test("Fallback source setting switches the resolver to SoundCloud", async () => {
   const { api } = await activated({
     exec: toolsPresent(BEHAVIOR),

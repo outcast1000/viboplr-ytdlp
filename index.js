@@ -631,13 +631,23 @@ async function activate(api) {
   scheduleCleanup(api, true).catch(function (e) { api.log("warn", "Startup cache cleanup failed: " + (e && e.message ? e.message : e), "ytdlp"); });
 
   // ---- Playback: metadata fallback resolver (the "youtube-fallback" role) ----
-  api.playback.onStreamResolve("ytdlp-fallback", async function (title, artistName, albumName, durationSecs) {
+  // Honors the host's advisory `preferVideo` hint: when set, resolve a video
+  // stream and flag the result `video: true` so the host plays it in the theater;
+  // fall back to audio when no video is available. Without the hint (or on
+  // fallback) it returns audio exactly as before.
+  api.playback.onStreamResolve("ytdlp-fallback", async function (title, artistName, albumName, durationSecs, opts) {
     await ensureToolStatus(api);
     if (!ytDlpVersion) { api.log("warn", "Stream resolve skipped — yt-dlp not available", "ytdlp"); return null; }
     title = stripRemasterSuffix(title);
+    var preferVideo = !!(opts && opts.preferVideo);
     try {
       var cand = await searchByMetadata(api, title, artistName, durationSecs);
       if (!cand) { api.log("warn", "No match for: " + title, "ytdlp"); return null; }
+      if (preferVideo) {
+        var vid = await resolvePlayable(api, cand.url, true);
+        if (vid) return { url: vid.url, label: "yt-dlp (video)", sourceUrl: cand.url, video: true };
+        api.log("warn", "No video stream — falling back to audio: " + cand.url, "ytdlp");
+      }
       var playable = await resolvePlayable(api, cand.url, false);
       if (!playable) return null;
       return { url: playable.url, label: "yt-dlp", sourceUrl: cand.url };
