@@ -300,47 +300,94 @@ async function searchByMetadata(api, title, artistName, durationSecs) {
 }
 
 // ---------------------------------------------------------------------------
-// Format probing + conversion (audio) — mirrors the proven youtube path
+// Downloads — yt-dlp does the transcode AND embeds tags + cover art
 // ---------------------------------------------------------------------------
-var AUDIO_FORMATS = {
-  aac:  { ext: "m4a",  encoder: "aac",        copyCodecs: ["aac"] },
-  m4a:  { ext: "m4a",  encoder: "aac",        copyCodecs: ["aac"] },
-  mp3:  { ext: "mp3",  encoder: "libmp3lame", copyCodecs: ["mp3"] },
-  flac: { ext: "flac", encoder: "flac",       copyCodecs: ["flac"] },
-  opus: { ext: "opus", encoder: "libopus",    copyCodecs: ["opus"] }
-};
+// Audio formats offered as a RE-ENCODE (yt-dlp `-x --audio-format`). "original"
+// keeps the source stream verbatim (best quality) and is not listed here.
+var TRANSCODE_FORMATS = { aac: 1, mp3: 1, opus: 1, flac: 1 };
 
-async function probeAudio(api, filePath) {
-  try {
-    var probe = await api.system.exec("ffmpeg", ["-i", filePath, "-hide_banner"]);
-    var stderr = probe.stderr || "", lines = stderr.split("\n"), streamLine = null;
-    for (var i = 0; i < lines.length; i++) {
-      if (lines[i].indexOf("Audio:") !== -1) { streamLine = lines[i]; break; }
-    }
-    if (!streamLine) return null;
-    var codecMatch = streamLine.match(/Audio:\s*([a-zA-Z0-9_]+)/);
-    var brMatch = streamLine.match(/(\d+)\s*kb\/s/);
-    return {
-      codec: codecMatch ? codecMatch[1].toLowerCase() : null,
-      bitrateKbps: brMatch ? parseInt(brMatch[1], 10) : null
-    };
-  } catch (e) {
-    api.log("warn", "probeAudio failed: " + (e && e.message ? e.message : e), "ytdlp");
-    return null;
-  }
+// Metadata --print template: first non-null of each comma group wins.
+// track/title | artist/creator/uploader | album | release_year | title
+var META_PRINT = "%(track,title)s\t%(artist,creator,uploader)s\t%(album)s\t%(release_year)s\t%(title)s";
+
+// Parse a META_PRINT line into { title?, artist?, album?, year? }. Pure.
+function parseMetadataLine(line) {
+  var cols = (line || "").split("\t");
+  function clean(v) { return v && v !== "NA" ? v.trim() : ""; }
+  var meta = {};
+  var title = clean(cols[0]) || clean(cols[4]);
+  if (title) meta.title = title;
+  if (clean(cols[1])) meta.artist = clean(cols[1]);
+  if (clean(cols[2])) meta.album = clean(cols[2]);
+  var yearStr = clean(cols[3]);
+  if (/^\d{4}$/.test(yearStr)) meta.year = parseInt(yearStr, 10);
+  return meta;
 }
 
-function buildConvertArgs(srcPath, destPath, fmt, probe) {
-  var spec = AUDIO_FORMATS[fmt];
-  if (!spec) return null;
-  var codec = probe ? probe.codec : null;
-  if (codec && spec.copyCodecs.indexOf(codec) !== -1) {
-    return { mode: "copy", args: ["-i", srcPath, "-vn", "-c:a", "copy", "-y", destPath] };
+// Pure builder for the download argv. opts: { url, video?, audioFormat? } where
+// audioFormat is a TRANSCODE_FORMATS key (re-encode) or falsy (keep the source
+// codec = "original"). `embed` (= ffmpeg available) adds tag + cover embedding
+// AND enables lossless audio extraction.
+//
+// "original" uses `-x --audio-format best`: ffmpeg *copies* the source codec
+// (no re-encode) into a taggable, non-webm container (opus→ogg, aac→m4a,
+// flac→flac). This is deliberate — a raw bestaudio download is Opus-in-webm,
+// and the HOST re-encodes any .webm to lossy AAC, so we must hand it a non-webm
+// container to preserve quality. Without ffmpeg we can't extract, so we fall
+// back to a raw bestaudio download (may be webm; the host handles it degraded).
+function buildDownloadArgs(opts, outDir, seq, embed) {
+  var args;
+  if (opts.video) {
+    args = ["-f", "bestvideo*+bestaudio/best", "--merge-output-format", "mp4"];
+  } else if (opts.audioFormat) {
+    args = ["-x", "--audio-format", opts.audioFormat, "--audio-quality", "0"];
+  } else if (embed) {
+    args = ["-x", "--audio-format", "best"];
+  } else {
+    args = ["-f", "bestaudio/best"];
   }
-  if (spec.encoder === "flac") return { mode: "encode", args: ["-i", srcPath, "-vn", "-c:a", "flac", "-y", destPath] };
-  var bitrateKbps = probe && probe.bitrateKbps ? probe.bitrateKbps : 160;
-  var targetKbps = Math.max(96, Math.min(320, bitrateKbps));
-  return { mode: "encode", bitrate: targetKbps, args: ["-i", srcPath, "-vn", "-c:a", spec.encoder, "-b:a", targetKbps + "k", "-y", destPath] };
+  if (embed) args = args.concat(["--embed-metadata", "--embed-thumbnail"]);
+  return args.concat([
+    "--no-warnings", "--quiet", "--no-simulate", "--no-playlist",
+    "--print", "after_move:filepath",
+    "-P", outDir, "-o", "dl." + seq + ".%(ext)s", opts.url
+  ]);
+}
+
+// Fetch the rich metadata yt-dlp knows about the source (artist/album/year).
+async function fetchMetadata(api, url) {
+  try {
+    var res = await api.system.exec("yt-dlp", ["--skip-download", "--no-warnings", "--no-playlist", "--print", META_PRINT, url], { cwd: null });
+    if (res.exitCode !== 0 || !res.stdout) return {};
+    return parseMetadataLine(res.stdout.split("\n")[0]);
+  } catch (e) { api.log("warn", "metadata fetch failed: " + (e && e.message ? e.message : e), "ytdlp"); return {}; }
+}
+
+// Download to the temp dir with tags + cover embedded; returns the file path or null.
+async function downloadForDownload(api, url, opts) {
+  var outDir = await api.storage.files.getPath(["temp"]);
+  var args = buildDownloadArgs({ url: url, video: opts.video, audioFormat: opts.audioFormat }, outDir, convSeq++, !!ffmpegVersion);
+  api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
+  var filePath = null;
+  try {
+    var res = await api.system.exec("yt-dlp", args, { cwd: null });
+    if (res.exitCode !== 0) {
+      api.log("error", "yt-dlp download failed (exit " + res.exitCode + "): " + (res.stderr || "").trim(), "ytdlp");
+      await logDownloadDiagnostics(api, url);
+      return null;
+    }
+    filePath = res.stdout ? res.stdout.trim() || null : null;
+  } catch (e) {
+    api.log("error", "yt-dlp download exec failed: " + (e && e.message ? e.message : e), "ytdlp");
+    return null;
+  }
+  if (!filePath) {
+    api.log("warn", "yt-dlp returned no file path — likely SABR/PO-token", "ytdlp");
+    await logDownloadDiagnostics(api, url);
+    return null;
+  }
+  api.log("info", "Downloaded to: " + filePath, "ytdlp");
+  return filePath;
 }
 
 // ---------------------------------------------------------------------------
@@ -499,60 +546,33 @@ async function resolvePlayable(api, url, isVideo) {
 }
 
 // Produce the host download-resolve result for a source URL + chosen format.
-// "original" / "video" → fast direct URL (backend downloads, no transcode/merge
-// needed for muxed video is the exception — video always downloads+merges).
-async function resolveDownload(api, url, format, title, artistName, albumName) {
+// Always downloads locally so yt-dlp can embed tags + cover art (using its rich
+// metadata) into a correctly-named file. `caller` carries any AUTHORITATIVE
+// metadata the host already has (e.g. a library track's real title/artist/album),
+// which overrides yt-dlp's guesses; when absent, yt-dlp's own metadata is used.
+async function resolveDownload(api, url, format, caller) {
   var fmt = format || "original";
-
-  // Video: always download+merge locally to a real mp4, then serve file://.
-  if (fmt === "video") {
-    if (!ffmpegVersion) api.log("warn", "ffmpeg missing — video merge may fail", "ytdlp");
-    var vPath = await downloadToCache(api, url, true);
-    if (!vPath) return null;
-    return await withCacheProtection(api, vPath, function () {
-      return { url: "file://" + vPath, headers: null, ext: extOf(vPath) || "mp4",
-        metadata: { title: title, artist: artistName || undefined, album: albumName || undefined } };
-    });
+  var isVideo = fmt === "video";
+  var audioFormat = null;
+  if (!isVideo && TRANSCODE_FORMATS[fmt]) {
+    if (ffmpegVersion) audioFormat = fmt;
+    else api.log("warn", "ffmpeg missing — downloading original audio instead of " + fmt, "ytdlp");
   }
 
-  // Original audio (no transcode): hand the backend a direct URL to stream to
-  // disk. ext:"auto" makes it sniff the true container. Sidesteps resolve caps.
-  if (fmt === "original" || !AUDIO_FORMATS[fmt] || !ffmpegVersion) {
-    if (fmt !== "original" && !ffmpegVersion) api.log("warn", "ffmpeg missing — serving original audio instead of " + fmt, "ytdlp");
-    var direct = await getDirectUrl(api, url, false);
-    if (direct) {
-      return { url: direct, headers: null, ext: "auto",
-        metadata: { title: title, artist: artistName || undefined, album: albumName || undefined } };
-    }
-    // Fall through to a local download if -g failed.
-    var aPath0 = await downloadToCache(api, url, false);
-    if (!aPath0) return null;
-    return await withCacheProtection(api, aPath0, function () {
-      return { url: "file://" + aPath0, headers: null, ext: extOf(aPath0) || "auto",
-        metadata: { title: title, artist: artistName || undefined, album: albumName || undefined } };
-    });
-  }
+  // Rich metadata from yt-dlp (artist/album/year), then caller-supplied fields win.
+  var meta = await fetchMetadata(api, url);
+  var md = {};
+  md.title = (caller && caller.title) || meta.title || url;
+  var artist = (caller && caller.artist) || meta.artist;
+  if (artist) md.artist = artist;
+  var album = (caller && caller.album) || meta.album;
+  if (album) md.album = album;
+  if (meta.year) md.year = meta.year;
 
-  // Transcoded audio (aac/mp3/flac/opus): download source, convert with ffmpeg.
-  var srcPath = await downloadToCache(api, url, false);
-  if (!srcPath) return null;
-  return await withCacheProtection(api, srcPath, async function () {
-    var spec = AUDIO_FORMATS[fmt];
-    var srcExt = extOf(srcPath);
-    var probe = await probeAudio(api, srcPath);
-    var destName = cacheStem(url, false) + "." + (convSeq++) + "." + spec.ext;
-    var destPath = await api.storage.files.writeText(["temp", destName], "");
-    var conv = buildConvertArgs(srcPath, destPath, fmt, probe);
-    var finalPath = srcPath;
-    if (conv && !(conv.mode === "copy" && srcExt === spec.ext)) {
-      var label = conv.mode === "copy" ? "Remuxing (codec copy)" : "Transcoding to " + fmt + (conv.bitrate ? " @ " + conv.bitrate + "k" : "");
-      api.log("info", label + " -> " + destPath, "ytdlp");
-      var ff = await api.system.exec("ffmpeg", conv.args);
-      if (ff.exitCode === 0) finalPath = destPath;
-      else api.log("error", "Conversion failed (exit " + ff.exitCode + "): " + (ff.stderr || "").trim() + " — serving source", "ytdlp");
-    }
-    return { url: "file://" + finalPath, headers: null, ext: extOf(finalPath) || undefined,
-      metadata: { title: title, artist: artistName || undefined, album: albumName || undefined } };
+  var filePath = await downloadForDownload(api, url, { video: isVideo, audioFormat: audioFormat });
+  if (!filePath) return null;
+  return await withCacheProtection(api, filePath, function () {
+    return { url: "file://" + filePath, headers: null, ext: extOf(filePath) || undefined, metadata: md };
   });
 }
 
@@ -620,13 +640,19 @@ async function activate(api) {
 
   // ---- Download provider: qualities ----
   api.downloads.onGetQualities("ytdlp-download", function () {
-    var q = [{ value: "original", label: "Original audio (no re-encode)" }];
+    // "Original" keeps the source stream verbatim — the best quality and the
+    // right default. Lossy sources (YouTube tops out at Opus ~160k / AAC ~128k)
+    // have no lossless master to recover, so the re-encode options are only for
+    // users who want a uniform library format. FLAC in particular does NOT
+    // improve quality: it wraps already-lossy audio in a lossless container
+    // (much larger file, zero quality gain).
+    var q = [{ value: "original", label: "Original — best quality, no re-encode" }];
     if (ffmpegVersion) {
-      q.push({ value: "aac", label: "AAC (matches source bitrate)" });
-      q.push({ value: "mp3", label: "MP3 (matches source bitrate)" });
-      q.push({ value: "opus", label: "Opus (matches source bitrate)" });
-      q.push({ value: "flac", label: "FLAC (lossless re-encode)" });
-      q.push({ value: "video", label: "Video (MP4, best quality)" });
+      q.push({ value: "opus", label: "Opus (re-encode)" });
+      q.push({ value: "aac", label: "AAC (re-encode)" });
+      q.push({ value: "mp3", label: "MP3 (re-encode)" });
+      q.push({ value: "flac", label: "FLAC (lossless container of lossy audio — larger, no quality gain)" });
+      q.push({ value: "video", label: "Video (MP4)" });
     }
     return q;
   });
@@ -635,7 +661,7 @@ async function activate(api) {
   api.downloads.onResolveByUri("ytdlp-download", async function (uri, format) {
     await ensureToolStatus(api);
     if (!ytDlpVersion) return null;
-    var url = null, videoTitle = null;
+    var url = null;
     if (uri && uri.indexOf("ytdlp://") === 0) {
       var ref = decodeRef(uri.substring("ytdlp://".length));
       if (ref) { url = ref.url; if (ref.isVideo && !format) format = "video"; }
@@ -644,7 +670,8 @@ async function activate(api) {
       if (YT_ID_RE.test(yid)) url = youtubeWatchUrl(yid);
     }
     if (!url) { api.log("warn", "Download URI resolve: unrecognized uri " + uri, "ytdlp"); return null; }
-    try { return await resolveDownload(api, url, format, videoTitle || url, null, null); }
+    // No authoritative caller metadata for a bare URI — use yt-dlp's own (best).
+    try { return await resolveDownload(api, url, format, null); }
     catch (e) { console.error("[ytdlp] download URI resolve failed:", e, e.stack || ""); return null; }
   });
 
@@ -656,7 +683,8 @@ async function activate(api) {
     try {
       var cand = await searchByMetadata(api, title, artistName, durationSecs);
       if (!cand) return null;
-      return await resolveDownload(api, cand.url, format, title, artistName, albumName);
+      // The host's metadata is authoritative here (a real library track).
+      return await resolveDownload(api, cand.url, format, { title: title, artist: artistName, album: albumName });
     } catch (e) { console.error("[ytdlp] download resolve failed:", e, e.stack || ""); return null; }
   });
 
@@ -693,7 +721,7 @@ async function activate(api) {
       url = matchId;
     }
     if (!url) throw new Error("Invalid yt-dlp match id: " + matchId);
-    var result = await resolveDownload(api, url, format, url, null, null);
+    var result = await resolveDownload(api, url, format, null);
     if (!result) throw new Error("Failed to download " + url);
     return result;
   });
@@ -922,6 +950,7 @@ return {
   _encodeRef: encodeRef,
   _decodeRef: decodeRef,
   _cacheStem: cacheStem,
-  _buildConvertArgs: buildConvertArgs,
+  _buildDownloadArgs: buildDownloadArgs,
+  _parseMetadataLine: parseMetadataLine,
   _loadToolStatus: loadToolStatus
 };

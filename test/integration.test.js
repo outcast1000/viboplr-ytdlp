@@ -108,12 +108,48 @@ test("interactive search parses rows into results with encoded ids", async () =>
   assert.equal(results[1].coverUrl, undefined); // "NA" thumbnail -> undefined
 });
 
-test("metadata download resolve of 'original' returns a direct URL with ext auto", async () => {
-  const { api } = await activated({ exec: toolsPresent(BEHAVIOR), fetch: { "direct.example": { status: 200 } } });
+// yt-dlp's own metadata (real artist/album/year) is embedded and returned; the
+// caller's authoritative fields (title/artist) win over yt-dlp's guesses.
+const META_STDOUT = "Creep\tRadiohead\tPablo Honey\t1992\tCreep";
+function withMeta(extra) {
+  return [
+    ...BEHAVIOR,
+    { match: { cmd: "yt-dlp", argsInclude: ["--skip-download"] }, result: { exitCode: 0, stdout: META_STDOUT } },
+    ...(extra || []),
+  ];
+}
+
+test("'original' downloads locally, embeds tags+cover, returns a file with real metadata", async () => {
+  const { api } = await activated({ exec: toolsPresent(withMeta()) });
   const result = await api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original");
-  assert.equal(result.url, DIRECT_URL);
-  assert.equal(result.ext, "auto");
-  assert.equal(result.metadata.title, "Creep");
+  assert.ok(result.url.startsWith("file://"));
+  assert.equal(result.metadata.title, "Creep");     // caller-authoritative
+  assert.equal(result.metadata.artist, "Radiohead"); // caller-authoritative
+  assert.equal(result.metadata.album, "Pablo Honey"); // from yt-dlp (caller album was null)
+  assert.equal(result.metadata.year, 1992);           // from yt-dlp
+  const dl = api.calls.exec.find((c) => c.cmd === "yt-dlp" && c.args.includes("after_move:filepath"));
+  assert.ok(dl.args.includes("--embed-metadata"));
+  assert.ok(dl.args.includes("--embed-thumbnail"));
+  // original = lossless extract (copy) into a non-webm container, not a transcode.
+  assert.equal(dl.args[dl.args.indexOf("--audio-format") + 1], "best");
+});
+
+test("'flac' re-encodes via yt-dlp -x --audio-format (real transcode, not a rename)", async () => {
+  const { api } = await activated({ exec: toolsPresent(withMeta()) });
+  const result = await api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "flac");
+  assert.ok(result.url.startsWith("file://"));
+  const dl = api.calls.exec.find((c) => c.cmd === "yt-dlp" && c.args.includes("after_move:filepath"));
+  assert.ok(dl.args.includes("-x"));
+  assert.equal(dl.args[dl.args.indexOf("--audio-format") + 1], "flac");
+});
+
+test("interactive resolve of a ytdlp:// uri uses yt-dlp's own metadata", async () => {
+  const { api, plugin } = await activated({ exec: toolsPresent(withMeta()) });
+  const matchId = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false);
+  const result = await api._handlers["iresolve:ytdlp-download"](matchId, "original");
+  assert.ok(result.url.startsWith("file://"));
+  assert.equal(result.metadata.artist, "Radiohead"); // yt-dlp metadata, not the channel
+  assert.equal(result.metadata.album, "Pablo Honey");
 });
 
 test("stream resolve skips cleanly when yt-dlp is unavailable", async () => {
