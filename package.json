@@ -1,0 +1,8 @@
+{
+  "private": true,
+  "name": "viboplr-ytdlp-tests",
+  "description": "Test harness for the viboplr-ytdlp plugin (not published; the plugin itself is just index.js + manifest.json).",
+  "scripts": {
+    "test": "node --test"
+  }
+}

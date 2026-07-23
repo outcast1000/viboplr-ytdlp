@@ -1,0 +1,98 @@
+name: Release
+
+# Two ways to cut a release:
+#  1. Push a tag  vX.Y.Z          -> builds + publishes that version
+#  2. Run manually (workflow_dispatch) with a version input -> tags + publishes
+#
+# In both cases the manifest.json "version" MUST equal the release version, and
+# ytdlp.zip MUST contain manifest.json at its root (the app's installer requires
+# this). The job fails loudly if either invariant is violated.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 1.0.1 (must match manifest.json)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+
+      - name: Run tests (gate release)
+        run: |
+          node --check index.js
+          node --test
+
+      - name: Resolve version
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION (tag v$VERSION)"
+
+      - name: Verify manifest version matches release version
+        run: |
+          MANIFEST_VERSION=$(node -e 'console.log(require("./manifest.json").version)')
+          echo "manifest.json version: $MANIFEST_VERSION"
+          echo "release version:       ${{ steps.ver.outputs.version }}"
+          if [ "$MANIFEST_VERSION" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::manifest.json version ($MANIFEST_VERSION) does not match release version (${{ steps.ver.outputs.version }}). Bump manifest.json first."
+            exit 1
+          fi
+
+      - name: Build artifacts (ytdlp.zip + update.json)
+        run: |
+          chmod +x scripts/package.sh
+          scripts/package.sh
+
+      - name: Verify zip has manifest.json at root
+        run: |
+          if unzip -l ytdlp.zip | grep -qE '(^| )manifest\.json$'; then
+            echo "manifest.json at zip root: OK"
+          else
+            echo "::error::ytdlp.zip does not contain manifest.json at its root."
+            unzip -l ytdlp.zip
+            exit 1
+          fi
+
+      - name: Create tag for manual dispatch
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git rev-parse "${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
+            echo "Tag ${{ steps.ver.outputs.tag }} already exists, skipping create."
+          else
+            git tag "${{ steps.ver.outputs.tag }}"
+            git push origin "${{ steps.ver.outputs.tag }}"
+          fi
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.ver.outputs.tag }}" ytdlp.zip update.json \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.ver.outputs.tag }}" \
+            --notes-file CHANGELOG.md
