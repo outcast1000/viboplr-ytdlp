@@ -11,6 +11,10 @@ from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via
   **Link** tab to paste a URL from any of the 1000+ sites yt-dlp supports (Bandcamp,
   Vimeo, Mixcloud, …). A single video becomes one track; a playlist, album or set
   fans out into all of its tracks (up to 100), ready to play, queue or download.
+  Fetched playlists get a sticky header with the playlist's title and true track
+  count plus one-click **Play all** (with a queue banner) / **Queue all**, and the
+  rows are numbered in source order. Each tab keeps its own query and results, so
+  a fetched link survives a detour through the search tabs.
 - **Audio and video, per action.** In the search view: **Play** / **Queue** listen
   (audio), **Watch** opens the video in the theater, and **Download** opens a format
   picker that includes Video (MP4). No global mode to set — YouTube results are
@@ -23,7 +27,10 @@ from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via
 - **Hybrid playback.** Tracks stream directly whenever possible (`yt-dlp -g`, with
   the direct URL validated by a tiny range request), falling back to
   download-then-play when a direct stream isn't usable. Switch to **Download then
-  play** in the plugin settings for maximum reliability.
+  play** in the plugin settings for maximum reliability. Video on sites with no
+  muxed video+audio stream (e.g. Reddit — DASH/HLS only) streams via the site's
+  HLS master playlist, which carries the video renditions and the audio group in
+  one URL.
 - **Downloads.** A download provider offering Original audio (no re-encode), AAC,
   MP3, Opus, FLAC and Video (MP4, merged). Works from the sidebar, the now-playing
   download button, and the download modal's interactive search.

@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.6.0
+- **Link tab: fetched playlists get a header with whole-list actions.** Pasting a
+  playlist / album / set now shows a sticky header with the playlist's title and
+  its TRUE track count, plus one-click **Play all** (with a queue banner naming
+  the playlist) and **Queue all** — no need to select rows first. Rows are
+  numbered in source order, and the 100-track cap note now says how many tracks
+  the link really has ("Showing the first 100 of 342 tracks").
+- **Each source tab keeps its own search.** YouTube / SoundCloud / Link each
+  remember their own query and results, so flipping tabs no longer shows one
+  tab's results under another — and a fetched link survives a detour through
+  the search tabs.
+- **Fixed video playback on sites with no combined video+audio stream (e.g.
+  Reddit).** Reddit only serves split DASH/HLS streams, so "Watch" failed with
+  "Requested format is not available". When no muxed stream exists, the plugin
+  now streams the site's HLS master playlist — one URL carrying the video
+  renditions and the audio group.
+- Titles from sites that HTML-escape them (e.g. Reddit) now display decoded —
+  "Clips &amp; More" reads "Clips & More".
+
 ## v1.5.0
 - **New "Watch YouTube video" right-click action on any track.** Appears in the
   context menu on every track surface — library, queue, playlists, search

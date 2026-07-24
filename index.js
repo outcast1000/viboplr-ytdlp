@@ -25,12 +25,22 @@ var playbackMode = "stream"; // "stream" (hybrid) | "download"
 var searchSource = "youtube"; // default source for the sidebar view + modal search
 var resolverSource = "youtube"; // site the metadata fallback resolver searches (Spotify/library-miss playback + downloads)
 
-// Sidebar search view state.
-var searchQuery = "";
-var searchResults = null; // array of candidates, or null before first search
+// Sidebar search view state — kept PER SOURCE TAB, so flipping tabs never
+// shows one source's results under another tab's UI (and a fetched link
+// survives a detour through the search tabs). Each entry: { query, results,
+// meta } where `results` is an array of candidates (null before the first
+// search) and `meta` is a link fetch's playlist info ({ title, count }) or null.
+var tabState = {};
+function stateFor(source) {
+  if (!tabState[source]) tabState[source] = { query: "", results: null, meta: null };
+  return tabState[source];
+}
+// One search runs at a time; searchingSource marks the tab that owns the
+// spinner / Cancel button. searchGen is bumped on every search start AND on
+// cancel; an in-flight search compares its captured generation and discards
+// its result if the value has moved on.
 var searching = false;
-// Bumped on every search start AND on cancel; an in-flight search compares its
-// captured generation and discards its result if the value has moved on.
+var searchingSource = null;
 var searchGen = 0;
 
 // Cache-eviction bookkeeping (see cleanupCache).
@@ -85,6 +95,19 @@ function cacheStem(url, isVideo) { return hashSlug(url) + (isVideo ? "v" : "a");
 var STEM_RE = /^[a-z0-9]+$/;
 
 function isHttpUrl(u) { return typeof u === "string" && /^https?:\/\//i.test(u); }
+
+// yt-dlp --print emits titles as the site provides them — some extractors
+// (e.g. Reddit) HTML-escape them ("Clips &amp; More"). Decode the common
+// entities; &amp; is decoded LAST so "&amp;lt;" can't double-decode into "<".
+function decodeHtmlEntities(s) {
+  if (!s || s.indexOf("&") === -1) return s;
+  return s
+    .replace(/&#(\d+);/g, function (m, d) { return String.fromCharCode(parseInt(d, 10)); })
+    .replace(/&#x([0-9a-f]+);/gi, function (m, h) { return String.fromCharCode(parseInt(h, 16)); })
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&");
+}
 
 // Render an exec argv as a copy-pasteable command line (for logs).
 function formatCmd(program, args) {
@@ -248,8 +271,17 @@ async function logDownloadDiagnostics(api, url) {
 // Run a search (or resolve a pasted URL) and return candidates:
 // [{ url, title, uploader, durationSecs, thumbnail }]. Returns [] on failure.
 async function runSearch(api, source, query, count) {
+  return (await runSearchFull(api, source, query, count)).candidates;
+}
+
+// Full variant: also returns `meta` — the fetched playlist's { title, count }
+// for a pasted URL, null for plain searches and single videos. The sidebar
+// Link tab uses it for its playlist header; every other caller goes through
+// runSearch and ignores it.
+async function runSearchFull(api, source, query, count) {
+  var none = { candidates: [], meta: null };
   var q = (query || "").trim();
-  if (!q) return [];
+  if (!q) return none;
   var n = count || 25;
   var target;
   var isUrl = isHttpUrl(q);
@@ -262,7 +294,7 @@ async function runSearch(api, source, query, count) {
     target = q;
   } else {
     var src = SOURCES[source] || SOURCES.youtube;
-    if (!src.prefix) return [];
+    if (!src.prefix) return none;
     target = src.prefix + n + ":" + q;
   }
   var args = [
@@ -273,22 +305,37 @@ async function runSearch(api, source, query, count) {
   ];
   // Bound a pasted playlist so a huge list can't flood the view/queue.
   if (isUrl) args.push("-I", "1:" + LINK_MAX);
-  // Comma fields = first non-null. thumbnail is best-effort.
-  args.push("--print", "%(url,webpage_url)s\t%(duration)s\t%(uploader,channel,uploader_id)s\t%(title)s\t%(thumbnail)s");
+  // Comma fields = first non-null. thumbnail is best-effort. URL fetches also
+  // carry the playlist's title/count (NA for a single video) so the Link tab
+  // can name what it fetched and show how much the -I cap hid.
+  var printFields = "%(url,webpage_url)s\t%(duration)s\t%(uploader,channel,uploader_id)s\t%(title)s\t%(thumbnail)s";
+  if (isUrl) printFields += "\t%(playlist_title)s\t%(playlist_count)s";
+  args.push("--print", printFields);
   api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
   var res;
   try {
     res = await api.system.exec("yt-dlp", args);
   } catch (e) {
     api.log("warn", "yt-dlp search exec failed: " + (e && e.message ? e.message : e), "ytdlp");
-    return [];
+    return none;
   }
   if (res.exitCode !== 0 || !res.stdout) {
     api.log("warn", "yt-dlp search returned no results (exit " + res.exitCode + ")" +
       (res.stderr ? ": " + res.stderr.trim() : ""), "ytdlp");
-    return [];
+    return none;
   }
-  var lines = res.stdout.split("\n"), out = [];
+  var parsed = parseSearchOutput(res.stdout, isUrl);
+  return {
+    candidates: dropSoundcloudPreviews(parsed.candidates, source, isUrl, api),
+    meta: parsed.meta
+  };
+}
+
+// Parse `--print` output lines into candidates, plus the playlist meta when
+// the extra URL-fetch fields were requested (every entry line repeats them;
+// the first line with a non-NA value wins). Pure — exported for tests.
+function parseSearchOutput(stdout, withPlaylistFields) {
+  var lines = (stdout || "").split("\n"), out = [], meta = null;
   for (var i = 0; i < lines.length; i++) {
     var line = lines[i];
     if (!line || !line.trim()) continue;
@@ -297,12 +344,17 @@ async function runSearch(api, source, query, count) {
     if (!isHttpUrl(url)) continue;
     var durRaw = cols[1];
     var dur = durRaw && durRaw !== "NA" ? parseInt(durRaw, 10) : NaN;
-    var uploader = cols[2] && cols[2] !== "NA" ? cols[2] : "";
-    var title = cols[3] && cols[3] !== "NA" ? cols[3] : null;
+    var uploader = cols[2] && cols[2] !== "NA" ? decodeHtmlEntities(cols[2]) : "";
+    var title = cols[3] && cols[3] !== "NA" ? decodeHtmlEntities(cols[3]) : null;
     var thumb = cols[4] && cols[4] !== "NA" && isHttpUrl(cols[4]) ? cols[4] : null;
     out.push({ url: url, title: title, uploader: uploader, durationSecs: isNaN(dur) ? null : dur, thumbnail: thumb });
+    if (withPlaylistFields && !meta) {
+      var pTitle = cols[5] && cols[5] !== "NA" ? decodeHtmlEntities(cols[5]) : null;
+      var pCount = cols[6] && cols[6] !== "NA" ? parseInt(cols[6], 10) : NaN;
+      if (pTitle || !isNaN(pCount)) meta = { title: pTitle, count: isNaN(pCount) ? null : pCount };
+    }
   }
-  return dropSoundcloudPreviews(out, source, isHttpUrl(q), api);
+  return { candidates: out, meta: meta };
 }
 
 // SoundCloud Go+/paid tracks expose only a 30s preview without auth. Real tracks
@@ -531,6 +583,8 @@ function scheduleCleanup(api, wipeTemp) {
 // ---------------------------------------------------------------------------
 // Get a direct stream URL via `yt-dlp -g`. audio: bestaudio; video: a single
 // muxed stream (streamable without a local merge). Returns a URL or null.
+// Video falls back to the HLS MASTER playlist when no muxed stream exists —
+// see getHlsMasterUrl.
 async function getDirectUrl(api, url, isVideo) {
   var fmt = isVideo ? "best[ext=mp4]/best" : "bestaudio[ext=m4a]/bestaudio";
   var args = ["-g", "-f", fmt, "--no-warnings", "--no-playlist", url];
@@ -538,12 +592,44 @@ async function getDirectUrl(api, url, isVideo) {
   var res;
   try { res = await api.system.exec("yt-dlp", args, { cwd: null }); }
   catch (e) { api.log("warn", "yt-dlp -g exec failed: " + (e && e.message ? e.message : e), "ytdlp"); return null; }
-  if (res.exitCode !== 0 || !res.stdout) return null;
-  // -g prints one URL per selected stream. For our single-stream selectors the
-  // last non-empty line is the (only) media URL.
-  var lines = res.stdout.split("\n"), direct = null;
-  for (var i = lines.length - 1; i >= 0; i--) { var l = lines[i].trim(); if (l) { direct = l; break; } }
-  return isHttpUrl(direct) ? direct : null;
+  if (res.exitCode === 0 && res.stdout) {
+    // -g prints one URL per selected stream. For our single-stream selectors
+    // the last non-empty line is the (only) media URL.
+    var lines = res.stdout.split("\n"), direct = null;
+    for (var i = lines.length - 1; i >= 0; i--) { var l = lines[i].trim(); if (l) { direct = l; break; } }
+    if (isHttpUrl(direct)) return direct;
+  }
+  // Some sites (e.g. Reddit) have NO muxed video+audio format at all — only
+  // split DASH/HLS streams — so `best` matches nothing. The HLS MASTER
+  // playlist is one URL carrying the video renditions + the audio group,
+  // playable by mpv and the macOS webview alike.
+  return isVideo ? await getHlsMasterUrl(api, url) : null;
+}
+
+// Pure: the master manifest URL of the best (last) m3u8 format, or null.
+function pickHlsMaster(formats) {
+  if (!formats || !formats.length) return null;
+  for (var i = formats.length - 1; i >= 0; i--) {
+    var f = formats[i];
+    if (f && typeof f.protocol === "string" && f.protocol.indexOf("m3u8") === 0 && isHttpUrl(f.manifest_url)) {
+      return f.manifest_url;
+    }
+  }
+  return null;
+}
+
+async function getHlsMasterUrl(api, url) {
+  var args = ["--no-warnings", "--no-playlist", "--skip-download", "--print", "%(formats)j", url];
+  try {
+    var res = await api.system.exec("yt-dlp", args, { cwd: null });
+    if (res.exitCode !== 0 || !res.stdout) return null;
+    var master = pickHlsMaster(JSON.parse(res.stdout.split("\n")[0]));
+    if (master) api.log("info", "No muxed stream — using HLS master: " + master, "ytdlp");
+    return master;
+  } catch (e) {
+    api.log("warn", "HLS master lookup failed: " + (e && e.message ? e.message : e), "ytdlp");
+    return null;
+  }
 }
 
 // Best-effort check that a direct URL is actually fetchable with default headers
@@ -850,31 +936,37 @@ async function activate(api) {
   });
 
   api.ui.onAction("ytdlp-search-submit", async function (data) {
-    if (searching) { // click while searching = cancel
-      searchGen++; searching = false; renderSearchView(api); return;
+    // Click while THIS tab's search is running = cancel. A search started from
+    // another tab is just superseded by the new one (generation bump below).
+    if (searching && searchingSource === searchSource) {
+      searchGen++; searching = false; searchingSource = null; renderSearchView(api); return;
     }
-    searchQuery = data && typeof data.query === "string" ? data.query : "";
-    if (!searchQuery.trim()) { searchResults = null; renderSearchView(api); return; }
+    var source = searchSource;
+    var st = stateFor(source);
+    st.query = data && typeof data.query === "string" ? data.query : "";
+    if (!st.query.trim()) { st.results = null; st.meta = null; renderSearchView(api); return; }
     await ensureToolStatus(api);
     if (!ytDlpVersion) { renderSearchView(api); return; }
     var gen = ++searchGen;
-    searching = true; renderSearchView(api);
+    searching = true; searchingSource = source; renderSearchView(api);
     try {
-      var results = await runSearch(api, searchSource, searchQuery, 25);
+      var full = await runSearchFull(api, source, st.query, 25);
       if (gen !== searchGen) return; // cancelled/superseded
-      searchResults = results;
+      st.results = full.candidates;
+      st.meta = full.meta;
     } catch (e) {
       if (gen !== searchGen) return;
       api.log("error", "Search failed: " + (e && e.message ? e.message : e), "ytdlp");
-      searchResults = [];
+      st.results = []; st.meta = null;
     }
-    searching = false; renderSearchView(api);
+    searching = false; searchingSource = null; renderSearchView(api);
   });
 
   function findResult(refId) {
-    if (!searchResults) return null;
-    for (var i = 0; i < searchResults.length; i++) {
-      if (encodeRef(searchResults[i].url, false) === refId || searchResults[i].url === refId) return searchResults[i];
+    var results = stateFor(searchSource).results;
+    if (!results) return null;
+    for (var i = 0; i < results.length; i++) {
+      if (encodeRef(results[i].url, false) === refId || results[i].url === refId) return results[i];
     }
     return null;
   }
@@ -934,6 +1026,29 @@ async function activate(api) {
     api.ui.requestAction("download-tracks", { providerId: "ytdlp:ytdlp-download", providerName: "yt-dlp", tracks: tracks });
   });
 
+  // ---- Link tab: whole-playlist actions (the header toolbar) ----
+  function linkAllTracks() {
+    var st = tabState.link;
+    if (!st || !st.results) return [];
+    var tracks = [];
+    for (var i = 0; i < st.results.length; i++) tracks.push(buildTrack(st.results[i], false));
+    return tracks;
+  }
+  api.ui.onAction("ytdlp-link-play-all", function () {
+    var tracks = linkAllTracks();
+    if (tracks.length === 0 || !ytDlpVersion) return;
+    var st = tabState.link;
+    // Playlist context gives the queue panel its banner (name + cover).
+    var ctx = { name: (st.meta && st.meta.title) || "Fetched link", source: "playlist" };
+    if (tracks[0].image_url) ctx.coverUrl = tracks[0].image_url;
+    api.playback.playTracks(tracks, 0, ctx);
+  });
+  api.ui.onAction("ytdlp-link-queue-all", function () {
+    var tracks = linkAllTracks();
+    if (tracks.length === 0 || !ytDlpVersion) return;
+    api.playback.insertTracks(tracks, -1);
+  });
+
   // ---- Settings ----
   api.ui.onAction("ytdlp-cache-size", async function (data) {
     var v = parseInt(typeof data === "string" ? data : data && data.value, 10);
@@ -983,28 +1098,49 @@ function renderSearchView(api) {
   }
   children.push({ type: "tabs", tabs: sourceTabs, activeTab: searchSource, action: "ytdlp-source" });
 
+  var st = stateFor(searchSource);
   var isLink = searchSource === "link";
+  var busy = searching && searchingSource === searchSource;
   children.push({
     type: "search-input",
     placeholder: isLink
       ? "Paste a link — a video, playlist, album or set…"
       : "Search " + (SOURCES[searchSource] ? SOURCES[searchSource].label : "") + ", or paste a URL…",
     action: "ytdlp-search-submit",
-    value: searchQuery,
-    buttonLabel: searching ? "Cancel" : (isLink ? "Fetch" : "Search")
+    value: st.query,
+    buttonLabel: busy ? "Cancel" : (isLink ? "Fetch" : "Search")
   });
 
-  if (searching) {
+  var results = st.results;
+  var isPlaylist = !busy && isLink && results != null && results.length > 1;
+  if (isPlaylist) {
+    // Playlist header — a leading toolbar node, so the host hoists it into the
+    // sticky area next to the tabs/search box. Title + TRUE count (playlist_count
+    // when yt-dlp reports one), and whole-list actions that don't require a
+    // selection. Play all passes playlist context so the queue shows its banner.
+    var total = (st.meta && st.meta.count) || results.length;
+    children.push({
+      type: "toolbar",
+      title: ((st.meta && st.meta.title) || "Fetched link") + " · " + total + " tracks",
+      buttons: [
+        { label: "Play all", action: "ytdlp-link-play-all", variant: "accent", icon: "▶" },
+        { label: "Queue all", action: "ytdlp-link-queue-all", icon: "+" }
+      ]
+    });
+  }
+
+  if (busy) {
     children.push({ type: "loading", message: isLink ? "Fetching…" : "Searching…" });
-  } else if (searchResults && searchResults.length > 0) {
-    if (isLink && searchResults.length >= LINK_MAX) {
+  } else if (results && results.length > 0) {
+    if (isLink && results.length >= LINK_MAX) {
+      var of = st.meta && st.meta.count && st.meta.count > results.length ? " of " + st.meta.count : "";
       children.push({ type: "text",
-        content: "Showing the first " + LINK_MAX + " tracks from this link.",
+        content: "Showing the first " + LINK_MAX + of + " tracks from this link.",
         className: "ds-empty" });
     }
     var items = [];
-    for (var j = 0; j < searchResults.length; j++) {
-      var c = searchResults[j], parsed = parseTrackTitle(c.title, c.uploader);
+    for (var j = 0; j < results.length; j++) {
+      var c = results[j], parsed = parseTrackTitle(c.title, c.uploader);
       var artist = parsed.artist || c.uploader || "";
       items.push({
         id: encodeRef(c.url, false),
@@ -1024,6 +1160,8 @@ function renderSearchView(api) {
     children.push({
       type: "track-row-list",
       selectable: true,
+      // Fetched playlists keep their source order — number the rows like an album.
+      numbered: isPlaylist,
       items: items,
       actions: [
         { id: "ytdlp-play", label: "Play", icon: "▶" },
@@ -1033,9 +1171,9 @@ function renderSearchView(api) {
         { id: "ytdlp-download", label: "Download", icon: "⬇" }
       ]
     });
-  } else if (searchResults && searchResults.length === 0) {
+  } else if (results && results.length === 0) {
     children.push({ type: "text",
-      content: (isLink && searchQuery && !isHttpUrl(searchQuery))
+      content: (isLink && st.query && !isHttpUrl(st.query))
         ? "That doesn't look like a link — paste a full URL starting with http(s)://."
         : "No results.",
       className: "ds-empty" });
@@ -1108,7 +1246,7 @@ function renderSettings(api) {
 function deactivate() {
   ytDlpVersion = null; ffmpegVersion = null; statusLoaded = false;
   inFlightFiles = {}; lastSourceFile = null;
-  searchQuery = ""; searchResults = null; searching = false; searchGen = 0;
+  tabState = {}; searching = false; searchingSource = null; searchGen = 0;
 }
 
 return {
@@ -1123,6 +1261,9 @@ return {
   _buildDownloadArgs: buildDownloadArgs,
   _parseMetadataLine: parseMetadataLine,
   _thumbFor: thumbFor,
+  _parseSearchOutput: parseSearchOutput,
+  _decodeHtmlEntities: decodeHtmlEntities,
+  _pickHlsMaster: pickHlsMaster,
   _dropSoundcloudPreviews: dropSoundcloudPreviews,
   _loadToolStatus: loadToolStatus
 };
