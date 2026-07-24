@@ -7,8 +7,10 @@ from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via
 
 ## Features
 
-- **Any yt-dlp source.** Search YouTube and SoundCloud from the sidebar, or paste
-  a URL from any of the 1000+ sites yt-dlp supports (Bandcamp, Vimeo, Mixcloud, …).
+- **Any yt-dlp source.** Search YouTube and SoundCloud from the sidebar, or use the
+  **Link** tab to paste a URL from any of the 1000+ sites yt-dlp supports (Bandcamp,
+  Vimeo, Mixcloud, …). A single video becomes one track; a playlist, album or set
+  fans out into all of its tracks (up to 100), ready to play, queue or download.
 - **Audio and video, per action.** In the search view: **Play** / **Queue** listen
   (audio), **Watch** opens the video in the theater, and **Download** opens a format
   picker that includes Video (MP4). No global mode to set — YouTube results are

@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.3.0
+- **New "Link" tab.** Paste a URL and get the track(s): a single video becomes one
+  track, and a **playlist / album / set** (YouTube, SoundCloud, Bandcamp, …) fans
+  out into all of its tracks — ready to play, queue or download like any result.
+- Pasted playlists are capped at 100 tracks so a huge list can't flood the view or
+  queue (with a note when the cap is hit).
+- Fixed a wrong assumption in the URL path: `--no-playlist` only disambiguates a
+  "video + &list=" watch URL toward the single video; it never blocked a pure
+  playlist URL from expanding.
+
 ## v1.2.0
 - **Stream mode no longer falls back to downloading.** A direct-stream failure now
   fails cleanly instead of downloading the whole file first — that fallback was

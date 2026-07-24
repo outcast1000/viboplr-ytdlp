@@ -42,13 +42,19 @@ var convSeq = 0; // monotonic counter for unique temp filenames
 // ---------------------------------------------------------------------------
 // Search sources
 // ---------------------------------------------------------------------------
-// prefix: the yt-dlp search extractor ("" ⇒ no search, URL/paste only).
+// prefix: the yt-dlp search extractor (null ⇒ no search, URL/paste only).
 var SOURCES = {
   youtube:    { label: "YouTube",    prefix: "ytsearch" },
-  soundcloud: { label: "SoundCloud", prefix: "scsearch" }
+  soundcloud: { label: "SoundCloud", prefix: "scsearch" },
+  // The "Link" tab has no search extractor — it only takes a pasted URL, and a
+  // playlist / album / set URL fans out into its entries (capped by LINK_MAX).
+  link:       { label: "Link",       prefix: null }
 };
 // Ordered list for the source tabs.
-var SOURCE_ORDER = ["youtube", "soundcloud"];
+var SOURCE_ORDER = ["youtube", "soundcloud", "link"];
+// Cap on entries pulled from a pasted playlist/album/set, so an enormous list
+// can't flood the view or the queue. A single video returns one row, untouched.
+var LINK_MAX = 100;
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -246,9 +252,13 @@ async function runSearch(api, source, query, count) {
   if (!q) return [];
   var n = count || 25;
   var target;
-  if (isHttpUrl(q)) {
-    // Pasted URL — resolve that exact item (Bandcamp/Vimeo/etc. have no search
-    // prefix, but a direct URL always works). --no-playlist keeps it to one item.
+  var isUrl = isHttpUrl(q);
+  if (isUrl) {
+    // Pasted URL (any of yt-dlp's sites — Bandcamp/Vimeo/etc. have no search
+    // prefix, but a direct URL always works). A single video → one row; a
+    // playlist / album / set → its entries (capped below). --no-playlist only
+    // disambiguates a "video + &list=" watch URL toward the single video; it does
+    // NOT stop a pure playlist URL from expanding.
     target = q;
   } else {
     var src = SOURCES[source] || SOURCES.youtube;
@@ -259,10 +269,12 @@ async function runSearch(api, source, query, count) {
     target,
     "--flat-playlist",
     "--no-playlist",
-    "--no-warnings",
-    // Comma fields = first non-null. thumbnail is best-effort.
-    "--print", "%(url,webpage_url)s\t%(duration)s\t%(uploader,channel,uploader_id)s\t%(title)s\t%(thumbnail)s"
+    "--no-warnings"
   ];
+  // Bound a pasted playlist so a huge list can't flood the view/queue.
+  if (isUrl) args.push("-I", "1:" + LINK_MAX);
+  // Comma fields = first non-null. thumbnail is best-effort.
+  args.push("--print", "%(url,webpage_url)s\t%(duration)s\t%(uploader,channel,uploader_id)s\t%(title)s\t%(thumbnail)s");
   api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
   var res;
   try {
@@ -748,7 +760,10 @@ async function activate(api) {
   api.downloads.onInteractiveSearch("ytdlp-download", async function (query, limit) {
     await ensureToolStatus(api);
     if (!ytDlpVersion) return [];
-    var candidates = await runSearch(api, searchSource, query, limit || 10);
+    // The modal's manual search is free text; the prefix-less "Link" tab can't
+    // serve that, so fall back to the (always real) fallback search source.
+    var isearchSource = searchSource === "link" ? resolverSource : searchSource;
+    var candidates = await runSearch(api, isearchSource, query, limit || 10);
     var out = [];
     for (var i = 0; i < candidates.length; i++) {
       var c = candidates[i], parsed = parseTrackTitle(c.title, c.uploader);
@@ -923,17 +938,25 @@ function renderSearchView(api) {
   }
   children.push({ type: "tabs", tabs: sourceTabs, activeTab: searchSource, action: "ytdlp-source" });
 
+  var isLink = searchSource === "link";
   children.push({
     type: "search-input",
-    placeholder: "Search " + (SOURCES[searchSource] ? SOURCES[searchSource].label : "") + ", or paste a URL…",
+    placeholder: isLink
+      ? "Paste a link — a video, playlist, album or set…"
+      : "Search " + (SOURCES[searchSource] ? SOURCES[searchSource].label : "") + ", or paste a URL…",
     action: "ytdlp-search-submit",
     value: searchQuery,
-    buttonLabel: searching ? "Cancel" : "Search"
+    buttonLabel: searching ? "Cancel" : (isLink ? "Fetch" : "Search")
   });
 
   if (searching) {
-    children.push({ type: "loading", message: "Searching…" });
+    children.push({ type: "loading", message: isLink ? "Fetching…" : "Searching…" });
   } else if (searchResults && searchResults.length > 0) {
+    if (isLink && searchResults.length >= LINK_MAX) {
+      children.push({ type: "text",
+        content: "Showing the first " + LINK_MAX + " tracks from this link.",
+        className: "ds-empty" });
+    }
     var items = [];
     for (var j = 0; j < searchResults.length; j++) {
       var c = searchResults[j], parsed = parseTrackTitle(c.title, c.uploader);
@@ -966,9 +989,17 @@ function renderSearchView(api) {
       ]
     });
   } else if (searchResults && searchResults.length === 0) {
-    children.push({ type: "text", content: "No results.", className: "ds-empty" });
+    children.push({ type: "text",
+      content: (isLink && searchQuery && !isHttpUrl(searchQuery))
+        ? "That doesn't look like a link — paste a full URL starting with http(s)://."
+        : "No results.",
+      className: "ds-empty" });
   } else {
-    children.push({ type: "text", content: "Search or paste a link. Play/Queue listen as audio; Watch opens the video; Download lets you pick the format (incl. MP4).", className: "ds-empty" });
+    children.push({ type: "text",
+      content: isLink
+        ? "Paste a link to a video, playlist, album or set. The tracks appear here to play, queue or download."
+        : "Search or paste a link. Play/Queue listen as audio; Watch opens the video; Download lets you pick the format (incl. MP4).",
+      className: "ds-empty" });
   }
 
   api.ui.setViewData("ytdlp-search", { type: "layout", direction: "vertical", children: children }, { scrollKey: searchSource });

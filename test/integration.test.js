@@ -224,6 +224,31 @@ test("clicking the SoundCloud source tab switches the search backend to scsearch
   assert.ok(searched, "search should use the scsearch: prefix after selecting SoundCloud");
 });
 
+test("Link tab: pasting a URL expands via yt-dlp, capped at 100, with no search prefix", async () => {
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  api._handlers["action:ytdlp-source"]({ tabId: "link" });
+  const url = "https://www.youtube.com/playlist?list=PLxxxxxxxx";
+  await api._handlers["action:ytdlp-search-submit"]({ query: url });
+  const call = api.calls.exec.find(
+    (c) => c.cmd === "yt-dlp" && c.args.includes("--flat-playlist") && c.args.includes(url)
+  );
+  assert.ok(call, "should run yt-dlp on the pasted URL");
+  const iIdx = call.args.indexOf("-I");
+  assert.ok(iIdx >= 0 && call.args[iIdx + 1] === "1:100", "URL fetch must be capped with -I 1:100");
+  // No search extractor prefix — the URL is fetched directly.
+  assert.ok(!call.args.some((a) => typeof a === "string" && /^(yt|sc)search/.test(a)));
+});
+
+test("a plain text query does NOT get the -I playlist cap (search, not a URL)", async () => {
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  await api._handlers["action:ytdlp-search-submit"]({ query: "radiohead" });
+  const call = api.calls.exec.find(
+    (c) => c.cmd === "yt-dlp" && c.args.some((a) => typeof a === "string" && a.indexOf("ytsearch") === 0)
+  );
+  assert.ok(call, "text query should use the ytsearch: prefix");
+  assert.ok(!call.args.includes("-I"), "a search query must not be capped with -I");
+});
+
 test("sidebar Queue video enqueues a VIDEO (.mp4) track", async () => {
   const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
   await api._handlers["action:ytdlp-search-submit"]({ query: "radiohead" });
