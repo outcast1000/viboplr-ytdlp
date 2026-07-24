@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.7.0
+- **Fixed the first download after every app restart failing** ("Provider could
+  not resolve this track for download"). The plugin's startup cleanup removes
+  its whole temp folder, and resolving a missing folder returns nothing — so
+  the download ran with a literal `-P null` output dir. Missing temp/cache
+  folders are now recreated on demand.
+- **Downloads make one yt-dlp request instead of two.** The metadata
+  (artist/album/year) now rides the download run itself rather than a separate
+  fetch — half the request volume, which matters because YouTube temporarily
+  rate-gates devices that make too many ("sign in to confirm you're not a bot").
+- **When YouTube's bot check kicks in, the plugin now tells you** — one
+  notification per session — instead of playback silently falling back (e.g.
+  to your library's audio copy of the song) and searches coming back empty
+  with no explanation.
+- **Download failures now report the real reason** (bot check / needs sign-in /
+  format unavailable / video removed / HTTP 403). Shown in the download modal
+  on hosts new enough to pass provider messages through; older hosts keep the
+  generic message.
+- **Link tab: new Paste button** next to Fetch — one click pastes the link from
+  the clipboard and fetches it. Each source tab also keeps its own typed text.
+  (Both light up on hosts new enough to support them; older hosts are
+  unaffected.)
+
 ## v1.6.0
 - **Link tab: fetched playlists get a header with whole-list actions.** Pasting a
   playlist / album / set now shows a sticky header with the playlist's title and
