@@ -31,11 +31,17 @@ test("buildDownloadArgs: video merges to mp4", () => {
   assert.ok(args.join(" ").includes("bestvideo"));
 });
 
-test("buildDownloadArgs: embeds tags + cover when ffmpeg present, omits when absent", () => {
+test("buildDownloadArgs: embeds metadata (never cover art) when ffmpeg present, omits when absent", () => {
   const on = plugin._buildDownloadArgs({ url: "u" }, "/tmp", 0, true);
-  assert.ok(on.includes("--embed-metadata") && on.includes("--embed-thumbnail"));
+  assert.ok(on.includes("--embed-metadata"), "tags embedded via ffmpeg");
+  assert.ok(!on.includes("--embed-thumbnail"), "cover art is never embedded (avoids the mutagen dependency)");
   const off = plugin._buildDownloadArgs({ url: "u" }, "/tmp", 0, false);
   assert.ok(!off.includes("--embed-metadata") && !off.includes("--embed-thumbnail"));
+});
+
+test("buildDownloadArgs: video merge never embeds cover art either", () => {
+  const args = plugin._buildDownloadArgs({ url: "u", video: true }, "/tmp", 0, true);
+  assert.ok(!args.includes("--embed-thumbnail"));
 });
 
 test("buildDownloadArgs: output dir + template wired", () => {

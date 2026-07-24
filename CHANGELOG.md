@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.4.0
+- **Fixed downloads failing with "Provider could not resolve this track".** The
+  cover-art embed step (`--embed-thumbnail`) needs the Python `mutagen` module,
+  which the managed yt-dlp zipapp's system Python often lacks — for opus/ogg/flac
+  (i.e. the default "Original") that aborted the *entire* download. We no longer
+  embed cover art; tags (artist/album/year) still embed via ffmpeg, and in-app
+  artwork is unaffected (it comes from the track, not the file).
+- **Downloading a video you're watching now defaults to Video (MP4)** instead of
+  audio (on hosts new enough to honor the hint; older hosts are unaffected). You
+  can still pick any audio format.
+
 ## v1.3.0
 - **New "Link" tab.** Paste a URL and get the track(s): a single video becomes one
   track, and a **playlist / album / set** (YouTube, SoundCloud, Bandcamp, …) fans

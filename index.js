@@ -348,7 +348,7 @@ async function searchByMetadata(api, title, artistName, durationSecs) {
 }
 
 // ---------------------------------------------------------------------------
-// Downloads — yt-dlp does the transcode AND embeds tags + cover art
+// Downloads — yt-dlp does the transcode AND embeds tags (metadata only)
 // ---------------------------------------------------------------------------
 // Audio formats offered as a RE-ENCODE (yt-dlp `-x --audio-format`). "original"
 // keeps the source stream verbatim (best quality) and is not listed here.
@@ -374,8 +374,15 @@ function parseMetadataLine(line) {
 
 // Pure builder for the download argv. opts: { url, video?, audioFormat? } where
 // audioFormat is a TRANSCODE_FORMATS key (re-encode) or falsy (keep the source
-// codec = "original"). `embed` (= ffmpeg available) adds tag + cover embedding
-// AND enables lossless audio extraction.
+// codec = "original"). `embed` (= ffmpeg available) embeds tags AND enables
+// lossless audio extraction.
+//
+// We embed metadata (artist/album/year) via ffmpeg but deliberately do NOT embed
+// cover art: `--embed-thumbnail` needs the Python `mutagen` module for opus/ogg/
+// flac, which the managed yt-dlp zipapp's system Python often lacks — and a failed
+// thumbnail embed aborts the whole download. Metadata-only embedding has no such
+// dependency, so the download always completes. In-app artwork is unaffected (it
+// comes from the track's image_url / the host's image providers, not the file).
 //
 // "original" uses `-x --audio-format best`: ffmpeg *copies* the source codec
 // (no re-encode) into a taggable, non-webm container (opus→ogg, aac→m4a,
@@ -394,7 +401,7 @@ function buildDownloadArgs(opts, outDir, seq, embed) {
   } else {
     args = ["-f", "bestaudio/best"];
   }
-  if (embed) args = args.concat(["--embed-metadata", "--embed-thumbnail"]);
+  if (embed) args = args.concat(["--embed-metadata"]);
   return args.concat([
     "--no-warnings", "--quiet", "--no-simulate", "--no-playlist",
     "--print", "after_move:filepath",
@@ -411,7 +418,8 @@ async function fetchMetadata(api, url) {
   } catch (e) { api.log("warn", "metadata fetch failed: " + (e && e.message ? e.message : e), "ytdlp"); return {}; }
 }
 
-// Download to the temp dir with tags + cover embedded; returns the file path or null.
+// Download to the temp dir with tags embedded (no cover art — see
+// buildDownloadArgs); returns the file path or null.
 async function downloadForDownload(api, url, opts) {
   var outDir = await api.storage.files.getPath(["temp"]);
   var args = buildDownloadArgs({ url: url, video: opts.video, audioFormat: opts.audioFormat }, outDir, convSeq++, !!ffmpegVersion);
@@ -602,8 +610,8 @@ async function resolvePlayable(api, url, isVideo) {
 }
 
 // Produce the host download-resolve result for a source URL + chosen format.
-// Always downloads locally so yt-dlp can embed tags + cover art (using its rich
-// metadata) into a correctly-named file. `caller` carries any AUTHORITATIVE
+// Always downloads locally so yt-dlp can embed tags (using its rich metadata)
+// into a correctly-named file. `caller` carries any AUTHORITATIVE
 // metadata the host already has (e.g. a library track's real title/artist/album),
 // which overrides yt-dlp's guesses; when absent, yt-dlp's own metadata is used.
 async function resolveDownload(api, url, format, caller) {
@@ -720,7 +728,7 @@ async function activate(api) {
       q.push({ value: "aac", label: "AAC (re-encode)" });
       q.push({ value: "mp3", label: "MP3 (re-encode)" });
       q.push({ value: "flac", label: "FLAC (lossless container of lossy audio — larger, no quality gain)" });
-      q.push({ value: "video", label: "Video (MP4)" });
+      q.push({ value: "video", label: "Video (MP4)", video: true });
     }
     return q;
   });

@@ -123,7 +123,7 @@ function withMeta(extra) {
   ];
 }
 
-test("'original' downloads locally, embeds tags+cover, returns a file with real metadata", async () => {
+test("'original' downloads locally, embeds tags (not cover art), returns a file with real metadata", async () => {
   const { api } = await activated({ exec: toolsPresent(withMeta()) });
   const result = await api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original");
   assert.ok(result.url.startsWith("file://"));
@@ -133,7 +133,9 @@ test("'original' downloads locally, embeds tags+cover, returns a file with real 
   assert.equal(result.metadata.year, 1992);           // from yt-dlp
   const dl = api.calls.exec.find((c) => c.cmd === "yt-dlp" && c.args.includes("after_move:filepath"));
   assert.ok(dl.args.includes("--embed-metadata"));
-  assert.ok(dl.args.includes("--embed-thumbnail"));
+  // Cover art is never embedded — `--embed-thumbnail` needs mutagen (missing
+  // under the managed zipapp's Python) and would abort the whole download.
+  assert.ok(!dl.args.includes("--embed-thumbnail"));
   // original = lossless extract (copy) into a non-webm container, not a transcode.
   assert.equal(dl.args[dl.args.indexOf("--audio-format") + 1], "best");
 });
