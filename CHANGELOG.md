@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.5.0
+- **New "Watch YouTube video" right-click action on any track.** Appears in the
+  context menu on every track surface — library, queue, playlists, search
+  results, similar tracks. It searches YouTube by the track's title + artist and
+  plays the top hit as a video in the in-app theater. (This replaces the host's
+  old built-in "Find in YouTube", which opened the video in your browser.)
+
 ## v1.4.0
 - **Fixed downloads failing with "Provider could not resolve this track".** The
   cover-art embed step (`--embed-thumbnail`) needs the Python `mutagen` module,

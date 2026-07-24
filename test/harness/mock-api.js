@@ -125,6 +125,11 @@ function makeApi(config) {
       requestAction: (action, payload) => { calls.requestAction.push({ action, payload }); },
       showNotification: (message) => { calls.showNotification.push(message); },
     },
+    contextMenu: {
+      onAction: (id, fn) => { handlers["ctx:" + id] = fn; },
+      registerItem: (item) => { (calls.registerItem = calls.registerItem || []).push(item); return () => {}; },
+      unregisterItem: () => {},
+    },
   };
 
   return api;

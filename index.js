@@ -347,6 +347,35 @@ async function searchByMetadata(api, title, artistName, durationSecs) {
   return pickBestCandidate(candidates, durationSecs, api);
 }
 
+// Context-menu "Watch YouTube video": search YouTube by the track's metadata
+// and play the top hit as a VIDEO in the theater. Always searches YouTube (the
+// video source), NOT the configurable fallback resolver — the action is
+// explicitly about YouTube video. Feedback is a notification (context-menu
+// actions have no loading modal); errors surface the same way and never throw.
+async function watchVideoFor(api, title, artistName) {
+  await ensureToolStatus(api);
+  if (!ytDlpVersion) {
+    api.ui.showNotification("yt-dlp isn't installed — see Settings → Dependencies.");
+    return;
+  }
+  var clean = stripRemasterSuffix((title || "").trim());
+  if (!clean) return;
+  api.ui.showNotification("Searching YouTube for a video…");
+  try {
+    var query = artistName ? clean + " " + artistName : clean;
+    var candidates = await runSearch(api, "youtube", query, 7);
+    var cand = pickBestCandidate(candidates, null, api);
+    if (!cand) {
+      api.ui.showNotification("No video found for “" + clean + "”.");
+      return;
+    }
+    api.playback.playTracks([buildTrack(cand, true)], 0);
+  } catch (e) {
+    api.log("error", "Watch video failed: " + (e && e.message ? e.message : e), "ytdlp");
+    api.ui.showNotification("Couldn't find a video for “" + clean + "”.");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Downloads — yt-dlp does the transcode AND embeds tags (metadata only)
 // ---------------------------------------------------------------------------
@@ -712,6 +741,14 @@ async function activate(api) {
       api.log("error", "Legacy youtube:// resolve failed: " + (e && e.message ? e.message : e), "ytdlp");
       return null;
     }
+  });
+
+  // ---- Context menu: "Watch YouTube video" (universal track action) ----
+  // Appears on every track surface (library, queue, playlists, search results,
+  // similar tracks). The target carries title/artistName — no DB id needed.
+  api.contextMenu.onAction("ytdlp-watch-video", function (target) {
+    if (!target || !target.title) return;
+    watchVideoFor(api, target.title, target.artistName || null);
   });
 
   // ---- Download provider: qualities ----

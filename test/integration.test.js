@@ -44,6 +44,7 @@ test("registers all expected handlers", async () => {
     "action:ytdlp-search-submit", "action:ytdlp-play", "action:ytdlp-watch",
     "action:ytdlp-queue-video", "action:ytdlp-download",
     "action:ytdlp-playback-mode", "action:ytdlp-cache-size",
+    "ctx:ytdlp-watch-video",
   ];
   for (const h of expected) assert.ok(api._handlers[h], "missing handler: " + h);
 });
@@ -179,6 +180,29 @@ test("sidebar Play produces an AUDIO track; Watch produces a VIDEO (.mp4) track"
   assert.equal(api.calls.playTracks.length, 2);
   assert.equal(api.calls.playTracks[1].tracks[0].path, plugin._encodeRef(url, true));
   assert.ok(api.calls.playTracks[1].tracks[0].path.endsWith(".mp4"));
+});
+
+test("context-menu 'Watch YouTube video' searches YouTube and plays a VIDEO (.mp4) track", async () => {
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  // Universal track target — title/artist only, no DB id. Handler is sync but
+  // kicks off an async YouTube search, so let it settle before asserting.
+  api._handlers["ctx:ytdlp-watch-video"]({ kind: "track", title: "Creep", artistName: "Radiohead" });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(api.calls.playTracks.length, 1);
+  const path = api.calls.playTracks[0].tracks[0].path;
+  assert.ok(path.startsWith("ytdlp://"), "must be a ytdlp:// ref");
+  assert.ok(path.endsWith(".mp4"), "watched track must be a video ref");
+  // Always searches YouTube (ytsearch:), regardless of the Fallback source setting.
+  const searched = api.calls.exec.find((c) => c.args.some((a) => typeof a === "string" && a.indexOf("ytsearch") === 0));
+  assert.ok(searched, "context watch should use ytsearch:");
+});
+
+test("context-menu 'Watch YouTube video' notifies and does not play when yt-dlp is unavailable", async () => {
+  const { api } = await activated({ exec: [] }); // no tools
+  api._handlers["ctx:ytdlp-watch-video"]({ kind: "track", title: "Creep", artistName: "Radiohead" });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(api.calls.playTracks.length, 0);
+  assert.ok(api.calls.showNotification.some((m) => /yt-dlp isn't installed/.test(m)));
 });
 
 test("fallback resolver searches YouTube by default", async () => {
