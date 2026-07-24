@@ -104,6 +104,9 @@ test("Link fetch of a playlist shows a header toolbar with title + true count an
   assert.ok(printArg.includes("%(playlist_count)s"), "URL fetch requests playlist_count");
 
   const view = lastView(api);
+  const input = view.children.find((c) => c.type === "search-input");
+  assert.equal(input.pasteButton, true, "Link tab offers the paste-and-fetch button");
+  assert.equal(input.stateKey, "link");
   const toolbar = view.children.find((c) => c.type === "toolbar");
   assert.ok(toolbar, "playlist fetch must render a header toolbar");
   assert.ok(toolbar.title.includes("OK Mix"), "header carries the playlist title");
@@ -174,6 +177,8 @@ test("tab state is per-source: flipping tabs never shows another tab's results",
   assert.ok(!view.children.some((c) => c.type === "toolbar"), "YouTube tab must not show the Link playlist header");
   const input = view.children.find((c) => c.type === "search-input");
   assert.equal(input.value, "radiohead", "each tab keeps its own query");
+  assert.equal(input.stateKey, "youtube", "stateKey follows the active tab so the host keeps per-tab text");
+  assert.equal(input.pasteButton, false, "no paste button outside the Link tab");
 
   // …and the Link fetch is still there too.
   api._handlers["action:ytdlp-source"]({ tabId: "link" });

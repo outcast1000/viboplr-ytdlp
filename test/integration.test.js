@@ -115,11 +115,14 @@ test("interactive search parses rows into results with encoded ids", async () =>
 
 // yt-dlp's own metadata (real artist/album/year) is embedded and returned; the
 // caller's authoritative fields (title/artist) win over yt-dlp's guesses.
+// The metadata line is printed by the DOWNLOAD RUN itself (before the
+// after_move filepath line) — there is no separate metadata fetch anymore.
 const META_STDOUT = "Creep\tRadiohead\tPablo Honey\t1992\tCreep";
 function withMeta(extra) {
   return [
+    // Must precede BEHAVIOR's generic single-line after_move rule.
+    { match: { cmd: "yt-dlp", argsInclude: ["after_move:filepath"] }, result: { exitCode: 0, stdout: META_STDOUT + "\n/mock-plugin-data/cache/abc.m4a" } },
     ...BEHAVIOR,
-    { match: { cmd: "yt-dlp", argsInclude: ["--skip-download"] }, result: { exitCode: 0, stdout: META_STDOUT } },
     ...(extra || []),
   ];
 }
@@ -157,6 +160,56 @@ test("interactive resolve of a ytdlp:// uri uses yt-dlp's own metadata", async (
   assert.ok(result.url.startsWith("file://"));
   assert.equal(result.metadata.artist, "Radiohead"); // yt-dlp metadata, not the channel
   assert.equal(result.metadata.album, "Pablo Honey");
+});
+
+test("metadata rides the download run — no separate --skip-download fetch", async () => {
+  const { api } = await activated({ exec: toolsPresent(withMeta()) });
+  const result = await api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original");
+  assert.equal(result.metadata.album, "Pablo Honey");
+  assert.ok(!api.calls.exec.some((c) => c.args.includes("--skip-download")),
+    "one extraction per download — a second metadata run provokes YouTube's bot gate");
+});
+
+test("by-URI download failure PROPAGATES a user-facing reason (YouTube bot check)", async () => {
+  const BOT_STDERR = "ERROR: [youtube] obLk8Y--wgw: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication.";
+  const { api, plugin } = await activated({
+    exec: toolsPresent([
+      { match: { cmd: "yt-dlp", argsInclude: ["after_move:filepath"] }, result: { exitCode: 1, stderr: BOT_STDERR } },
+      ...BEHAVIOR,
+    ]),
+  });
+  const uri = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false);
+  await assert.rejects(
+    () => api._handlers["uri:ytdlp-download"](uri, "original"),
+    (e) => /bot check/.test(e.message),
+  );
+});
+
+test("first download after the temp wipe self-heals the missing dir (-P null regression)", async () => {
+  const { api } = await activated({ exec: toolsPresent(withMeta()) });
+  // Mirror the HOST's getPath semantics: null for paths that don't exist on
+  // disk (the startup cleanup removes the whole temp dir).
+  let tempExists = false;
+  const realGetPath = api.storage.files.getPath;
+  const realWriteText = api.storage.files.writeText;
+  api.storage.files.getPath = async (segs) => (segs[0] === "temp" && !tempExists ? null : realGetPath(segs));
+  api.storage.files.writeText = async (segs, text) => { if (segs[0] === "temp") tempExists = true; return realWriteText(segs, text); };
+
+  const result = await api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original");
+  assert.ok(result && result.url.startsWith("file://"), "download must succeed after materializing the dir");
+  const dl = api.calls.exec.find((c) => c.args.includes("after_move:filepath"));
+  assert.notEqual(String(dl.args[dl.args.indexOf("-P") + 1]), "null", "argv must never carry a null out dir");
+});
+
+test("by-metadata download failure still returns null (chain semantics)", async () => {
+  const { api } = await activated({
+    exec: toolsPresent([
+      { match: { cmd: "yt-dlp", argsInclude: ["after_move:filepath"] }, result: { exitCode: 1, stderr: "ERROR: nope" } },
+      ...BEHAVIOR,
+    ]),
+  });
+  const r = await api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original");
+  assert.equal(r, null, "the provider chain must be able to fall through to the next provider");
 });
 
 test("stream resolve skips cleanly when yt-dlp is unavailable", async () => {

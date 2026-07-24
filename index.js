@@ -244,6 +244,50 @@ async function loadToolStatus(api) {
 }
 async function ensureToolStatus(api) { if (!statusLoaded) await loadToolStatus(api); }
 
+// Map yt-dlp stderr to a user-facing reason — the host download modal shows
+// thrown messages, so the real cause reaches the user instead of a generic
+// "could not resolve" failure. Pure; exported for tests.
+function classifyYtdlpError(stderr) {
+  var s = stderr || "";
+  if (/sign in to confirm/i.test(s)) {
+    return "YouTube rejected the request with a sign-in / bot check. This is temporary — try again in a few minutes.";
+  }
+  if (/account authentication is required|--cookies/i.test(s)) {
+    return "The site requires a signed-in account to access this item.";
+  }
+  if (/requested format is not available/i.test(s)) {
+    return "The requested format isn't available for this item.";
+  }
+  if (/video unavailable|private video|has been removed|geo.?restricted|not available in your country/i.test(s)) {
+    return "The video is unavailable (removed, private or region-locked).";
+  }
+  if (/HTTP Error 403/i.test(s)) {
+    return "The site refused the transfer (HTTP 403) — often temporary; updating yt-dlp may help.";
+  }
+  // Fall back to the last ERROR: line, minus the "[extractor] id:" prefix.
+  var lines = s.split("\n");
+  for (var i = lines.length - 1; i >= 0; i--) {
+    var m = lines[i].match(/^ERROR:\s*(.*)$/);
+    if (m) return "yt-dlp: " + m[1].replace(/^\[[^\]]*\]\s*[^\s:]*:\s*/, "").trim();
+  }
+  return "yt-dlp could not download this item.";
+}
+
+// Absolute filesystem path (POSIX or Windows drive letter)?
+function looksLikePath(s) { return /^\/|^[A-Za-z]:[\\\/]/.test(s || ""); }
+
+// YouTube sometimes rate-gates a device ("Sign in to confirm you're not a
+// bot"): every extraction fails for a while, playback silently falls back
+// (e.g. to a local audio copy of the song) and searches return nothing — with
+// no clue why. Surface it ONCE per session as a notification.
+var botGateNotified = false;
+function noteBotGate(api, stderr) {
+  if (botGateNotified || !/sign in to confirm/i.test(stderr || "")) return;
+  botGateNotified = true;
+  api.log("warn", "YouTube bot gate detected — extractions will fail until it lifts", "ytdlp");
+  api.ui.showNotification("YouTube is temporarily rate-limiting this device (sign-in / bot check). YouTube playback, search and downloads may fail for a while.");
+}
+
 // ---------------------------------------------------------------------------
 // Diagnostics — re-run extraction in verbose simulate mode to surface WHY a
 // download/stream failed (PO-token/SABR/403). Best-effort; never throws.
@@ -322,6 +366,7 @@ async function runSearchFull(api, source, query, count) {
   if (res.exitCode !== 0 || !res.stdout) {
     api.log("warn", "yt-dlp search returned no results (exit " + res.exitCode + ")" +
       (res.stderr ? ": " + res.stderr.trim() : ""), "ytdlp");
+    noteBotGate(api, res.stderr);
     return none;
   }
   var parsed = parseSearchOutput(res.stdout, isUrl);
@@ -483,53 +528,70 @@ function buildDownloadArgs(opts, outDir, seq, embed) {
     args = ["-f", "bestaudio/best"];
   }
   if (embed) args = args.concat(["--embed-metadata"]);
+  // Two prints: the META_PRINT line lands at extraction time, the filepath
+  // after the file is moved into place — so ONE run yields both the metadata
+  // and the file (a separate metadata fetch doubled our request volume, which
+  // is what provokes YouTube's bot gate).
   return args.concat([
     "--no-warnings", "--quiet", "--no-simulate", "--no-playlist",
+    "--print", META_PRINT,
     "--print", "after_move:filepath",
     "-P", outDir, "-o", "dl." + seq + ".%(ext)s", opts.url
   ]);
 }
 
-// Fetch the rich metadata yt-dlp knows about the source (artist/album/year).
-async function fetchMetadata(api, url) {
-  try {
-    var res = await api.system.exec("yt-dlp", ["--skip-download", "--no-warnings", "--no-playlist", "--print", META_PRINT, url], { cwd: null });
-    if (res.exitCode !== 0 || !res.stdout) return {};
-    return parseMetadataLine(res.stdout.split("\n")[0]);
-  } catch (e) { api.log("warn", "metadata fetch failed: " + (e && e.message ? e.message : e), "ytdlp"); return {}; }
-}
-
 // Download to the temp dir with tags embedded (no cover art — see
-// buildDownloadArgs); returns the file path or null.
+// buildDownloadArgs). Returns { filePath, meta } — `meta` is yt-dlp's own
+// metadata, printed by the SAME run (no separate metadata fetch). Throws an
+// Error with a user-facing reason on failure; the host download modal shows
+// thrown messages, so the real cause (bot check, region lock, missing format)
+// reaches the user.
 async function downloadForDownload(api, url, opts) {
-  var outDir = await api.storage.files.getPath(["temp"]);
+  var outDir = await ensureDir(api, "temp");
+  if (!outDir) throw new Error("The plugin's temp folder is unavailable — cannot download.");
   var args = buildDownloadArgs({ url: url, video: opts.video, audioFormat: opts.audioFormat }, outDir, convSeq++, !!ffmpegVersion);
   api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
-  var filePath = null;
+  var res;
   try {
-    var res = await api.system.exec("yt-dlp", args, { cwd: null });
-    if (res.exitCode !== 0) {
-      api.log("error", "yt-dlp download failed (exit " + res.exitCode + "): " + (res.stderr || "").trim(), "ytdlp");
-      await logDownloadDiagnostics(api, url);
-      return null;
-    }
-    filePath = res.stdout ? res.stdout.trim() || null : null;
+    res = await api.system.exec("yt-dlp", args, { cwd: null });
   } catch (e) {
     api.log("error", "yt-dlp download exec failed: " + (e && e.message ? e.message : e), "ytdlp");
-    return null;
+    throw new Error("yt-dlp could not be run — check Settings → Dependencies.");
   }
-  if (!filePath) {
+  if (res.exitCode !== 0) {
+    api.log("error", "yt-dlp download failed (exit " + res.exitCode + "): " + (res.stderr || "").trim(), "ytdlp");
+    await logDownloadDiagnostics(api, url);
+    throw new Error(classifyYtdlpError(res.stderr));
+  }
+  // stdout: the META_PRINT line (extraction time), then the after_move
+  // filepath line. Anything that doesn't end in an absolute path means no
+  // file actually landed.
+  var lines = (res.stdout || "").split("\n").filter(function (l) { return l.trim(); });
+  var last = lines.length ? lines[lines.length - 1].trim() : "";
+  if (!looksLikePath(last)) {
     api.log("warn", "yt-dlp returned no file path — likely SABR/PO-token", "ytdlp");
     await logDownloadDiagnostics(api, url);
-    return null;
+    throw new Error("The download produced no file — often a YouTube restriction; updating yt-dlp usually fixes this.");
   }
-  api.log("info", "Downloaded to: " + filePath, "ytdlp");
-  return filePath;
+  api.log("info", "Downloaded to: " + last, "ytdlp");
+  return { filePath: last, meta: lines.length > 1 ? parseMetadataLine(lines[0]) : {} };
 }
 
 // ---------------------------------------------------------------------------
 // Cache management (LRU by mtime, budget = cacheMaxMb)
 // ---------------------------------------------------------------------------
+// Resolve a plugin-storage dir to an absolute path, CREATING it when missing.
+// getPath returns null for paths that don't exist on disk — and the startup
+// cleanup removes the whole temp dir — so the first download after a restart
+// used to build a literal "-P null" argv (the v1.2.0 bug's second home).
+// writeText creates parent dirs, so touching a marker materializes the dir.
+async function ensureDir(api, name) {
+  var p = await api.storage.files.getPath([name]);
+  if (p) return p;
+  try { await api.storage.files.writeText([name, ".keep"], ""); }
+  catch (e) { console.error("[ytdlp] ensureDir " + name + " failed:", e); }
+  return await api.storage.files.getPath([name]);
+}
 async function findCachedDownload(api, stem) {
   try {
     var entries = await api.storage.files.list(["cache"]);
@@ -599,6 +661,7 @@ async function getDirectUrl(api, url, isVideo) {
     for (var i = lines.length - 1; i >= 0; i--) { var l = lines[i].trim(); if (l) { direct = l; break; } }
     if (isHttpUrl(direct)) return direct;
   }
+  noteBotGate(api, res.stderr);
   // Some sites (e.g. Reddit) have NO muxed video+audio format at all — only
   // split DASH/HLS streams — so `best` matches nothing. The HLS MASTER
   // playlist is one URL carrying the video renditions + the audio group,
@@ -650,7 +713,7 @@ async function downloadToCache(api, url, isVideo) {
   var cached = await findCachedDownload(api, stem);
   if (cached) { api.log("info", "Using cached download: " + cached, "ytdlp"); return cached; }
 
-  var cacheDir = await api.storage.files.getPath(["cache"]);
+  var cacheDir = await ensureDir(api, "cache");
   if (!cacheDir) { api.log("error", "Cache dir unavailable — cannot download", "ytdlp"); return null; }
   var args;
   if (isVideo) {
@@ -729,6 +792,7 @@ async function resolvePlayable(api, url, isVideo) {
 // into a correctly-named file. `caller` carries any AUTHORITATIVE
 // metadata the host already has (e.g. a library track's real title/artist/album),
 // which overrides yt-dlp's guesses; when absent, yt-dlp's own metadata is used.
+// Throws (via downloadForDownload) with a user-facing reason on failure.
 async function resolveDownload(api, url, format, caller) {
   var fmt = format || "original";
   var isVideo = fmt === "video";
@@ -738,8 +802,10 @@ async function resolveDownload(api, url, format, caller) {
     else api.log("warn", "ffmpeg missing — downloading original audio instead of " + fmt, "ytdlp");
   }
 
-  // Rich metadata from yt-dlp (artist/album/year), then caller-supplied fields win.
-  var meta = await fetchMetadata(api, url);
+  var dl = await downloadForDownload(api, url, { video: isVideo, audioFormat: audioFormat });
+  // Rich metadata from yt-dlp (printed by the download run itself);
+  // caller-supplied fields win.
+  var meta = dl.meta || {};
   var md = {};
   md.title = (caller && caller.title) || meta.title || url;
   var artist = (caller && caller.artist) || meta.artist;
@@ -748,10 +814,8 @@ async function resolveDownload(api, url, format, caller) {
   if (album) md.album = album;
   if (meta.year) md.year = meta.year;
 
-  var filePath = await downloadForDownload(api, url, { video: isVideo, audioFormat: audioFormat });
-  if (!filePath) return null;
-  return await withCacheProtection(api, filePath, function () {
-    return { url: "file://" + filePath, headers: null, ext: extOf(filePath) || undefined, metadata: md };
+  return await withCacheProtection(api, dl.filePath, function () {
+    return { url: "file://" + dl.filePath, headers: null, ext: extOf(dl.filePath) || undefined, metadata: md };
   });
 }
 
@@ -870,8 +934,11 @@ async function activate(api) {
     }
     if (!url) { api.log("warn", "Download URI resolve: unrecognized uri " + uri, "ytdlp"); return null; }
     // No authoritative caller metadata for a bare URI — use yt-dlp's own (best).
+    // Failures PROPAGATE with a user-facing reason (bot check, region lock, …)
+    // so the host download modal shows the real cause; nothing else can serve
+    // a ytdlp:// URI anyway.
     try { return await resolveDownload(api, url, format, null); }
-    catch (e) { console.error("[ytdlp] download URI resolve failed:", e, e.stack || ""); return null; }
+    catch (e) { console.error("[ytdlp] download URI resolve failed:", e, e.stack || ""); throw e; }
   });
 
   // ---- Download provider: by metadata (stream-resolver-win fallback path) ----
@@ -1108,6 +1175,10 @@ function renderSearchView(api) {
       : "Search " + (SOURCES[searchSource] ? SOURCES[searchSource].label : "") + ", or paste a URL…",
     action: "ytdlp-search-submit",
     value: st.query,
+    // Newer hosts keep each tab's typed text separate (stateKey) and offer a
+    // one-click paste-and-fetch button on the Link tab; older hosts ignore both.
+    stateKey: searchSource,
+    pasteButton: isLink,
     buttonLabel: busy ? "Cancel" : (isLink ? "Fetch" : "Search")
   });
 
@@ -1247,6 +1318,7 @@ function deactivate() {
   ytDlpVersion = null; ffmpegVersion = null; statusLoaded = false;
   inFlightFiles = {}; lastSourceFile = null;
   tabState = {}; searching = false; searchingSource = null; searchGen = 0;
+  botGateNotified = false;
 }
 
 return {
@@ -1263,6 +1335,7 @@ return {
   _thumbFor: thumbFor,
   _parseSearchOutput: parseSearchOutput,
   _decodeHtmlEntities: decodeHtmlEntities,
+  _classifyYtdlpError: classifyYtdlpError,
   _pickHlsMaster: pickHlsMaster,
   _dropSoundcloudPreviews: dropSoundcloudPreviews,
   _loadToolStatus: loadToolStatus

@@ -95,6 +95,21 @@ test("video resolve still prefers a muxed -g URL when one exists (no formats dum
   assert.ok(!api.calls.exec.some((c) => c.args.includes("%(formats)j")), "no fallback lookup when -g succeeds");
 });
 
+test("YouTube bot gate on stream resolve notifies the user ONCE per session", async () => {
+  const BOT = "ERROR: [youtube] x: Sign in to confirm you’re not a bot. Use --cookies-from-browser ...";
+  const { api, plugin: p } = await activated({
+    exec: rules([
+      { match: { cmd: "yt-dlp", argsInclude: ["-g"] }, result: { exitCode: 1, stderr: BOT } },
+      { match: { cmd: "yt-dlp", argsInclude: ["%(formats)j"] }, result: { exitCode: 1, stderr: BOT } },
+    ]),
+  });
+  const id = p._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
+  assert.equal(await api._handlers["streamuri:ytdlp"](id), null);
+  assert.equal(await api._handlers["streamuri:ytdlp"](id), null);
+  const gate = api.calls.showNotification.filter((m) => /rate-limiting/.test(m));
+  assert.equal(gate.length, 1, "notified exactly once, not per failure");
+});
+
 test("audio resolve does NOT fall back to the HLS master (audio -g failure fails cleanly)", async () => {
   const { api, plugin: p } = await activated({
     exec: rules([

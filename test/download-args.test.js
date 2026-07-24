@@ -50,6 +50,25 @@ test("buildDownloadArgs: output dir + template wired", () => {
   assert.equal(args[args.indexOf("-o") + 1], "dl.7.%(ext)s");
 });
 
+test("buildDownloadArgs prints metadata AND filepath in the one run", () => {
+  const args = plugin._buildDownloadArgs({ url: "u" }, "/tmp", 0, true);
+  const prints = args.reduce((acc, a, i) => (a === "--print" ? [...acc, args[i + 1]] : acc), []);
+  assert.equal(prints.length, 2);
+  assert.ok(prints[0].includes("%(track,title)s"), "metadata template printed at extraction time");
+  assert.equal(prints[1], "after_move:filepath");
+});
+
+test("classifyYtdlpError maps common failures to friendly reasons", () => {
+  assert.match(plugin._classifyYtdlpError("ERROR: [youtube] x: Sign in to confirm you’re not a bot. Use --cookies-from-browser ..."), /bot check/);
+  assert.match(plugin._classifyYtdlpError("ERROR: [Reddit] x: Account authentication is required. Use --cookies ..."), /signed-in account/);
+  assert.match(plugin._classifyYtdlpError("ERROR: [youtube] x: Requested format is not available"), /format isn't available/);
+  assert.match(plugin._classifyYtdlpError("ERROR: [youtube] x: Video unavailable"), /unavailable/);
+  assert.match(plugin._classifyYtdlpError("ERROR: unable to download video data: HTTP Error 403: Forbidden"), /HTTP 403/);
+  // Unknown errors fall back to the last ERROR line, extractor prefix stripped.
+  assert.equal(plugin._classifyYtdlpError("ERROR: [foo] abc123: something odd happened"), "yt-dlp: something odd happened");
+  assert.equal(plugin._classifyYtdlpError(""), "yt-dlp could not download this item.");
+});
+
 test("parseMetadataLine picks real music metadata over the channel name", () => {
   // track \t artist \t album \t year \t title
   const m = plugin._parseMetadataLine("Hey\tPixies\tDoolittle\t1989\tHey");
