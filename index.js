@@ -949,14 +949,36 @@ async function activate(api) {
     // have no lossless master to recover, so the re-encode options are only for
     // users who want a uniform library format. FLAC in particular does NOT
     // improve quality: it wraps already-lossy audio in a lossless container
-    // (much larger file, zero quality gain).
-    var q = [{ value: "original", label: "Original — best quality, no re-encode" }];
+    // (much larger file, zero quality gain). Labels are "Type · Format — note"
+    // (all the old host shows); `description` renders under the picker on newer
+    // hosts. (Opus re-encode was dropped in v1.8.0 — unused.)
+    var q = [{
+      value: "original",
+      label: "Audio · Original — keeps the source codec",
+      description: "Best quality: the source audio is copied, not re-encoded, into a taggable file. The format follows the source — YouTube is usually Opus ~160k (.ogg), SoundCloud/Bandcamp MP3 128k. Tags embedded."
+    }];
     if (ffmpegVersion) {
-      q.push({ value: "opus", label: "Opus (re-encode)" });
-      q.push({ value: "aac", label: "AAC (re-encode)" });
-      q.push({ value: "mp3", label: "MP3 (re-encode)" });
-      q.push({ value: "flac", label: "FLAC (lossless container of lossy audio — larger, no quality gain)" });
-      q.push({ value: "video", label: "Video (MP4)", video: true });
+      q.push({
+        value: "aac",
+        label: "Audio · AAC (.m4a) — re-encode",
+        description: "Re-encodes the source to AAC. Pick for maximum device compatibility; slight quality loss vs Original. Tags embedded."
+      });
+      q.push({
+        value: "mp3",
+        label: "Audio · MP3 — re-encode",
+        description: "Re-encodes the source to MP3. Pick for maximum device compatibility; slight quality loss vs Original. Tags embedded."
+      });
+      q.push({
+        value: "flac",
+        label: "Audio · FLAC — lossless wrap of a lossy source",
+        description: "No quality gain over Original — the source is already lossy, so FLAC only makes the file much larger. Only useful for a uniform-format library. Tags embedded."
+      });
+      q.push({
+        value: "video",
+        label: "Video · MP4 — best video + audio, merged",
+        video: true,
+        description: "Downloads the best video and audio streams and merges them into an .mp4."
+      });
     }
     return q;
   });

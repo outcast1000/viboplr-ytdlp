@@ -53,9 +53,13 @@ test("qualities: original always; transcodes + video only when ffmpeg present", 
   const { api } = await activated({ exec: toolsPresent(BEHAVIOR) });
   const q = api._handlers["qual:ytdlp-download"]();
   const values = q.map((x) => x.value);
-  assert.ok(values.includes("original"));
-  assert.ok(values.includes("video"));
-  assert.ok(values.includes("flac"));
+  assert.deepEqual(values, ["original", "aac", "mp3", "flac", "video"], "opus was dropped in v1.8.0");
+  // Labels lead with the type; every option carries a description for newer hosts.
+  for (const opt of q) {
+    assert.match(opt.label, /^(Audio|Video) · /, opt.value + " label starts with its type");
+    assert.ok(opt.description && opt.description.length > 0, opt.value + " has a description");
+  }
+  assert.equal(q.find((x) => x.value === "video").video, true);
 
   // yt-dlp present but ffmpeg absent -> only "original".
   const noff = await activated({

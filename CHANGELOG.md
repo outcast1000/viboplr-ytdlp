@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.8.0
+- **Clearer download quality options.** Every option now reads "Type · Format —
+  note": *Audio · Original — keeps the source codec*, *Audio · AAC (.m4a) —
+  re-encode*, *Audio · MP3 — re-encode*, *Audio · FLAC — lossless wrap of a
+  lossy source*, *Video · MP4 — best video + audio, merged*. On newer app
+  versions each option also shows a full explanation under the picker (what
+  the format really is, typical source bitrates, that tags are embedded);
+  older apps just show the improved labels.
+- **Removed the Opus re-encode option** — unused. If it was your remembered
+  choice, the modal falls back to Original; programmatic `enqueue` calls with
+  `format: "opus"` still work.
+
 ## v1.7.1
 - **Downloads that fail with HTTP 403 now retry once with a fresh extraction.**
   YouTube's media URLs are minted per-extraction and sometimes get a transient
