@@ -201,6 +201,49 @@ test("first download after the temp wipe self-heals the missing dir (-P null reg
   assert.notEqual(String(dl.args[dl.args.indexOf("-P") + 1]), "null", "argv must never carry a null out dir");
 });
 
+test("HTTP 403 on download retries ONCE with a fresh extraction and succeeds", async () => {
+  let calls = 0;
+  const { api } = await activated({
+    exec: toolsPresent([
+      {
+        match: { cmd: "yt-dlp", argsInclude: ["after_move:filepath"] },
+        result: () => (++calls === 1
+          ? { exitCode: 1, stderr: "ERROR: unable to download video data: HTTP Error 403: Forbidden" }
+          : { exitCode: 0, stdout: META_STDOUT + "\n/mock-plugin-data/cache/abc.m4a" }),
+      },
+      ...BEHAVIOR,
+    ]),
+  });
+  const result = await api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original");
+  assert.ok(result && result.url.startsWith("file://"), "retry must succeed");
+  assert.equal(calls, 2, "exactly one retry");
+});
+
+test("non-403 download failure does NOT retry", async () => {
+  let calls = 0;
+  const { api } = await activated({
+    exec: toolsPresent([
+      {
+        match: { cmd: "yt-dlp", argsInclude: ["after_move:filepath"] },
+        result: () => { calls++; return { exitCode: 1, stderr: "ERROR: [youtube] x: Video unavailable" }; },
+      },
+      ...BEHAVIOR,
+    ]),
+  });
+  const r = await api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original");
+  assert.equal(r, null);
+  assert.equal(calls, 1, "no retry for non-403 failures");
+});
+
+test("isOlderVersion compares dotted date-style versions", async () => {
+  const p = loadPlugin();
+  assert.equal(p._isOlderVersion("2026.03.17", "2026.07.04"), true);
+  assert.equal(p._isOlderVersion("2026.07.04", "2026.07.04"), false);
+  assert.equal(p._isOlderVersion("2026.07.04", "2026.03.17"), false);
+  assert.equal(p._isOlderVersion("7.0", "7.0.1"), true);
+  assert.equal(p._isOlderVersion("unknown", "2026.07.04"), false);
+});
+
 test("by-metadata download failure still returns null (chain semantics)", async () => {
   const { api } = await activated({
     exec: toolsPresent([

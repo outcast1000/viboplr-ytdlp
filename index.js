@@ -276,6 +276,32 @@ function classifyYtdlpError(stderr) {
 // Absolute filesystem path (POSIX or Windows drive letter)?
 function looksLikePath(s) { return /^\/|^[A-Za-z]:[\\\/]/.test(s || ""); }
 
+// True when version a is clearly older than b (dotted numeric segments, e.g.
+// yt-dlp's date-style "2026.07.04"). Pure; exported for tests.
+function isOlderVersion(a, b) {
+  var pa = String(a || "").split("."), pb = String(b || "").split(".");
+  for (var i = 0; i < Math.max(pa.length, pb.length); i++) {
+    var x = parseInt(pa[i] || "0", 10), y = parseInt(pb[i] || "0", 10);
+    if (isNaN(x) || isNaN(y)) return false;
+    if (x !== y) return x < y;
+  }
+  return false;
+}
+
+// Append an "outdated yt-dlp" note when the host's cached dependency check
+// knows a newer version exists — stale yt-dlp is the usual cause of
+// persistent YouTube failures and otherwise reads as an app bug. Cache-only;
+// never hits the network.
+async function withOutdatedHint(api, message) {
+  try {
+    var dep = await api.system.getDependency("yt-dlp");
+    if (dep && dep.installed && dep.latest && isOlderVersion(dep.version, dep.latest)) {
+      return message + " Installed yt-dlp " + dep.version + " is outdated (latest " + dep.latest + ") — update it in Settings → Dependencies.";
+    }
+  } catch (e) { console.error("[ytdlp] outdated-hint lookup failed:", e); }
+  return message;
+}
+
 // YouTube sometimes rate-gates a device ("Sign in to confirm you're not a
 // bot"): every extraction fails for a while, playback silently falls back
 // (e.g. to a local audio copy of the song) and searches return nothing — with
@@ -549,19 +575,28 @@ function buildDownloadArgs(opts, outDir, seq, embed) {
 async function downloadForDownload(api, url, opts) {
   var outDir = await ensureDir(api, "temp");
   if (!outDir) throw new Error("The plugin's temp folder is unavailable — cannot download.");
-  var args = buildDownloadArgs({ url: url, video: opts.video, audioFormat: opts.audioFormat }, outDir, convSeq++, !!ffmpegVersion);
-  api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
-  var res;
-  try {
-    res = await api.system.exec("yt-dlp", args, { cwd: null });
-  } catch (e) {
-    api.log("error", "yt-dlp download exec failed: " + (e && e.message ? e.message : e), "ytdlp");
-    throw new Error("yt-dlp could not be run — check Settings → Dependencies.");
+  var attempt = async function () {
+    var args = buildDownloadArgs({ url: url, video: opts.video, audioFormat: opts.audioFormat }, outDir, convSeq++, !!ffmpegVersion);
+    api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
+    try {
+      return await api.system.exec("yt-dlp", args, { cwd: null });
+    } catch (e) {
+      api.log("error", "yt-dlp download exec failed: " + (e && e.message ? e.message : e), "ytdlp");
+      throw new Error("yt-dlp could not be run — check Settings → Dependencies.");
+    }
+  };
+  var res = await attempt();
+  if (res.exitCode !== 0 && /HTTP Error 403|403 Forbidden/i.test(res.stderr || "")) {
+    // A 403 on the media URLs is usually YouTube's transient PO-token/SABR
+    // gate on the just-minted URLs; a NEW extraction mints fresh URLs and
+    // often passes. Retry once before giving up.
+    api.log("warn", "HTTP 403 on media download — retrying with a fresh extraction", "ytdlp");
+    res = await attempt();
   }
   if (res.exitCode !== 0) {
     api.log("error", "yt-dlp download failed (exit " + res.exitCode + "): " + (res.stderr || "").trim(), "ytdlp");
     await logDownloadDiagnostics(api, url);
-    throw new Error(classifyYtdlpError(res.stderr));
+    throw new Error(await withOutdatedHint(api, classifyYtdlpError(res.stderr)));
   }
   // stdout: the META_PRINT line (extraction time), then the after_move
   // filepath line. Anything that doesn't end in an absolute path means no
@@ -730,6 +765,12 @@ async function downloadToCache(api, url, isVideo) {
   var filePath = null;
   try {
     var res = await api.system.exec("yt-dlp", args, { cwd: null });
+    if (res.exitCode !== 0 && /HTTP Error 403|403 Forbidden/i.test(res.stderr || "")) {
+      // Transient PO-token/SABR gate on the minted URLs — a fresh extraction
+      // often passes (same retry as downloadForDownload).
+      api.log("warn", "HTTP 403 on media download — retrying with a fresh extraction", "ytdlp");
+      res = await api.system.exec("yt-dlp", args, { cwd: null });
+    }
     if (res.exitCode !== 0) {
       api.log("error", "yt-dlp download failed (exit " + res.exitCode + "): " + (res.stderr || "").trim(), "ytdlp");
       await logDownloadDiagnostics(api, url);
@@ -1336,6 +1377,7 @@ return {
   _parseSearchOutput: parseSearchOutput,
   _decodeHtmlEntities: decodeHtmlEntities,
   _classifyYtdlpError: classifyYtdlpError,
+  _isOlderVersion: isOlderVersion,
   _pickHlsMaster: pickHlsMaster,
   _dropSoundcloudPreviews: dropSoundcloudPreviews,
   _loadToolStatus: loadToolStatus

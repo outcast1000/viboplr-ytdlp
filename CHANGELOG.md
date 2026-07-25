@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.7.1
+- **Downloads that fail with HTTP 403 now retry once with a fresh extraction.**
+  YouTube's media URLs are minted per-extraction and sometimes get a transient
+  403 gate (SABR/PO-token enforcement) — a new extraction mints fresh URLs and
+  usually passes, so what used to need a manual retry now happens automatically.
+  Applies to both the download modal and download-then-play playback.
+- **Persistent download errors now note when yt-dlp itself is outdated**
+  ("Installed yt-dlp X is outdated (latest Y) — update it in Settings →
+  Dependencies") — a stale yt-dlp is the other common cause of YouTube 403s.
+
 ## v1.7.0
 - **Fixed the first download after every app restart failing** ("Provider could
   not resolve this track for download"). The plugin's startup cleanup removes
