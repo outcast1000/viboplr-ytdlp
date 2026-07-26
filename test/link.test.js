@@ -102,6 +102,8 @@ test("Link fetch of a playlist shows a header toolbar with title + true count an
   const printArg = call.args[call.args.indexOf("--print") + 1];
   assert.ok(printArg.includes("%(playlist_title)s"), "URL fetch requests playlist_title");
   assert.ok(printArg.includes("%(playlist_count)s"), "URL fetch requests playlist_count");
+  assert.equal(call.args[call.args.indexOf("--encoding") + 1], "utf-8",
+    "must force UTF-8 or non-Latin titles (e.g. Greek, on Windows) come back as mojibake");
 
   const view = lastView(api);
   const input = view.children.find((c) => c.type === "search-input");

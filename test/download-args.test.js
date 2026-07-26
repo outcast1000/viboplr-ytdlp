@@ -50,6 +50,11 @@ test("buildDownloadArgs: output dir + template wired", () => {
   assert.equal(args[args.indexOf("-o") + 1], "dl.7.%(ext)s");
 });
 
+test("buildDownloadArgs forces --encoding utf-8 (yt-dlp's own preferredencoding() mojibakes non-ASCII titles on Windows)", () => {
+  const args = plugin._buildDownloadArgs({ url: "u" }, "/tmp", 0, true);
+  assert.equal(args[args.indexOf("--encoding") + 1], "utf-8");
+});
+
 test("buildDownloadArgs prints metadata AND filepath in the one run", () => {
   const args = plugin._buildDownloadArgs({ url: "u" }, "/tmp", 0, true);
   const prints = args.reduce((acc, a, i) => (a === "--print" ? [...acc, args[i + 1]] : acc), []);

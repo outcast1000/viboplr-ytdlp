@@ -66,6 +66,14 @@ var SOURCE_ORDER = ["youtube", "soundcloud", "link"];
 // can't flood the view or the queue. A single video returns one row, untouched.
 var LINK_MAX = 100;
 
+// yt-dlp writes non-ASCII --print output (titles, artists, albums) using
+// locale.getpreferredencoding() for some internal paths, which on Windows is
+// the ANSI codepage (e.g. cp1253 on Greek Windows) rather than UTF-8 — the
+// host's PYTHONUTF8/PYTHONIOENCODING env vars don't override this. yt-dlp's
+// own --encoding flag does. Every invocation that reads text back (search,
+// link fetch, download metadata) must carry this.
+var ENCODING_ARGS = ["--encoding", "utf-8"];
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -372,7 +380,7 @@ async function runSearchFull(api, source, query, count) {
     "--flat-playlist",
     "--no-playlist",
     "--no-warnings"
-  ];
+  ].concat(ENCODING_ARGS);
   // Bound a pasted playlist so a huge list can't flood the view/queue.
   if (isUrl) args.push("-I", "1:" + LINK_MAX);
   // Comma fields = first non-null. thumbnail is best-effort. URL fetches also
@@ -558,7 +566,7 @@ function buildDownloadArgs(opts, outDir, seq, embed) {
   // after the file is moved into place — so ONE run yields both the metadata
   // and the file (a separate metadata fetch doubled our request volume, which
   // is what provokes YouTube's bot gate).
-  return args.concat([
+  return args.concat(ENCODING_ARGS).concat([
     "--no-warnings", "--quiet", "--no-simulate", "--no-playlist",
     "--print", META_PRINT,
     "--print", "after_move:filepath",

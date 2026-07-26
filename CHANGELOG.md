@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.8.1
+- **Fix: non-Latin titles (Greek, Cyrillic, etc.) came back as mojibake on
+  Windows** — search results, Link-tab fetches, and downloaded-file metadata
+  (title/artist/album tags) could all show garbled text for sites whose pages
+  contain non-ASCII text, because yt-dlp writes some `--print` output using
+  the OS locale's ANSI codepage rather than UTF-8 (the host's
+  `PYTHONUTF8`/`PYTHONIOENCODING` env vars don't override this internal
+  yt-dlp behavior). Every yt-dlp invocation that reads text back now passes
+  `--encoding utf-8` explicitly.
+
+
 ## v1.8.0
 - **Clearer download quality options.** Every option now reads "Type · Format —
   note": *Audio · Original — keeps the source codec*, *Audio · AAC (.m4a) —
