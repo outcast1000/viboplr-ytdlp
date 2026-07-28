@@ -8,7 +8,7 @@
   merges on the fly — so YouTube plays at 1080p/1440p/4K with no download wait.
   The browser engine can't merge two streams, so it still gets the self-contained
   muxed stream (and is used as the instant fallback if a native play fails).
-  Requires app **v1.1.0+** (new stream-candidate contract).
+  Requires app **v1.0.3+** (new stream-candidate contract).
 - **Max video quality setting** (Settings → yt-dlp → Playback): cap streaming and
   the default video download at Best / 4K / 1080p / 720p / 480p. Defaults to
   1080p so 4K isn't pulled by surprise.
