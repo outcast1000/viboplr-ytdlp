@@ -24,6 +24,21 @@ var cacheMaxMb = 100;
 var playbackMode = "stream"; // "stream" (hybrid) | "download"
 var searchSource = "youtube"; // default source for the sidebar view + modal search
 var resolverSource = "youtube"; // site the metadata fallback resolver searches (Spotify/library-miss playback + downloads)
+// Max video height (px) for hi-res streaming + the default video download. 0 =
+// best available (no cap). Streaming a video-only + audio-only pair only happens
+// on the native mpv engine (which merges them); the browser engine still gets a
+// muxed stream regardless. 1080 by default to avoid pulling 4K by surprise.
+var maxVideoHeight = 1080;
+
+// Shared resolution choices, used for BOTH the streaming cap (Settings) and the
+// video download quality options. Order is best → lower (the first is default).
+var VIDEO_RESOLUTIONS = [
+  { height: 0, label: "Best available" },
+  { height: 2160, label: "4K · 2160p" },
+  { height: 1080, label: "1080p" },
+  { height: 720, label: "720p" },
+  { height: 480, label: "480p" }
+];
 
 // Sidebar search view state — kept PER SOURCE TAB, so flipping tabs never
 // shows one source's results under another tab's UI (and a fetched link
@@ -514,6 +529,24 @@ async function watchVideoFor(api, title, artistName) {
 // keeps the source stream verbatim (best quality) and is not listed here.
 var TRANSCODE_FORMATS = { aac: 1, mp3: 1, opus: 1, flac: 1 };
 
+// Parse a download `format` value into video intent + a height cap. "video" =
+// best; "video-<N>" = capped at N px; anything else = not a video download.
+// Pure; exported for tests.
+function parseVideoFormat(fmt) {
+  if (fmt === "video") return { isVideo: true, maxHeight: 0 };
+  var m = /^video-(\d+)$/.exec(fmt || "");
+  if (m) return { isVideo: true, maxHeight: parseInt(m[1], 10) };
+  return { isVideo: false, maxHeight: 0 };
+}
+
+// yt-dlp `-f` selector for a merged video download, optionally height-capped.
+// Pure; exported for tests.
+function videoFormatSelector(maxHeight) {
+  return maxHeight > 0
+    ? "bestvideo*[height<=" + maxHeight + "]+bestaudio/best[height<=" + maxHeight + "]"
+    : "bestvideo*+bestaudio/best";
+}
+
 // Metadata --print template: first non-null of each comma group wins.
 // track/title | artist/creator/uploader | album | release_year | title
 var META_PRINT = "%(track,title)s\t%(artist,creator,uploader)s\t%(album)s\t%(release_year)s\t%(title)s";
@@ -553,7 +586,7 @@ function parseMetadataLine(line) {
 function buildDownloadArgs(opts, outDir, seq, embed) {
   var args;
   if (opts.video) {
-    args = ["-f", "bestvideo*+bestaudio/best", "--merge-output-format", "mp4"];
+    args = ["-f", videoFormatSelector(opts.maxHeight || 0), "--merge-output-format", "mp4"];
   } else if (opts.audioFormat) {
     args = ["-x", "--audio-format", opts.audioFormat, "--audio-quality", "0"];
   } else if (embed) {
@@ -584,7 +617,7 @@ async function downloadForDownload(api, url, opts) {
   var outDir = await ensureDir(api, "temp");
   if (!outDir) throw new Error("The plugin's temp folder is unavailable — cannot download.");
   var attempt = async function () {
-    var args = buildDownloadArgs({ url: url, video: opts.video, audioFormat: opts.audioFormat }, outDir, convSeq++, !!ffmpegVersion);
+    var args = buildDownloadArgs({ url: url, video: opts.video, audioFormat: opts.audioFormat, maxHeight: opts.maxHeight }, outDir, convSeq++, !!ffmpegVersion);
     api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
     try {
       return await api.system.exec("yt-dlp", args, { cwd: null });
@@ -738,6 +771,65 @@ async function getHlsMasterUrl(api, url) {
   }
 }
 
+// Pure: map a yt-dlp `--dump-json` formats array to the host's StreamCandidate
+// menu. The host's selectStream picks per its active engine — the native mpv
+// engine pairs a hi-res video-only stream with a separate audio-only stream;
+// the browser engine takes a self-contained muxed stream. `maxHeight` (0 = no
+// cap) drops video/muxed streams taller than the user's setting. Exported for
+// tests.
+function candidatesFromFormats(formats, maxHeight) {
+  if (!formats || !formats.length) return [];
+  var out = [];
+  for (var i = 0; i < formats.length; i++) {
+    var f = formats[i];
+    if (!f || !isHttpUrl(f.url)) continue;
+    var hasV = f.vcodec && f.vcodec !== "none";
+    var hasA = f.acodec && f.acodec !== "none";
+    var kind = hasV && hasA ? "muxed" : hasV ? "video" : hasA ? "audio" : null;
+    if (!kind) continue;
+    var height = typeof f.height === "number" ? f.height : undefined;
+    if (kind !== "audio" && maxHeight > 0 && height && height > maxHeight) continue;
+    var c = { url: f.url, kind: kind };
+    if (height) c.height = height;
+    if (f.ext) c.container = f.ext;
+    if (hasV) c.vcodec = f.vcodec;
+    if (hasA) c.acodec = f.acodec;
+    if (typeof f.tbr === "number") c.tbr = f.tbr;
+    out.push(c);
+  }
+  // Sources with no progressive muxed stream (e.g. Reddit) still need a
+  // self-contained option for the browser engine — the HLS master carries the
+  // renditions + audio group in one URL. Add it as a muxed candidate.
+  var hasMuxed = out.some(function (c) { return c.kind === "muxed"; });
+  if (!hasMuxed) {
+    var master = pickHlsMaster(formats);
+    if (master) out.push({ url: master, kind: "muxed", container: "m3u8" });
+  }
+  return out;
+}
+
+// Enumerate a source's streams as a StreamCandidate menu via ONE `yt-dlp -j`
+// call (formats carry directly-usable URLs). Returns [] on any failure so the
+// caller can fall back to the single-stream muxed path.
+async function enumerateFormats(api, url, maxHeight) {
+  var args = ["-j", "--no-warnings", "--no-playlist", url];
+  api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
+  var res;
+  try { res = await api.system.exec("yt-dlp", args, { cwd: null }); }
+  catch (e) { api.log("warn", "yt-dlp -j exec failed: " + (e && e.message ? e.message : e), "ytdlp"); return []; }
+  if (res.exitCode !== 0 || !res.stdout) {
+    noteBotGate(api, res.stderr);
+    return [];
+  }
+  try {
+    var info = JSON.parse(res.stdout.split("\n")[0]);
+    return candidatesFromFormats(info.formats || [], maxHeight || 0);
+  } catch (e) {
+    api.log("warn", "yt-dlp -j parse failed: " + (e && e.message ? e.message : e), "ytdlp");
+    return [];
+  }
+}
+
 // Best-effort check that a direct URL is actually fetchable with default headers
 // (some sources sign URLs or require a UA). A tiny range GET through the host's
 // CORS-bypassing proxy. Returns true on 2xx, false on anything else/errors.
@@ -760,7 +852,8 @@ async function downloadToCache(api, url, isVideo) {
   if (!cacheDir) { api.log("error", "Cache dir unavailable — cannot download", "ytdlp"); return null; }
   var args;
   if (isVideo) {
-    args = ["-f", "bestvideo*+bestaudio/best", "--merge-output-format", "mp4"];
+    // "Download then play" honors the streaming resolution cap.
+    args = ["-f", videoFormatSelector(maxVideoHeight), "--merge-output-format", "mp4"];
   } else {
     args = ["-f", "bestaudio[ext=m4a]/bestaudio"];
   }
@@ -844,14 +937,15 @@ async function resolvePlayable(api, url, isVideo) {
 // Throws (via downloadForDownload) with a user-facing reason on failure.
 async function resolveDownload(api, url, format, caller) {
   var fmt = format || "original";
-  var isVideo = fmt === "video";
+  var vf = parseVideoFormat(fmt);
+  var isVideo = vf.isVideo;
   var audioFormat = null;
   if (!isVideo && TRANSCODE_FORMATS[fmt]) {
     if (ffmpegVersion) audioFormat = fmt;
     else api.log("warn", "ffmpeg missing — downloading original audio instead of " + fmt, "ytdlp");
   }
 
-  var dl = await downloadForDownload(api, url, { video: isVideo, audioFormat: audioFormat });
+  var dl = await downloadForDownload(api, url, { video: isVideo, audioFormat: audioFormat, maxHeight: vf.maxHeight });
   // Rich metadata from yt-dlp (printed by the download run itself);
   // caller-supplied fields win.
   var meta = dl.meta || {};
@@ -876,12 +970,14 @@ async function activate(api) {
     api.storage.get("cacheMaxMb"),
     api.storage.get("playbackMode"),
     api.storage.get("searchSource"),
-    api.storage.get("resolverSource")
+    api.storage.get("resolverSource"),
+    api.storage.get("maxVideoHeight")
   ]);
   if (stored[0] != null && typeof stored[0] === "number") cacheMaxMb = stored[0];
   if (stored[1] === "download" || stored[1] === "stream") playbackMode = stored[1];
   if (stored[2] && SOURCES[stored[2]]) searchSource = stored[2];
   if (stored[3] && SOURCES[stored[3]]) resolverSource = stored[3];
+  if (stored[4] != null && typeof stored[4] === "number") maxVideoHeight = stored[4];
 
   // Startup cleanup: wipe transcoded temp files; keep cached source downloads.
   scheduleCleanup(api, true).catch(function (e) { api.log("warn", "Startup cache cleanup failed: " + (e && e.message ? e.message : e), "ytdlp"); });
@@ -914,12 +1010,25 @@ async function activate(api) {
   });
 
   // ---- Playback: ytdlp:// scheme resolver (exact source, audio or video) ----
-  api.playback.onResolveStreamByUri("ytdlp", async function (id, quality) {
+  api.playback.onResolveStreamByUri("ytdlp", async function (id, quality, opts) {
     await ensureToolStatus(api);
     if (!ytDlpVersion) { api.log("warn", "URI resolve skipped — yt-dlp not available", "ytdlp"); return null; }
     var ref = decodeRef(id);
     if (!ref) { api.log("warn", "URI resolve: bad ref " + id, "ytdlp"); return null; }
     try {
+      // The host can attach a separate audio track (native mpv engine + video):
+      // return the full candidate menu so it can pick a hi-res video-only +
+      // audio-only pair. Only in "stream" mode — "download then play" already
+      // fetches a full-res merged file below. On enumeration failure fall
+      // through to the single muxed stream.
+      if (ref.isVideo && opts && opts.externalAudio && playbackMode === "stream") {
+        var candidates = await enumerateFormats(api, ref.url, maxVideoHeight);
+        if (candidates.length) {
+          api.log("info", "Resolved " + candidates.length + " stream candidate(s) for " + ref.url, "ytdlp");
+          return { candidates: candidates };
+        }
+        api.log("warn", "No candidates enumerated — falling back to muxed stream", "ytdlp");
+      }
       var playable = await resolvePlayable(api, ref.url, ref.isVideo);
       return playable ? playable.url : null;
     } catch (e) {
@@ -981,12 +1090,21 @@ async function activate(api) {
         label: "Audio · FLAC — lossless wrap of a lossy source",
         description: "No quality gain over Original — the source is already lossy, so FLAC only makes the file much larger. Only useful for a uniform-format library. Tags embedded."
       });
-      q.push({
-        value: "video",
-        label: "Video · MP4 — best video + audio, merged",
-        video: true,
-        description: "Downloads the best video and audio streams and merges them into an .mp4."
-      });
+      // Video download options mirror the streaming resolution choices: best +
+      // per-resolution caps. Each merges the best video ≤ cap with the best
+      // audio into an .mp4. The host defaults to the first `video:true` option
+      // when the item being downloaded is itself a video.
+      for (var i = 0; i < VIDEO_RESOLUTIONS.length; i++) {
+        var r = VIDEO_RESOLUTIONS[i];
+        q.push({
+          value: r.height === 0 ? "video" : "video-" + r.height,
+          label: "Video · MP4 · " + (r.height === 0 ? "Best" : r.label),
+          video: true,
+          description: r.height === 0
+            ? "Downloads the best available video and audio streams and merges them into an .mp4."
+            : "Downloads the best video up to " + r.label + " and merges it with the best audio into an .mp4."
+        });
+      }
     }
     return q;
   });
@@ -1199,6 +1317,11 @@ async function activate(api) {
     if (v !== "stream" && v !== "download") return;
     playbackMode = v; await api.storage.set("playbackMode", v); renderSettings(api);
   });
+  api.ui.onAction("ytdlp-max-res", async function (data) {
+    var v = parseInt(typeof data === "string" ? data : data && data.value, 10);
+    if (isNaN(v) || v < 0) return;
+    maxVideoHeight = v; await api.storage.set("maxVideoHeight", v); renderSettings(api);
+  });
   api.ui.onAction("ytdlp-resolver-source", async function (data) {
     var v = data && data.value;
     if (!v || !SOURCES[v]) return;
@@ -1347,6 +1470,16 @@ function renderSettings(api) {
               { value: "download", label: "Download then play" }
             ]
           }
+        }, {
+          type: "settings-row",
+          label: "Max video quality",
+          description: "Highest video resolution to stream or download. Streaming above 720p needs the native (mpv) playback engine — it merges the separate video and audio streams; the browser engine tops out at the muxed 360–720p stream. Also the default for video downloads.",
+          control: {
+            type: "select", action: "ytdlp-max-res", value: String(maxVideoHeight),
+            options: VIDEO_RESOLUTIONS.map(function (r) {
+              return { value: String(r.height), label: r.height === 0 ? "Best available" : r.label };
+            })
+          }
         }]
       },
       {
@@ -1409,6 +1542,9 @@ return {
   _classifyYtdlpError: classifyYtdlpError,
   _isOlderVersion: isOlderVersion,
   _pickHlsMaster: pickHlsMaster,
+  _candidatesFromFormats: candidatesFromFormats,
+  _parseVideoFormat: parseVideoFormat,
+  _videoFormatSelector: videoFormatSelector,
   _dropSoundcloudPreviews: dropSoundcloudPreviews,
   _loadToolStatus: loadToolStatus
 };

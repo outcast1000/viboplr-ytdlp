@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.9.0
+- **Hi-res video streaming (up to 4K).** Watching a video no longer caps at the
+  360–720p muxed stream. On the **native (mpv) playback engine**, the plugin now
+  hands the host the full menu of a source's streams and the host picks a hi-res
+  **video-only** stream paired with a separate **audio-only** stream, which mpv
+  merges on the fly — so YouTube plays at 1080p/1440p/4K with no download wait.
+  The browser engine can't merge two streams, so it still gets the self-contained
+  muxed stream (and is used as the instant fallback if a native play fails).
+  Requires app **v1.1.0+** (new stream-candidate contract).
+- **Max video quality setting** (Settings → yt-dlp → Playback): cap streaming and
+  the default video download at Best / 4K / 1080p / 720p / 480p. Defaults to
+  1080p so 4K isn't pulled by surprise.
+- **Resolution choices for video downloads.** The download quality picker now
+  offers Video · MP4 at Best / 4K / 1080p / 720p / 480p, mirroring the streaming
+  choices (previously a single "best" video option).
+
 ## v1.8.1
 - **Fix: non-Latin titles (Greek, Cyrillic, etc.) came back as mojibake on
   Windows** — search results, Link-tab fetches, and downloaded-file metadata

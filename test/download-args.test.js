@@ -31,6 +31,25 @@ test("buildDownloadArgs: video merges to mp4", () => {
   assert.ok(args.join(" ").includes("bestvideo"));
 });
 
+test("buildDownloadArgs: capped video selector limits height", () => {
+  const args = plugin._buildDownloadArgs({ url: "u", video: true, maxHeight: 1080 }, "/tmp", 2, true);
+  const sel = args[args.indexOf("-f") + 1];
+  assert.ok(sel.includes("[height<=1080]"), "height cap applied to both split and muxed fallback");
+  assert.ok(sel.includes("bestvideo*[height<=1080]+bestaudio"));
+});
+
+test("parseVideoFormat: 'video' = best, 'video-720' = capped, else not video", () => {
+  assert.deepEqual(plugin._parseVideoFormat("video"), { isVideo: true, maxHeight: 0 });
+  assert.deepEqual(plugin._parseVideoFormat("video-720"), { isVideo: true, maxHeight: 720 });
+  assert.deepEqual(plugin._parseVideoFormat("flac"), { isVideo: false, maxHeight: 0 });
+  assert.deepEqual(plugin._parseVideoFormat("original"), { isVideo: false, maxHeight: 0 });
+});
+
+test("videoFormatSelector: uncapped vs capped", () => {
+  assert.equal(plugin._videoFormatSelector(0), "bestvideo*+bestaudio/best");
+  assert.equal(plugin._videoFormatSelector(720), "bestvideo*[height<=720]+bestaudio/best[height<=720]");
+});
+
 test("buildDownloadArgs: embeds metadata (never cover art) when ffmpeg present, omits when absent", () => {
   const on = plugin._buildDownloadArgs({ url: "u" }, "/tmp", 0, true);
   assert.ok(on.includes("--embed-metadata"), "tags embedded via ffmpeg");
