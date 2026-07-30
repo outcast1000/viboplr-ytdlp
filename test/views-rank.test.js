@@ -157,3 +157,23 @@ test("formatScoreDebug: empty string when candidate has no score", () => {
   assert.equal(plugin._formatScoreDebug({ url: "x" }, 0), "");
   assert.equal(plugin._formatScoreDebug(null, 0), "");
 });
+
+// ---------------------------------------------------------------------------
+// buildResultRow (row shape shared by search list + resolve panel)
+// ---------------------------------------------------------------------------
+
+test("buildResultRow: folds views into subtitle and carries a playable ref", () => {
+  const c = { url: "https://youtu.be/abc", title: "Artist - Song", uploader: "Artist", durationSecs: 200, views: 1500000, thumbnail: null };
+  const row = plugin._buildResultRow(c, 0);
+  assert.equal(row.title, "Song");
+  assert.match(row.subtitle, /1\.5M views/);
+  assert.equal(row.action, "ytdlp-play-one");
+  assert.ok(row.path && row.path === row.id, "carries an encoded ref as both id and path");
+  assert.equal(row.durationSecs, 200);
+});
+
+test("buildResultRow: opts.chosen marks the row with a leading check", () => {
+  const c = { url: "https://youtu.be/abc", title: "Song", uploader: "Artist", durationSecs: 200, views: 5 };
+  assert.ok(!plugin._buildResultRow(c, 0).title.startsWith("✓"), "unmarked by default");
+  assert.ok(plugin._buildResultRow(c, 0, { chosen: true }).title.startsWith("✓ "), "chosen gets a ✓");
+});

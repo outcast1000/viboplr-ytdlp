@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.12.0
+- **"Last resolve" debug panel.** With debug scoring on (Settings → yt-dlp →
+  Debugging), the yt-dlp sidebar now shows a panel — right when a track is
+  resolved — listing every candidate the resolver considered, scored, with the
+  one it actually picked marked by a ✓. Covers the invisible automated paths:
+  the playback/download fallback (Spotify tracks, library misses) and the
+  "Watch YouTube video" action. So when the wrong video plays, you can see the
+  alternatives and exactly why the winner won (e.g. a duration match that beat a
+  higher-scored result), and click any candidate to Play/Watch/Download and
+  compare. Only active while debug scoring is on; a Clear button dismisses it.
+
 ## v1.11.0
 - **Debug scoring (Settings → yt-dlp → Debugging).** A new "Show scoring in
   results" toggle annotates every search result with how it was ranked — its

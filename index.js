@@ -34,6 +34,12 @@ var maxVideoHeight = 1080;
 // landed where it did — and why the automated pick (Watch / playback fallback,
 // same pipeline) chose what it chose. Off by default; persisted.
 var debugScoring = false;
+// Debug: the most recent AUTOMATED resolve (playback/download fallback or the
+// "Watch YouTube video" action). Captured so the sidebar can show which
+// candidate the resolver picked, and the alternatives it scored, right when a
+// track is resolved. Only populated while debugScoring is on. Cleared on
+// deactivate. Shape: { kind, query, source, target, candidates, chosen }.
+var lastResolve = null;
 
 // Shared resolution choices, used for BOTH the streaming cap (Settings) and the
 // video download quality options. Order is best → lower (the first is default).
@@ -593,13 +599,27 @@ function pickBestCandidate(candidates, durationSecs, api) {
   return best;
 }
 
+// Capture an automated resolve for the debug panel and refresh the sidebar so
+// it shows immediately. No-op (and clears any stale capture) when debug scoring
+// is off, so normal playback never re-renders the view.
+function recordResolve(api, info) {
+  if (!debugScoring) { lastResolve = null; return; }
+  lastResolve = info;
+  renderSearchView(api);
+}
+
 async function searchByMetadata(api, title, artistName, durationSecs) {
   var query = artistName ? title + " " + artistName : title;
   // Uses the configurable fallback source (YouTube by default) — this is what
   // resolves tracks that have no direct source of their own (e.g. from Spotify,
   // or a library track missing locally), for both playback and download.
   var candidates = await runSearch(api, resolverSource, query, 7);
-  return pickBestCandidate(candidates, durationSecs, api);
+  var cand = pickBestCandidate(candidates, durationSecs, api);
+  recordResolve(api, {
+    kind: "Playback / download fallback", query: query, source: resolverSource,
+    target: durationSecs != null ? durationSecs : null, candidates: candidates, chosen: cand
+  });
+  return cand;
 }
 
 // Context-menu "Watch YouTube video": search YouTube by the track's metadata
@@ -620,6 +640,10 @@ async function watchVideoFor(api, title, artistName) {
     var query = artistName ? clean + " " + artistName : clean;
     var candidates = await runSearch(api, "youtube", query, 7);
     var cand = pickBestCandidate(candidates, null, api);
+    recordResolve(api, {
+      kind: "Watch YouTube video", query: query, source: "youtube",
+      target: null, candidates: candidates, chosen: cand
+    });
     if (!cand) {
       api.ui.showNotification("No video found for “" + clean + "”.");
       return;
@@ -1331,9 +1355,18 @@ async function activate(api) {
 
   function findResult(refId) {
     var results = stateFor(searchSource).results;
-    if (!results) return null;
-    for (var i = 0; i < results.length; i++) {
-      if (encodeRef(results[i].url, false) === refId || results[i].url === refId) return results[i];
+    if (results) {
+      for (var i = 0; i < results.length; i++) {
+        if (encodeRef(results[i].url, false) === refId || results[i].url === refId) return results[i];
+      }
+    }
+    // Fall back to the "Last resolve" debug panel candidates so its Play / Watch
+    // / Download row actions work even though they're not in the search list.
+    if (lastResolve && lastResolve.candidates) {
+      for (var k = 0; k < lastResolve.candidates.length; k++) {
+        var rc = lastResolve.candidates[k];
+        if (encodeRef(rc.url, false) === refId || rc.url === refId) return rc;
+      }
     }
     return null;
   }
@@ -1441,7 +1474,11 @@ async function activate(api) {
   api.ui.onAction("ytdlp-debug-scoring", async function (data) {
     debugScoring = !!(data && data.value);
     await api.storage.set("debugScoring", debugScoring);
+    if (!debugScoring) lastResolve = null; // drop the captured resolve when debug is off
     renderSettings(api); renderSearchView(api);
+  });
+  api.ui.onAction("ytdlp-clear-resolve", function () {
+    lastResolve = null; renderSearchView(api);
   });
 
   renderSettings(api);
@@ -1460,6 +1497,77 @@ function makeMissingDepNote() {
   if (!statusLoaded || ytDlpVersion) return null;
   return { type: "text", className: "ds-banner ds-banner--error",
     content: "yt-dlp isn't installed. Install it from Settings → Dependencies to search, play or download." };
+}
+
+// Build one track-row-list item from a search/resolve candidate at display
+// position `pos`. Folds the view count — and, when debug scoring is on, the
+// score breakdown — into the subtitle. `opts.chosen` marks the row the resolver
+// actually picked (leading ✓). Shared by the search list and the "Last resolve"
+// debug panel so both render candidates identically.
+function buildResultRow(c, pos, opts) {
+  opts = opts || {};
+  var parsed = parseTrackTitle(c.title, c.uploader);
+  var artist = parsed.artist || c.uploader || "";
+  // Fold the view count into the subtitle line ("Artist · 1.5B views").
+  // track-row-list has no dedicated views field, and views is the signal the
+  // user wants to see to spot the real music video.
+  var viewsLabel = formatViews(c.views);
+  var subtitle = artist && viewsLabel ? artist + " · " + viewsLabel : (artist || viewsLabel);
+  // Debug: fold the ranking score breakdown into the subtitle so you can see
+  // why this result placed where it did (and what the view rerank moved).
+  if (debugScoring) {
+    var dbg = formatScoreDebug(c, pos);
+    if (dbg) subtitle = subtitle ? subtitle + "  ·  " + dbg : dbg;
+  }
+  return {
+    id: encodeRef(c.url, false),
+    title: (opts.chosen ? "✓ " : "") + (parsed.title || c.title || c.url),
+    subtitle: subtitle,
+    duration: formatDuration(c.durationSecs),
+    imageUrl: thumbFor(c.url, c.thumbnail),
+    action: "ytdlp-play-one",
+    // Carry the audio ref + metadata so the host builds a native right-click
+    // menu (Play / Enqueue / Play Next), resolves artwork by name, and allows
+    // drag-to-queue — all without a DB id.
+    path: encodeRef(c.url, false),
+    artistName: artist || null,
+    durationSecs: c.durationSecs != null ? c.durationSecs : null
+  };
+}
+
+// The "Last resolve (debug)" panel: shows the candidates the most recent
+// automated resolve considered, the winner marked with a ✓. Returns null when
+// debug scoring is off or nothing has resolved yet.
+function buildResolvePanel() {
+  if (!debugScoring || !lastResolve) return null;
+  var lr = lastResolve;
+  var srcLabel = (SOURCES[lr.source] && SOURCES[lr.source].label) || lr.source;
+  var meta = ["source: " + srcLabel];
+  if (lr.target != null) meta.push("target " + formatDuration(lr.target));
+  meta.push((lr.candidates ? lr.candidates.length : 0) + " candidate" + ((lr.candidates && lr.candidates.length === 1) ? "" : "s"));
+  var body = [
+    { type: "toolbar", title: lr.kind + " · “" + lr.query + "”",
+      buttons: [{ label: "Clear", action: "ytdlp-clear-resolve", icon: "✕" }] },
+    { type: "text", content: meta.join(" · "), className: "ds-empty" }
+  ];
+  if (lr.candidates && lr.candidates.length) {
+    var rows = [];
+    for (var r = 0; r < lr.candidates.length; r++) {
+      var rc = lr.candidates[r];
+      rows.push(buildResultRow(rc, r, { chosen: !!(lr.chosen && rc.url === lr.chosen.url) }));
+    }
+    body.push({
+      type: "track-row-list", selectable: true, items: rows,
+      actions: [
+        { id: "ytdlp-play", label: "Play", icon: "▶" },
+        { id: "ytdlp-watch", label: "Watch", icon: "🎬" },
+        { id: "ytdlp-download", label: "Download", icon: "⬇" }
+      ]
+    });
+  } else {
+    body.push({ type: "text", content: "No candidates were returned for this resolve.", className: "ds-empty" });
+  }
+  return { type: "section", title: "Last resolve (debug)", children: body };
 }
 
 function renderSearchView(api) {
@@ -1510,6 +1618,11 @@ function renderSearchView(api) {
     });
   }
 
+  // Debug: the most recent automated resolve, right below the search box so you
+  // see it the moment a track is resolved (opt-in via Settings → Debugging).
+  var resolvePanel = buildResolvePanel();
+  if (resolvePanel) children.push(resolvePanel);
+
   if (busy) {
     children.push({ type: "loading", message: isLink ? "Fetching…" : "Searching…" });
   } else if (results && results.length > 0) {
@@ -1520,35 +1633,7 @@ function renderSearchView(api) {
         className: "ds-empty" });
     }
     var items = [];
-    for (var j = 0; j < results.length; j++) {
-      var c = results[j], parsed = parseTrackTitle(c.title, c.uploader);
-      var artist = parsed.artist || c.uploader || "";
-      // Fold the view count into the subtitle line ("Artist · 1.5B views").
-      // track-row-list has no dedicated views field, and views is the signal
-      // the user wants to see to spot the real music video.
-      var viewsLabel = formatViews(c.views);
-      var subtitle = artist && viewsLabel ? artist + " · " + viewsLabel : (artist || viewsLabel);
-      // Debug: fold the ranking score breakdown into the subtitle so you can see
-      // why this result placed where it did (and what the view rerank moved).
-      if (debugScoring) {
-        var dbg = formatScoreDebug(c, j);
-        if (dbg) subtitle = subtitle ? subtitle + "  ·  " + dbg : dbg;
-      }
-      items.push({
-        id: encodeRef(c.url, false),
-        title: parsed.title || c.title || c.url,
-        subtitle: subtitle,
-        duration: formatDuration(c.durationSecs),
-        imageUrl: thumbFor(c.url, c.thumbnail),
-        action: "ytdlp-play-one",
-        // Carry the audio ref + metadata so the host builds a native right-click
-        // menu (Play / Enqueue / Play Next), resolves artwork by name, and allows
-        // drag-to-queue — all without a DB id.
-        path: encodeRef(c.url, false),
-        artistName: artist || null,
-        durationSecs: c.durationSecs != null ? c.durationSecs : null
-      });
-    }
+    for (var j = 0; j < results.length; j++) items.push(buildResultRow(results[j], j));
     children.push({
       type: "track-row-list",
       selectable: true,
@@ -1659,7 +1744,7 @@ function deactivate() {
   ytDlpVersion = null; ffmpegVersion = null; statusLoaded = false;
   inFlightFiles = {}; lastSourceFile = null;
   tabState = {}; searching = false; searchingSource = null; searchGen = 0;
-  botGateNotified = false;
+  botGateNotified = false; lastResolve = null;
 }
 
 return {
@@ -1672,6 +1757,7 @@ return {
   _scoreCandidates: scoreCandidates,
   _rerankByViews: rerankByViews,
   _formatScoreDebug: formatScoreDebug,
+  _buildResultRow: buildResultRow,
   _encodeRef: encodeRef,
   _decodeRef: decodeRef,
   _cacheStem: cacheStem,
