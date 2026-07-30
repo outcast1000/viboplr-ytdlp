@@ -41,6 +41,32 @@ var debugScoring = false;
 // deactivate. Shape: { kind, query, source, target, candidates, chosen }.
 var lastResolve = null;
 
+// The two tunable scoring profiles that drive which candidate a RESOLVE picks
+// (audio playback/download fallback vs. "Watch"/preferVideo). Seeded from the
+// defaults, overwritten by stored values on activate. See "Scoring profiles".
+var scoringAudio = null;  // lazily set to defaultProfile("audio") on activate
+var scoringVideo = null;  // lazily set to defaultProfile("video") on activate
+// Debug-only tabs (visible only while debugScoring is on), each swapping the
+// search UI within the same sidebar item (no extra sidebar entries). At most one
+// is open at a time; selecting a real source tab closes both.
+//   tuneOpen    — the live scoring-profile tuner
+//   resolveOpen — the "Last resolve" readout (what the last automated pick scored)
+var resolveOpen = false;
+// Tuning tab: the profile being edited, the query/target-duration inputs, and
+// the last raw fetch it ranked (kept so editing a param re-ranks WITHOUT
+// re-fetching).
+var tuneOpen = false;
+var tuneProfile = "audio"; // "audio" | "video"
+var tuneQuery = "";
+var tuneTarget = null;     // target duration (secs) or null
+var tuneResults = null;    // raw candidates from the last Run (null before first)
+var tuneBusy = false;
+// Raw typed text for the numeric inputs, so a live re-render hands each input
+// back exactly what was typed (partial values like "-" or "1." survive) while
+// the parsed number drives the profile. Cleared on reset / profile switch.
+var tuneParamText = {};    // param key -> raw string
+var tuneTargetRaw = null;  // raw target-duration string (null = derive from tuneTarget)
+
 // Shared resolution choices, used for BOTH the streaming cap (Settings) and the
 // video download quality options. Order is best → lower (the first is default).
 var VIDEO_RESOLUTIONS = [
@@ -389,15 +415,23 @@ async function logDownloadDiagnostics(api, url) {
 // ---------------------------------------------------------------------------
 // Run a search (or resolve a pasted URL) and return candidates:
 // [{ url, title, uploader, durationSecs, thumbnail }]. Returns [] on failure.
+// View-boost reranked (the sidebar/interactive-search order).
 async function runSearch(api, source, query, count) {
   return (await runSearchFull(api, source, query, count)).candidates;
+}
+
+// Raw variant: candidates in yt-dlp's own relevance order (NO view rerank), so a
+// profile can score them off the true relevance position. Used by the resolve
+// paths and the Tuning tab, which do their own ranking.
+async function runSearchRaw(api, source, query, count) {
+  return (await runSearchFull(api, source, query, count, { rank: "none" })).candidates;
 }
 
 // Full variant: also returns `meta` — the fetched playlist's { title, count }
 // for a pasted URL, null for plain searches and single videos. The sidebar
 // Link tab uses it for its playlist header; every other caller goes through
 // runSearch and ignores it.
-async function runSearchFull(api, source, query, count) {
+async function runSearchFull(api, source, query, count, opts) {
   var none = { candidates: [], meta: null };
   var q = (query || "").trim();
   if (!q) return none;
@@ -451,8 +485,9 @@ async function runSearchFull(api, source, query, count) {
   var candidates = dropSoundcloudPreviews(parsed.candidates, source, isUrl, api);
   // Promote high-view results for real searches (official music videos usually
   // dwarf covers/lyric re-uploads in views). A pasted URL / playlist keeps its
-  // source order untouched.
-  if (!isUrl) candidates = rerankByViews(candidates, api);
+  // source order untouched, and callers that rank themselves (resolve paths,
+  // Tuning tab) pass rank: "none" to get the raw relevance order.
+  if (!isUrl && !(opts && opts.rank === "none")) candidates = rerankByViews(candidates, api);
   return { candidates: candidates, meta: parsed.meta };
 }
 
@@ -566,6 +601,186 @@ function formatScoreDebug(c, pos) {
   return parts.join(" · ");
 }
 
+// ---------------------------------------------------------------------------
+// Scoring profiles (audio vs video track-finding)
+// ---------------------------------------------------------------------------
+// When RESOLVING a track (playback/download fallback, "Watch YouTube video",
+// preferVideo streaming) we pick ONE candidate out of a yt-dlp search. The right
+// pick differs by intent: for audio we want the clean official-audio / "- Topic"
+// upload whose length matches the album track; for video we want the official
+// music video / VEVO upload, popularity-led. So the pick is driven by one of two
+// tunable PROFILES — a map of weights over signals extracted from each
+// candidate's title / uploader / duration / views. The Tuning tab (visible when
+// Settings → Debugging → "Show scoring in results" is on) edits these live and
+// validates the resulting rank. The sidebar's own manual search is unaffected —
+// it keeps its view-boost order (rerankByViews).
+//
+// Each param: key, human label, `type` ("weight" = continuous multiplier,
+// "flag" = keyword bonus/penalty applied when the signal is present), and the
+// per-profile default. Order drives the Tuning editor layout AND the debug
+// breakdown order. Pure data; exported for tests.
+var SCORING_PARAMS = [
+  { key: "w_rel",         type: "weight", label: "Relevance weight",            audio: 1.0, video: 1.0 },
+  { key: "w_views",       type: "weight", label: "Views weight",                audio: 1.0, video: 2.5 },
+  { key: "w_dur",         type: "weight", label: "Duration-match weight",       audio: 5.0, video: 1.0 },
+  { key: "official",      type: "flag",   label: "“official”",        audio: 1,   video: 2 },
+  { key: "officialAudio", type: "flag",   label: "“official audio”",  audio: 3,   video: -2 },
+  { key: "officialVideo", type: "flag",   label: "“official video” / MV", audio: -1, video: 4 },
+  { key: "topic",         type: "flag",   label: "“- Topic” channel", audio: 4,   video: -4 },
+  { key: "vevo",          type: "flag",   label: "VEVO channel",                audio: 1,   video: 3 },
+  { key: "lyrics",        type: "flag",   label: "lyric video",                 audio: 1,   video: -2 },
+  { key: "live",          type: "flag",   label: "live",                        audio: -4,  video: -1 },
+  { key: "cover",         type: "flag",   label: "cover",                       audio: -3,  video: -3 },
+  { key: "remix",         type: "flag",   label: "remix",                       audio: -2,  video: -1 },
+  { key: "instrumental",  type: "flag",   label: "instrumental",                audio: -3,  video: -2 },
+  { key: "effects",       type: "flag",   label: "sped up / nightcore / 8D",    audio: -4,  video: -3 }
+];
+// Fixed contribution order for the debug breakdown (weights first, then flags in
+// param order) so the readout is deterministic regardless of object key order.
+var CONTRIB_ORDER = (function () {
+  var o = ["rel", "views", "dur"];
+  for (var i = 0; i < SCORING_PARAMS.length; i++) {
+    if (SCORING_PARAMS[i].type === "flag") o.push(SCORING_PARAMS[i].key);
+  }
+  return o;
+})();
+
+// A profile filled with a kind's ("audio" | "video") defaults. Pure.
+function defaultProfile(kind) {
+  var p = {};
+  for (var i = 0; i < SCORING_PARAMS.length; i++) p[SCORING_PARAMS[i].key] = SCORING_PARAMS[i][kind];
+  return p;
+}
+// Merge a stored profile over the kind's defaults: every known key gets the
+// stored numeric value if present, else the default; unknown/NaN keys are
+// dropped. So adding a new param later still yields a valid profile from old
+// storage. Pure; exported for tests.
+function normalizeProfile(kind, stored) {
+  var p = defaultProfile(kind);
+  if (stored && typeof stored === "object") {
+    for (var i = 0; i < SCORING_PARAMS.length; i++) {
+      var k = SCORING_PARAMS[i].key, v = stored[k];
+      if (typeof v === "number" && isFinite(v)) p[k] = v;
+    }
+  }
+  return p;
+}
+
+// Lowercase + collapse whitespace, padded with spaces so \b-free substring
+// checks still see word edges. Pure.
+function normForMatch(s) {
+  return " " + String(s == null ? "" : s).toLowerCase().replace(/\s+/g, " ").trim() + " ";
+}
+
+// Duration closeness in [-1, 1]: exact match = +1, decays linearly to 0 at 15s
+// off and floors at -1 by 30s off (so a wildly wrong length is penalized, not
+// merely un-rewarded). Neutral 0 when either duration is unknown. Pure.
+function durationScore(dur, target) {
+  if (target == null || target <= 0 || dur == null) return 0;
+  var s = 1 - Math.abs(dur - target) / 15;
+  return s > 1 ? 1 : (s < -1 ? -1 : s);
+}
+
+// Parse a target-duration input into seconds: plain seconds ("238"), "m:ss"
+// ("3:58" -> 238) or "h:mm:ss". Returns null for blank/garbage. Pure; exported.
+function parseDurationInput(s) {
+  var str = String(s == null ? "" : s).trim();
+  if (!str) return null;
+  var parts = str.split(":");
+  if (parts.length === 1) {
+    var n = parseInt(parts[0], 10);
+    return isNaN(n) || n < 0 ? null : n;
+  }
+  var total = 0;
+  for (var i = 0; i < parts.length; i++) {
+    var p = parseInt(parts[i], 10);
+    if (isNaN(p) || p < 0) return null;
+    total = total * 60 + p;
+  }
+  return total;
+}
+
+// Extract the keyword/channel signals (0/1 flags matching the SCORING_PARAMS
+// "flag" keys) from a candidate. Pure; exported for tests.
+function candidateSignals(c) {
+  var t = normForMatch(c && c.title);
+  var u = normForMatch(c && c.uploader);
+  var officialVideo = /\bofficial\s+(music\s+)?video\b/.test(t) || /\bofficial\s+mv\b/.test(t) || /\bmv\b/.test(t);
+  var officialAudio = /\bofficial\s+audio\b/.test(t);
+  return {
+    official: /\bofficial\b/.test(t) ? 1 : 0,
+    officialAudio: officialAudio ? 1 : 0,
+    officialVideo: officialVideo ? 1 : 0,
+    topic: /-\s*topic\s*$/.test(u) ? 1 : 0,
+    vevo: /vevo/.test(u) ? 1 : 0,
+    lyrics: /\blyric/.test(t) ? 1 : 0,
+    live: /\blive\b/.test(t) ? 1 : 0,
+    cover: /\bcover\b/.test(t) ? 1 : 0,
+    remix: /\bremix\b/.test(t) ? 1 : 0,
+    instrumental: /\binstrumental\b/.test(t) ? 1 : 0,
+    effects: /\b(sped\s*up|nightcore|8d|slowed|reverb|daycore)\b/.test(t) ? 1 : 0
+  };
+}
+
+// Score one candidate under a profile. `ctx` = { rel, target }. Returns
+// { score, parts, rel, views, signals } where `parts` is the per-signal
+// contribution (for the debug breakdown). Pure; exported for tests.
+function scoreWithProfile(c, ctx, params) {
+  var rel = ctx && ctx.rel != null ? ctx.rel : 0;
+  var target = ctx ? ctx.target : null;
+  var views = c && c.views != null && c.views > 0 ? c.views : 0;
+  var dur = c && c.durationSecs != null ? c.durationSecs : null;
+  var sig = candidateSignals(c);
+  var parts = {}, total = 0;
+  function add(name, val) { parts[name] = val; total += val; }
+  add("rel", -rel * (params.w_rel || 0));
+  add("views", (params.w_views || 0) * Math.log(views + 1) / Math.LN10);
+  add("dur", (params.w_dur || 0) * durationScore(dur, target));
+  for (var i = 0; i < SCORING_PARAMS.length; i++) {
+    var sp = SCORING_PARAMS[i];
+    if (sp.type === "flag" && sig[sp.key]) add(sp.key, params[sp.key] || 0);
+  }
+  return { score: total, parts: parts, rel: rel, views: views, signals: sig };
+}
+
+// Rank candidates by a profile (highest score first, stable on the original
+// yt-dlp relevance order). Stamps each candidate with `_profileScore` so the
+// Tuning UI can show why it placed where it did. Pure (aside from the stamp);
+// exported for tests.
+function rankByProfile(candidates, params, target) {
+  var list = candidates || [];
+  var scored = list.map(function (c, i) {
+    return { c: c, rel: i, res: scoreWithProfile(c, { rel: i, target: target != null ? target : null }, params) };
+  });
+  scored.sort(function (a, b) {
+    if (b.res.score !== a.res.score) return b.res.score - a.res.score;
+    return a.rel - b.rel;
+  });
+  return scored.map(function (s, pos) {
+    s.c._profileScore = { pos: pos, rel: s.rel, score: s.res.score, parts: s.res.parts, signals: s.res.signals };
+    return s.c;
+  });
+}
+
+// Compact one-line profile-score breakdown for the Tuning result list. ""
+// when the candidate carries no profile score. Pure; exported for tests.
+function formatProfileScore(c) {
+  var s = c && c._profileScore;
+  if (!s) return "";
+  var parts = ["#" + (s.pos + 1)];
+  if (s.rel !== s.pos) parts.push("was #" + (s.rel + 1));
+  parts.push("score " + s.score.toFixed(2));
+  var contribs = [];
+  for (var i = 0; i < CONTRIB_ORDER.length; i++) {
+    var k = CONTRIB_ORDER[i], v = s.parts[k];
+    if (typeof v === "number" && Math.abs(v) >= 0.005) {
+      contribs.push(k + " " + (v >= 0 ? "+" : "") + v.toFixed(2));
+    }
+  }
+  if (contribs.length) parts.push(contribs.join(" "));
+  return parts.join(" · ");
+}
+
 // SoundCloud Go+/paid tracks expose only a 30s preview without auth. Real tracks
 // are rarely exactly ~30s, so treat a ~30s SoundCloud result as an "obvious
 // preview" and drop it — but never for a directly pasted URL (there the user
@@ -580,23 +795,11 @@ function dropSoundcloudPreviews(candidates, source, isUrlPaste, api) {
   return kept;
 }
 
-// Pick the best candidate for a known target duration (fallback resolver path):
-// first within ±3s, else the top result. Returns a candidate or null.
-function pickBestCandidate(candidates, durationSecs, api) {
-  if (!candidates || candidates.length === 0) {
-    if (api) api.log("warn", "yt-dlp search parsed 0 valid candidates", "ytdlp");
-    return null;
-  }
-  var best = candidates[0], matched = false;
-  if (durationSecs != null && durationSecs > 0) {
-    for (var c = 0; c < candidates.length; c++) {
-      if (candidates[c].durationSecs !== null && Math.abs(candidates[c].durationSecs - durationSecs) <= 3) {
-        best = candidates[c]; matched = true; break;
-      }
-    }
-  }
-  if (api) api.log("info", candidates.length + " candidate(s); chose " + best.url + (matched ? " (duration match)" : " (top result)"), "ytdlp");
-  return best;
+// The active scoring profile for a kind ("audio" | "video"), falling back to the
+// baked defaults if activate hasn't populated them yet.
+function profileFor(kind) {
+  if (kind === "video") return scoringVideo || defaultProfile("video");
+  return scoringAudio || defaultProfile("audio");
 }
 
 // Capture an automated resolve for the debug panel and refresh the sidebar so
@@ -608,25 +811,43 @@ function recordResolve(api, info) {
   renderSearchView(api);
 }
 
-async function searchByMetadata(api, title, artistName, durationSecs) {
-  var query = artistName ? title + " " + artistName : title;
-  // Uses the configurable fallback source (YouTube by default) — this is what
-  // resolves tracks that have no direct source of their own (e.g. from Spotify,
-  // or a library track missing locally), for both playback and download.
-  var candidates = await runSearch(api, resolverSource, query, 7);
-  var cand = pickBestCandidate(candidates, durationSecs, api);
+// Shared resolve: fetch RAW candidates (yt-dlp relevance order), rank them by
+// the given profile ("audio" | "video"), record the resolve for the debug panel
+// and return the winner (or null). `target` is the known duration in secs (or
+// null); `resolveKind` is the human label shown in the panel.
+async function resolvePick(api, source, query, target, profileKind, resolveKind) {
+  var candidates = await runSearchRaw(api, source, query, 7);
+  var ranked = rankByProfile(candidates, profileFor(profileKind), target);
+  var cand = ranked.length ? ranked[0] : null;
+  if (api) {
+    if (!cand) api.log("warn", "yt-dlp search parsed 0 valid candidates", "ytdlp");
+    else api.log("info", ranked.length + " candidate(s); " + profileKind + " profile chose " +
+      cand.url + " (score " + cand._profileScore.score.toFixed(2) + ")", "ytdlp");
+  }
   recordResolve(api, {
-    kind: "Playback / download fallback", query: query, source: resolverSource,
-    target: durationSecs != null ? durationSecs : null, candidates: candidates, chosen: cand
+    kind: resolveKind, query: query, source: source, profile: profileKind,
+    target: target != null ? target : null, candidates: ranked, chosen: cand
   });
   return cand;
 }
 
-// Context-menu "Watch YouTube video": search YouTube by the track's metadata
-// and play the top hit as a VIDEO in the theater. Always searches YouTube (the
-// video source), NOT the configurable fallback resolver — the action is
-// explicitly about YouTube video. Feedback is a notification (context-menu
-// actions have no loading modal); errors surface the same way and never throw.
+// Resolve a track that has no direct source of its own (played from Spotify, a
+// library miss, or a metadata download) via the configurable fallback source
+// (YouTube by default). `profileKind` selects the scoring profile — "audio" for
+// ordinary playback/downloads, "video" when the host wants a video stream.
+async function searchByMetadata(api, title, artistName, durationSecs, profileKind) {
+  var query = artistName ? title + " " + artistName : title;
+  return resolvePick(api, resolverSource, query,
+    durationSecs != null ? durationSecs : null,
+    profileKind === "video" ? "video" : "audio",
+    "Playback / download fallback");
+}
+
+// Context-menu "Watch YouTube video": search YouTube by the track's metadata and
+// play the top hit as a VIDEO in the theater. Always searches YouTube (the video
+// source), NOT the configurable fallback resolver, and always ranks with the
+// VIDEO profile. Feedback is a notification (context-menu actions have no loading
+// modal); errors surface the same way and never throw.
 async function watchVideoFor(api, title, artistName) {
   await ensureToolStatus(api);
   if (!ytDlpVersion) {
@@ -638,12 +859,7 @@ async function watchVideoFor(api, title, artistName) {
   api.ui.showNotification("Searching YouTube for a video…");
   try {
     var query = artistName ? clean + " " + artistName : clean;
-    var candidates = await runSearch(api, "youtube", query, 7);
-    var cand = pickBestCandidate(candidates, null, api);
-    recordResolve(api, {
-      kind: "Watch YouTube video", query: query, source: "youtube",
-      target: null, candidates: candidates, chosen: cand
-    });
+    var cand = await resolvePick(api, "youtube", query, null, "video", "Watch YouTube video");
     if (!cand) {
       api.ui.showNotification("No video found for “" + clean + "”.");
       return;
@@ -1105,7 +1321,9 @@ async function activate(api) {
     api.storage.get("searchSource"),
     api.storage.get("resolverSource"),
     api.storage.get("maxVideoHeight"),
-    api.storage.get("debugScoring")
+    api.storage.get("debugScoring"),
+    api.storage.get("scoringAudio"),
+    api.storage.get("scoringVideo")
   ]);
   if (stored[0] != null && typeof stored[0] === "number") cacheMaxMb = stored[0];
   if (stored[1] === "download" || stored[1] === "stream") playbackMode = stored[1];
@@ -1113,6 +1331,10 @@ async function activate(api) {
   if (stored[3] && SOURCES[stored[3]]) resolverSource = stored[3];
   if (stored[4] != null && typeof stored[4] === "number") maxVideoHeight = stored[4];
   if (stored[5] === true) debugScoring = true;
+  // Scoring profiles: stored values merged over the defaults (missing/new keys
+  // keep their default), so tuning survives restarts and future param additions.
+  scoringAudio = normalizeProfile("audio", stored[6]);
+  scoringVideo = normalizeProfile("video", stored[7]);
 
   // Startup cleanup: wipe transcoded temp files; keep cached source downloads.
   scheduleCleanup(api, true).catch(function (e) { api.log("warn", "Startup cache cleanup failed: " + (e && e.message ? e.message : e), "ytdlp"); });
@@ -1128,7 +1350,9 @@ async function activate(api) {
     title = stripRemasterSuffix(title);
     var preferVideo = !!(opts && opts.preferVideo);
     try {
-      var cand = await searchByMetadata(api, title, artistName, durationSecs);
+      // preferVideo → rank with the VIDEO profile (official MV / VEVO); plain
+      // audio playback → the AUDIO profile (clean official-audio / Topic).
+      var cand = await searchByMetadata(api, title, artistName, durationSecs, preferVideo ? "video" : "audio");
       if (!cand) { api.log("warn", "No match for: " + title, "ytdlp"); return null; }
       if (preferVideo) {
         var vid = await resolvePlayable(api, cand.url, true);
@@ -1271,7 +1495,10 @@ async function activate(api) {
     if (!ytDlpVersion) return null;
     title = stripRemasterSuffix(title);
     try {
-      var cand = await searchByMetadata(api, title, artistName, durationSecs);
+      // Downloads are audio unless a video format was requested — match the
+      // scoring profile so a video download ranks toward the actual MV.
+      var dlProfile = parseVideoFormat(format).isVideo ? "video" : "audio";
+      var cand = await searchByMetadata(api, title, artistName, durationSecs, dlProfile);
       if (!cand) return null;
       // The host's metadata is authoritative here (a real library track).
       return await resolveDownload(api, cand.url, format, { title: title, artist: artistName, album: albumName });
@@ -1323,7 +1550,70 @@ async function activate(api) {
   api.ui.onAction("ytdlp-source", function (data) {
     // The `tabs` control dispatches { tabId }, not { value } (that's `select`).
     var s = data && (data.tabId || data.value);
-    if (s && SOURCES[s]) { searchSource = s; api.storage.set("searchSource", s); renderSearchView(api); }
+    if (s === "__tune") { tuneOpen = true; resolveOpen = false; renderSearchView(api); return; }
+    if (s === "__resolve") { resolveOpen = true; tuneOpen = false; renderSearchView(api); return; }
+    if (s && SOURCES[s]) {
+      tuneOpen = false; resolveOpen = false;
+      searchSource = s; api.storage.set("searchSource", s); renderSearchView(api);
+    }
+  });
+
+  // ---- Tuning tab (visible only while debug scoring is on) ----
+  function activeTuneProfile() { return tuneProfile === "video" ? scoringVideo : scoringAudio; }
+  function persistTuneProfile(api) {
+    api.storage.set(tuneProfile === "video" ? "scoringVideo" : "scoringAudio", activeTuneProfile())
+      .catch(function (e) { console.error("[ytdlp] persist scoring profile failed:", e); });
+  }
+  api.ui.onAction("ytdlp-tune-profile", function (data) {
+    var p = data && (data.tabId || data.value);
+    if (p !== "audio" && p !== "video") return;
+    tuneProfile = p; tuneParamText = {}; // inputs re-derive from the new profile
+    renderSearchView(api);
+  });
+  // Param edit: store the raw text so the input keeps exactly what was typed, and
+  // apply the parsed number to the LIVE profile (so real resolves change too).
+  // Registered once per param key.
+  for (var pi = 0; pi < SCORING_PARAMS.length; pi++) {
+    (function (key) {
+      api.ui.onAction("ytdlp-tune-p-" + key, function (data) {
+        var raw = data && data.value != null ? String(data.value) : "";
+        tuneParamText[key] = raw;
+        var v = parseFloat(raw);
+        if (isFinite(v)) { activeTuneProfile()[key] = v; persistTuneProfile(api); }
+        renderSearchView(api);
+      });
+    })(SCORING_PARAMS[pi].key);
+  }
+  api.ui.onAction("ytdlp-tune-target", function (data) {
+    tuneTargetRaw = data && data.value != null ? String(data.value) : "";
+    tuneTarget = parseDurationInput(tuneTargetRaw);
+    renderSearchView(api);
+  });
+  api.ui.onAction("ytdlp-tune-reset", function () {
+    if (tuneProfile === "video") scoringVideo = defaultProfile("video");
+    else scoringAudio = defaultProfile("audio");
+    tuneParamText = {};
+    persistTuneProfile(api);
+    renderSearchView(api);
+  });
+  api.ui.onAction("ytdlp-tune-run", async function (data) {
+    if (tuneBusy) return;
+    tuneQuery = data && typeof data.query === "string" ? data.query : "";
+    if (!tuneQuery.trim()) { tuneResults = null; renderSearchView(api); return; }
+    await ensureToolStatus(api);
+    if (!ytDlpVersion) { renderSearchView(api); return; }
+    // Match the real resolve source per profile: video → YouTube, audio → the
+    // configured fallback source. 12 candidates so the ranking has something to
+    // reorder.
+    var src = tuneProfile === "video" ? "youtube" : resolverSource;
+    tuneBusy = true; renderSearchView(api);
+    try {
+      tuneResults = await runSearchRaw(api, src, tuneQuery, 12);
+    } catch (e) {
+      api.log("error", "Tuning search failed: " + (e && e.message ? e.message : e), "ytdlp");
+      tuneResults = [];
+    }
+    tuneBusy = false; renderSearchView(api);
   });
 
   api.ui.onAction("ytdlp-search-submit", async function (data) {
@@ -1366,6 +1656,14 @@ async function activate(api) {
       for (var k = 0; k < lastResolve.candidates.length; k++) {
         var rc = lastResolve.candidates[k];
         if (encodeRef(rc.url, false) === refId || rc.url === refId) return rc;
+      }
+    }
+    // ...and the Tuning tab's ranked candidates, so Play / Watch / Download work
+    // straight from the tuning result list.
+    if (tuneResults) {
+      for (var t = 0; t < tuneResults.length; t++) {
+        var tc = tuneResults[t];
+        if (encodeRef(tc.url, false) === refId || tc.url === refId) return tc;
       }
     }
     return null;
@@ -1474,7 +1772,7 @@ async function activate(api) {
   api.ui.onAction("ytdlp-debug-scoring", async function (data) {
     debugScoring = !!(data && data.value);
     await api.storage.set("debugScoring", debugScoring);
-    if (!debugScoring) lastResolve = null; // drop the captured resolve when debug is off
+    if (!debugScoring) { lastResolve = null; tuneOpen = false; resolveOpen = false; } // drop debug capture + close debug tabs
     renderSettings(api); renderSearchView(api);
   });
   api.ui.onAction("ytdlp-clear-resolve", function () {
@@ -1502,8 +1800,9 @@ function makeMissingDepNote() {
 // Build one track-row-list item from a search/resolve candidate at display
 // position `pos`. Folds the view count — and, when debug scoring is on, the
 // score breakdown — into the subtitle. `opts.chosen` marks the row the resolver
-// actually picked (leading ✓). Shared by the search list and the "Last resolve"
-// debug panel so both render candidates identically.
+// actually picked (leading ✓). `opts.profile` folds the PROFILE score breakdown
+// (Tuning tab) instead of the view-rerank one. Shared by the search list, the
+// "Last resolve" debug panel and the Tuning tab so all render identically.
 function buildResultRow(c, pos, opts) {
   opts = opts || {};
   var parsed = parseTrackTitle(c.title, c.uploader);
@@ -1513,12 +1812,11 @@ function buildResultRow(c, pos, opts) {
   // user wants to see to spot the real music video.
   var viewsLabel = formatViews(c.views);
   var subtitle = artist && viewsLabel ? artist + " · " + viewsLabel : (artist || viewsLabel);
-  // Debug: fold the ranking score breakdown into the subtitle so you can see
-  // why this result placed where it did (and what the view rerank moved).
-  if (debugScoring) {
-    var dbg = formatScoreDebug(c, pos);
-    if (dbg) subtitle = subtitle ? subtitle + "  ·  " + dbg : dbg;
-  }
+  // Fold the ranking score breakdown into the subtitle so you can see why this
+  // result placed where it did — the profile breakdown in the Tuning tab, else
+  // (when debug scoring is on) the view-rerank one.
+  var dbg = opts.profile ? formatProfileScore(c) : (debugScoring ? formatScoreDebug(c, pos) : "");
+  if (dbg) subtitle = subtitle ? subtitle + "  ·  " + dbg : dbg;
   return {
     id: encodeRef(c.url, false),
     title: (opts.chosen ? "✓ " : "") + (parsed.title || c.title || c.url),
@@ -1535,28 +1833,37 @@ function buildResultRow(c, pos, opts) {
   };
 }
 
-// The "Last resolve (debug)" panel: shows the candidates the most recent
-// automated resolve considered, the winner marked with a ✓. Returns null when
-// debug scoring is off or nothing has resolved yet.
-function buildResolvePanel() {
-  if (!debugScoring || !lastResolve) return null;
+// The "Last resolve" tab: the candidates the most recent AUTOMATED resolve
+// (playback/download fallback or "Watch YouTube video") considered, ranked by
+// the profile it used, with the winning pick ✓ and the same per-signal
+// breakdown as the Tuning tab. Shows an empty state until something resolves.
+function appendResolveView(children) {
   var lr = lastResolve;
+  children.push({
+    type: "toolbar", title: "Last resolve",
+    buttons: lr ? [{ label: "Clear", action: "ytdlp-clear-resolve", icon: "✕" }] : []
+  });
+  if (!lr) {
+    children.push({
+      type: "text", className: "ds-empty",
+      content: "No automated resolve captured yet. Play a track that resolves through yt-dlp — a Spotify track, a library miss, or the “Watch YouTube video” action — and the candidates it scored (and the one it picked) appear here."
+    });
+    return;
+  }
   var srcLabel = (SOURCES[lr.source] && SOURCES[lr.source].label) || lr.source;
-  var meta = ["source: " + srcLabel];
+  var profileLabel = lr.profile ? (lr.profile.charAt(0).toUpperCase() + lr.profile.slice(1)) : "—";
+  var meta = ["Profile: " + profileLabel, "source: " + srcLabel];
   if (lr.target != null) meta.push("target " + formatDuration(lr.target));
   meta.push((lr.candidates ? lr.candidates.length : 0) + " candidate" + ((lr.candidates && lr.candidates.length === 1) ? "" : "s"));
-  var body = [
-    { type: "toolbar", title: lr.kind + " · “" + lr.query + "”",
-      buttons: [{ label: "Clear", action: "ytdlp-clear-resolve", icon: "✕" }] },
-    { type: "text", content: meta.join(" · "), className: "ds-empty" }
-  ];
+  children.push({ type: "text", content: lr.kind + " · “" + lr.query + "”" });
+  children.push({ type: "text", content: meta.join("  ·  "), className: "ds-empty" });
   if (lr.candidates && lr.candidates.length) {
     var rows = [];
     for (var r = 0; r < lr.candidates.length; r++) {
       var rc = lr.candidates[r];
-      rows.push(buildResultRow(rc, r, { chosen: !!(lr.chosen && rc.url === lr.chosen.url) }));
+      rows.push(buildResultRow(rc, r, { profile: true, chosen: !!(lr.chosen && rc.url === lr.chosen.url) }));
     }
-    body.push({
+    children.push({
       type: "track-row-list", selectable: true, items: rows,
       actions: [
         { id: "ytdlp-play", label: "Play", icon: "▶" },
@@ -1565,9 +1872,98 @@ function buildResolvePanel() {
       ]
     });
   } else {
-    body.push({ type: "text", content: "No candidates were returned for this resolve.", className: "ds-empty" });
+    children.push({ type: "text", content: "No candidates were returned for this resolve.", className: "ds-empty" });
   }
-  return { type: "section", title: "Last resolve (debug)", children: body };
+}
+
+// The Tuning tab: pick a profile, run a real search, and see it ranked by that
+// profile with a full per-signal breakdown — editing any weight re-ranks live.
+// The edited profile IS the live one, so tuning changes real resolves too.
+// Build the ranked-results column node(s) for the current tuning state.
+function buildTuningResults(profile) {
+  if (tuneBusy) return [{ type: "loading", message: "Searching…" }];
+  if (tuneResults == null) {
+    return [{ type: "text", className: "ds-empty", content: "Enter a query and press Run to rank candidates with this profile." }];
+  }
+  if (tuneResults.length === 0) {
+    return [{ type: "text", className: "ds-empty", content: "No results for that query." }];
+  }
+  var ranked = rankByProfile(tuneResults, profile, tuneTarget);
+  var items = [];
+  for (var r = 0; r < ranked.length; r++) items.push(buildResultRow(ranked[r], r, { profile: true, chosen: r === 0 }));
+  return [{
+    type: "track-row-list", selectable: true, items: items,
+    actions: [
+      { id: "ytdlp-play", label: "Play", icon: "▶" },
+      { id: "ytdlp-watch", label: "Watch", icon: "🎬" },
+      { id: "ytdlp-download", label: "Download", icon: "⬇" }
+    ]
+  }];
+}
+
+function appendTuningView(children) {
+  var profile = tuneProfile === "video" ? scoringVideo : scoringAudio;
+  var realPath = tuneProfile === "video"
+    ? "the “Watch YouTube video” action and preferVideo streaming"
+    : "playback / download fallback (Spotify tracks, library misses)";
+
+  // Full-width header.
+  children.push({
+    type: "toolbar", title: "Scoring tuning",
+    buttons: [{ label: "Reset " + tuneProfile + " to defaults", action: "ytdlp-tune-reset", icon: "↺" }]
+  });
+  children.push({
+    type: "text", className: "ds-empty",
+    content: "Rank a real search with the " + tuneProfile + " profile to see why each pick wins. " +
+      "Edit any weight and the results re-rank instantly. This is exactly how " + realPath + " chooses its result."
+  });
+
+  // Left column: all the controls (profile, query, target, weights, signals).
+  var controls = [];
+  controls.push({
+    type: "tabs", action: "ytdlp-tune-profile", activeTab: tuneProfile,
+    tabs: [{ id: "audio", label: "Audio profile" }, { id: "video", label: "Video profile" }]
+  });
+  controls.push({
+    type: "search-input", action: "ytdlp-tune-run", value: tuneQuery,
+    placeholder: "Search query, e.g. creep radiohead",
+    buttonLabel: tuneBusy ? "…" : "Run"
+  });
+  controls.push({
+    type: "settings-row", label: "Target duration",
+    description: "Optional — the known track length the duration-match weight scores against (e.g. 3:58 or 238). Blank ignores duration.",
+    control: {
+      type: "text-input", action: "ytdlp-tune-target",
+      placeholder: "m:ss or seconds",
+      value: tuneTargetRaw != null ? tuneTargetRaw : (tuneTarget != null ? String(tuneTarget) : "")
+    }
+  });
+  // Param editors, grouped by kind. Each input shows the raw typed text if the
+  // user has touched it this session, else the live profile value.
+  var weightRows = [], flagRows = [];
+  for (var i = 0; i < SCORING_PARAMS.length; i++) {
+    var sp = SCORING_PARAMS[i];
+    var val = tuneParamText[sp.key] != null ? tuneParamText[sp.key] : String(profile[sp.key]);
+    var row = {
+      type: "settings-row", label: sp.label,
+      control: { type: "text-input", action: "ytdlp-tune-p-" + sp.key, value: val, placeholder: "0" }
+    };
+    (sp.type === "weight" ? weightRows : flagRows).push(row);
+  }
+  controls.push({ type: "section", title: "Weights (multipliers)", children: weightRows });
+  controls.push({ type: "section", title: "Keyword & channel signals (+ favor / − penalize)", children: flagRows });
+
+  // Right column: the live ranked results.
+  var results = [{ type: "section", title: "Ranked results", children: buildTuningResults(profile) }];
+
+  // Two columns side by side (stacks on a narrow view — see plugin-layout-columns).
+  children.push({
+    type: "layout", direction: "horizontal", className: "plugin-layout-columns",
+    children: [
+      { type: "layout", direction: "vertical", children: controls },
+      { type: "layout", direction: "vertical", children: results }
+    ]
+  });
 }
 
 function renderSearchView(api) {
@@ -1575,13 +1971,32 @@ function renderSearchView(api) {
   var note = makeMissingDepNote();
   if (note) children.push(note);
 
-  // Source tabs (which extractor the search box queries).
+  // Source tabs (which extractor the search box queries) + the debug-only Tuning
+  // and Last-resolve tabs that only exist while debug scoring is on.
   var sourceTabs = [];
   for (var i = 0; i < SOURCE_ORDER.length; i++) {
     var k = SOURCE_ORDER[i];
     sourceTabs.push({ id: k, label: SOURCES[k].label });
   }
-  children.push({ type: "tabs", tabs: sourceTabs, activeTab: searchSource, action: "ytdlp-source" });
+  if (debugScoring) {
+    sourceTabs.push({ id: "__tune", label: "🔧 Tuning" });
+    sourceTabs.push({ id: "__resolve", label: "🧭 Last resolve" });
+  }
+  var activeTab = (resolveOpen && debugScoring) ? "__resolve"
+    : (tuneOpen && debugScoring) ? "__tune" : searchSource;
+  children.push({ type: "tabs", tabs: sourceTabs, activeTab: activeTab, action: "ytdlp-source" });
+
+  // The debug tabs replace the search UI within the same sidebar item.
+  if (tuneOpen && debugScoring) {
+    appendTuningView(children);
+    api.ui.setViewData("ytdlp-search", { type: "layout", direction: "vertical", children: children }, { scrollKey: "__tune" });
+    return;
+  }
+  if (resolveOpen && debugScoring) {
+    appendResolveView(children);
+    api.ui.setViewData("ytdlp-search", { type: "layout", direction: "vertical", children: children }, { scrollKey: "__resolve" });
+    return;
+  }
 
   var st = stateFor(searchSource);
   var isLink = searchSource === "link";
@@ -1617,11 +2032,6 @@ function renderSearchView(api) {
       ]
     });
   }
-
-  // Debug: the most recent automated resolve, right below the search box so you
-  // see it the moment a track is resolved (opt-in via Settings → Debugging).
-  var resolvePanel = buildResolvePanel();
-  if (resolvePanel) children.push(resolvePanel);
 
   if (busy) {
     children.push({ type: "loading", message: isLink ? "Fetching…" : "Searching…" });
@@ -1730,7 +2140,7 @@ function renderSettings(api) {
         type: "section", title: "Debugging", children: [{
           type: "settings-row",
           label: "Show scoring in results",
-          description: "Annotate each search result with its ranking score (relevance position, view boost, final score). Searches, the \"Watch YouTube video\" action and the playback/download fallback all rank the same way — type a track's \"title artist\" here to see exactly why a given video wins.",
+          description: "Annotate each search result with its ranking score, show a \"Last resolve\" panel of what the automated picks considered, and add a \"🔧 Tuning\" tab to the yt-dlp sidebar. In Tuning you can rank a real search with the Audio or Video profile, see the full per-signal breakdown, and edit the weights live — the same weights that drive which video the automated audio (playback/download) and video (Watch / preferVideo) resolves pick.",
           control: {
             type: "toggle", action: "ytdlp-debug-scoring", checked: debugScoring
           }
@@ -1745,6 +2155,10 @@ function deactivate() {
   inFlightFiles = {}; lastSourceFile = null;
   tabState = {}; searching = false; searchingSource = null; searchGen = 0;
   botGateNotified = false; lastResolve = null;
+  scoringAudio = null; scoringVideo = null;
+  resolveOpen = false;
+  tuneOpen = false; tuneProfile = "audio"; tuneQuery = ""; tuneTarget = null;
+  tuneResults = null; tuneBusy = false; tuneParamText = {}; tuneTargetRaw = null;
 }
 
 return {
@@ -1757,6 +2171,15 @@ return {
   _scoreCandidates: scoreCandidates,
   _rerankByViews: rerankByViews,
   _formatScoreDebug: formatScoreDebug,
+  _SCORING_PARAMS: SCORING_PARAMS,
+  _defaultProfile: defaultProfile,
+  _normalizeProfile: normalizeProfile,
+  _durationScore: durationScore,
+  _parseDurationInput: parseDurationInput,
+  _candidateSignals: candidateSignals,
+  _scoreWithProfile: scoreWithProfile,
+  _rankByProfile: rankByProfile,
+  _formatProfileScore: formatProfileScore,
   _buildResultRow: buildResultRow,
   _encodeRef: encodeRef,
   _decodeRef: decodeRef,
