@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.13.0
+- **Separate audio & video scoring profiles for finding a track.** When the
+  plugin has to *pick* a result from a search — the playback/download fallback
+  (Spotify tracks, library misses) and the "Watch YouTube video" / prefer-video
+  paths — it now ranks candidates with one of two tunable profiles instead of a
+  single view-boost + duration heuristic. The **audio** profile favors clean
+  official-audio / "- Topic" uploads whose length matches the track; the
+  **video** profile favors the official music video / VEVO upload, popularity-led.
+  Scoring is a weighted sum over relevance, views and duration match plus
+  title/channel keyword signals (official / official audio / official video · MV /
+  Topic / VEVO / lyrics / live / cover / remix / instrumental / sped-up·nightcore·8D).
+- **Tuning tab** (Settings → yt-dlp → Debugging → "Show scoring in results" adds
+  a "🔧 Tuning" tab to the yt-dlp sidebar). Rank a real search with either
+  profile, see the full per-signal breakdown behind every result, and edit any
+  weight live — the list re-ranks instantly with no re-fetch. The edited profile
+  is the live one, so tuning immediately changes what automated resolves pick;
+  Reset restores the defaults. Controls sit beside the ranked results.
+- **"Last resolve" moved to its own "🧭 Last resolve" tab** (same Debugging
+  toggle) and now shows the **profile used** plus the same per-signal
+  calculations as Tuning, with the winning pick marked. Previously it was an
+  inline panel in the search view with no score breakdown.
+- Scoring debug annotations and the two new tabs are all opt-in behind the
+  existing "Show scoring in results" toggle; nothing changes with it off.
+
+
 ## v1.12.0
 - **"Last resolve" debug panel.** With debug scoring on (Settings → yt-dlp →
   Debugging), the yt-dlp sidebar now shows a panel — right when a track is
