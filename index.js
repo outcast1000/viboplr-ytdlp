@@ -104,6 +104,21 @@ function formatDuration(secs) {
   return (h > 0 ? h + ":" : "") + mm + ":" + ss;
 }
 
+// View count -> compact "1.5B views" / "16M views" / "573K views" / "42 views".
+// Floors like YouTube (1 decimal below 10 of a unit, whole above). Returns ""
+// for null/NaN/negative. Pure; exported for tests.
+function formatViews(n) {
+  if (n == null || isNaN(n) || n < 0) return "";
+  function unit(x) {
+    var v = x < 10 ? Math.floor(x * 10) / 10 : Math.floor(x);
+    return String(v);
+  }
+  if (n >= 1e9) return unit(n / 1e9) + "B views";
+  if (n >= 1e6) return unit(n / 1e6) + "M views";
+  if (n >= 1e3) return unit(n / 1e3) + "K views";
+  return n + (n === 1 ? " view" : " views");
+}
+
 // Deterministic base36 hash (djb2) — used for cache filenames since the sandbox
 // has no Math.random/Date. Length is folded in to further cut collision odds.
 function hashSlug(s) {
@@ -398,10 +413,13 @@ async function runSearchFull(api, source, query, count) {
   ].concat(ENCODING_ARGS);
   // Bound a pasted playlist so a huge list can't flood the view/queue.
   if (isUrl) args.push("-I", "1:" + LINK_MAX);
-  // Comma fields = first non-null. thumbnail is best-effort. URL fetches also
-  // carry the playlist's title/count (NA for a single video) so the Link tab
-  // can name what it fetched and show how much the -I cap hid.
-  var printFields = "%(url,webpage_url)s\t%(duration)s\t%(uploader,channel,uploader_id)s\t%(title)s\t%(thumbnail)s";
+  // Comma fields = first non-null. thumbnail + view_count are best-effort
+  // (view_count is "NA" on sources/entries that don't report it — SoundCloud
+  // flat search, most non-YouTube sites). URL fetches also carry the playlist's
+  // title/count (NA for a single video) so the Link tab can name what it fetched
+  // and show how much the -I cap hid. Keep view_count BEFORE the playlist fields
+  // so its column index is stable whether or not they're appended.
+  var printFields = "%(url,webpage_url)s\t%(duration)s\t%(uploader,channel,uploader_id)s\t%(title)s\t%(thumbnail)s\t%(view_count)s";
   if (isUrl) printFields += "\t%(playlist_title)s\t%(playlist_count)s";
   args.push("--print", printFields);
   api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
@@ -419,10 +437,12 @@ async function runSearchFull(api, source, query, count) {
     return none;
   }
   var parsed = parseSearchOutput(res.stdout, isUrl);
-  return {
-    candidates: dropSoundcloudPreviews(parsed.candidates, source, isUrl, api),
-    meta: parsed.meta
-  };
+  var candidates = dropSoundcloudPreviews(parsed.candidates, source, isUrl, api);
+  // Promote high-view results for real searches (official music videos usually
+  // dwarf covers/lyric re-uploads in views). A pasted URL / playlist keeps its
+  // source order untouched.
+  if (!isUrl) candidates = rerankByViews(candidates, api);
+  return { candidates: candidates, meta: parsed.meta };
 }
 
 // Parse `--print` output lines into candidates, plus the playlist meta when
@@ -441,14 +461,56 @@ function parseSearchOutput(stdout, withPlaylistFields) {
     var uploader = cols[2] && cols[2] !== "NA" ? decodeHtmlEntities(cols[2]) : "";
     var title = cols[3] && cols[3] !== "NA" ? decodeHtmlEntities(cols[3]) : null;
     var thumb = cols[4] && cols[4] !== "NA" && isHttpUrl(cols[4]) ? cols[4] : null;
-    out.push({ url: url, title: title, uploader: uploader, durationSecs: isNaN(dur) ? null : dur, thumbnail: thumb });
+    var viewsRaw = cols[5];
+    var views = viewsRaw && viewsRaw !== "NA" ? parseInt(viewsRaw, 10) : NaN;
+    out.push({
+      url: url, title: title, uploader: uploader,
+      durationSecs: isNaN(dur) ? null : dur,
+      thumbnail: thumb, views: isNaN(views) ? null : views
+    });
     if (withPlaylistFields && !meta) {
-      var pTitle = cols[5] && cols[5] !== "NA" ? decodeHtmlEntities(cols[5]) : null;
-      var pCount = cols[6] && cols[6] !== "NA" ? parseInt(cols[6], 10) : NaN;
+      var pTitle = cols[6] && cols[6] !== "NA" ? decodeHtmlEntities(cols[6]) : null;
+      var pCount = cols[7] && cols[7] !== "NA" ? parseInt(cols[7], 10) : NaN;
       if (pTitle || !isNaN(pCount)) meta = { title: pTitle, count: isNaN(pCount) ? null : pCount };
     }
   }
   return { candidates: out, meta: meta };
+}
+
+// Re-rank search candidates so popular results (usually the official music
+// video) surface, WITHOUT throwing away yt-dlp's relevance ordering. Each
+// candidate keeps its relevance position `rel` (0 = top); we add a boost that
+// grows with log10(views), so an order-of-magnitude more views is worth about
+// VIEW_WEIGHT relevance positions. That lets a runaway view lead (an official
+// video with 100–1000× the views of a cover) climb several spots, while a
+// modest view edge barely moves anything — "a bit more", not a pure view sort.
+// Unknown/zero views contribute no boost (they sink toward their relevance
+// spot). No-op unless at least two candidates report a positive view count, so
+// sources that don't expose views (SoundCloud flat search) keep source order.
+// Stable on ties (falls back to relevance). Pure; exported for tests.
+var VIEW_WEIGHT = 1.5;
+function rerankByViews(candidates, api) {
+  if (!candidates || candidates.length < 2) return candidates || [];
+  var withViews = 0;
+  for (var k = 0; k < candidates.length; k++) {
+    if (candidates[k] && candidates[k].views != null && candidates[k].views > 0) withViews++;
+  }
+  if (withViews < 2) return candidates;
+  var scored = candidates.map(function (c, i) {
+    var v = c && c.views != null && c.views > 0 ? c.views : 0;
+    // Higher score = better: relevance (top result = 0 penalty) + view boost.
+    return { c: c, rel: i, score: -i + VIEW_WEIGHT * Math.log(v + 1) / Math.LN10 };
+  });
+  scored.sort(function (a, b) {
+    if (b.score !== a.score) return b.score - a.score;
+    return a.rel - b.rel; // deterministic tie-break: keep relevance order
+  });
+  var reordered = scored.map(function (s) { return s.c; });
+  if (api && reordered[0] !== candidates[0]) {
+    api.log("info", "Re-ranked search by views: top is now \"" +
+      (reordered[0].title || reordered[0].url) + "\" (" + (reordered[0].views || 0) + " views)", "ytdlp");
+  }
+  return reordered;
 }
 
 // SoundCloud Go+/paid tracks expose only a 30s preview without auth. Real tracks
@@ -1407,10 +1469,15 @@ function renderSearchView(api) {
     for (var j = 0; j < results.length; j++) {
       var c = results[j], parsed = parseTrackTitle(c.title, c.uploader);
       var artist = parsed.artist || c.uploader || "";
+      // Fold the view count into the subtitle line ("Artist · 1.5B views").
+      // track-row-list has no dedicated views field, and views is the signal
+      // the user wants to see to spot the real music video.
+      var viewsLabel = formatViews(c.views);
+      var subtitle = artist && viewsLabel ? artist + " · " + viewsLabel : (artist || viewsLabel);
       items.push({
         id: encodeRef(c.url, false),
         title: parsed.title || c.title || c.url,
-        subtitle: artist,
+        subtitle: subtitle,
         duration: formatDuration(c.durationSecs),
         imageUrl: thumbFor(c.url, c.thumbnail),
         action: "ytdlp-play-one",
@@ -1531,6 +1598,8 @@ return {
   // Exposed for the test harness.
   _parseTrackTitle: parseTrackTitle,
   _formatDuration: formatDuration,
+  _formatViews: formatViews,
+  _rerankByViews: rerankByViews,
   _encodeRef: encodeRef,
   _decodeRef: decodeRef,
   _cacheStem: cacheStem,

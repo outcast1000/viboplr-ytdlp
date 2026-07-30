@@ -14,9 +14,11 @@ function toolsPresent(extra) {
 }
 
 const DIRECT_URL = "https://direct.example/media.m4a";
+// view_count is col 5 (after thumbnail); row a outranks row b on views so the
+// view re-ranker keeps source order and the order-dependent assertions hold.
 const SEARCH_STDOUT =
-  "https://www.youtube.com/watch?v=aaaaaaaaaaa\t213\tRadiohead\tRadiohead - Creep\thttps://i.ytimg.com/x.jpg\n" +
-  "https://www.youtube.com/watch?v=bbbbbbbbbbb\t180\tBjork\tBjork - Joga\tNA";
+  "https://www.youtube.com/watch?v=aaaaaaaaaaa\t213\tRadiohead\tRadiohead - Creep\thttps://i.ytimg.com/x.jpg\t1000000\n" +
+  "https://www.youtube.com/watch?v=bbbbbbbbbbb\t180\tBjork\tBjork - Joga\tNA\t5000";
 
 const BEHAVIOR = [
   { match: { cmd: "yt-dlp", argsInclude: ["-g"] }, result: { exitCode: 0, stdout: DIRECT_URL } },

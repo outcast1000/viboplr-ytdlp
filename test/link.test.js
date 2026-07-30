@@ -9,11 +9,11 @@ const plugin = loadPlugin();
 // parseSearchOutput (pure)
 // ---------------------------------------------------------------------------
 
-test("parseSearchOutput parses candidates without playlist fields", () => {
+test("parseSearchOutput parses candidates (incl. view_count) without playlist fields", () => {
   const stdout =
-    "https://www.youtube.com/watch?v=aaaaaaaaaaa\t213\tRadiohead\tRadiohead - Creep\thttps://i.ytimg.com/x.jpg\n" +
-    "https://www.youtube.com/watch?v=bbbbbbbbbbb\tNA\tNA\tNA\tNA\n" +
-    "not-a-url\t1\tx\ty\tNA\n";
+    "https://www.youtube.com/watch?v=aaaaaaaaaaa\t213\tRadiohead\tRadiohead - Creep\thttps://i.ytimg.com/x.jpg\t1521543229\n" +
+    "https://www.youtube.com/watch?v=bbbbbbbbbbb\tNA\tNA\tNA\tNA\tNA\n" +
+    "not-a-url\t1\tx\ty\tNA\t9\n";
   const r = plugin._parseSearchOutput(stdout, false);
   assert.equal(r.candidates.length, 2); // invalid-url line skipped
   assert.deepEqual(r.candidates[0], {
@@ -22,30 +22,32 @@ test("parseSearchOutput parses candidates without playlist fields", () => {
     uploader: "Radiohead",
     durationSecs: 213,
     thumbnail: "https://i.ytimg.com/x.jpg",
+    views: 1521543229,
   });
   assert.equal(r.candidates[1].durationSecs, null);
   assert.equal(r.candidates[1].uploader, "");
+  assert.equal(r.candidates[1].views, null, "NA view_count parses to null");
   assert.equal(r.meta, null);
 });
 
-test("parseSearchOutput extracts playlist meta from the first non-NA line", () => {
+test("parseSearchOutput extracts playlist meta from the first non-NA line (views col before playlist fields)", () => {
   const stdout =
-    "https://x.example/a\t10\tU\tA\tNA\tMy Mix\t42\n" +
-    "https://x.example/b\t20\tU\tB\tNA\tMy Mix\t42\n";
+    "https://x.example/a\t10\tU\tA\tNA\tNA\tMy Mix\t42\n" +
+    "https://x.example/b\t20\tU\tB\tNA\tNA\tMy Mix\t42\n";
   const r = plugin._parseSearchOutput(stdout, true);
   assert.equal(r.candidates.length, 2);
   assert.deepEqual(r.meta, { title: "My Mix", count: 42 });
 });
 
 test("parseSearchOutput: single video (NA playlist fields) yields no meta", () => {
-  const stdout = "https://x.example/a\t10\tU\tA\tNA\tNA\tNA\n";
+  const stdout = "https://x.example/a\t10\tU\tA\tNA\tNA\tNA\tNA\n";
   const r = plugin._parseSearchOutput(stdout, true);
   assert.equal(r.candidates.length, 1);
   assert.equal(r.meta, null);
 });
 
 test("parseSearchOutput: playlist title without a count still yields meta", () => {
-  const r = plugin._parseSearchOutput("https://x.example/a\t10\tU\tA\tNA\tMy Mix\tNA\n", true);
+  const r = plugin._parseSearchOutput("https://x.example/a\t10\tU\tA\tNA\tNA\tMy Mix\tNA\n", true);
   assert.deepEqual(r.meta, { title: "My Mix", count: null });
 });
 
@@ -61,17 +63,20 @@ function toolsPresent(extra) {
   ];
 }
 
+// view_count is col 5 (after thumbnail). Row a outranks row b on views so the
+// view re-ranker keeps source order — order-dependent assertions below stay valid.
 const SEARCH_STDOUT =
-  "https://www.youtube.com/watch?v=aaaaaaaaaaa\t213\tRadiohead\tRadiohead - Creep\thttps://i.ytimg.com/x.jpg\n" +
-  "https://www.youtube.com/watch?v=bbbbbbbbbbb\t180\tBjork\tBjork - Joga\tNA";
+  "https://www.youtube.com/watch?v=aaaaaaaaaaa\t213\tRadiohead\tRadiohead - Creep\thttps://i.ytimg.com/x.jpg\t1000000\n" +
+  "https://www.youtube.com/watch?v=bbbbbbbbbbb\t180\tBjork\tBjork - Joga\tNA\t5000";
 
+// URL fetches keep source order (never re-ranked); playlist fields now sit at cols 6/7.
 const PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLtest";
 const PLAYLIST_STDOUT =
-  "https://www.youtube.com/watch?v=aaaaaaaaaaa\t213\tRadiohead\tRadiohead - Creep\thttps://i.ytimg.com/a.jpg\tOK Mix\t142\n" +
-  "https://www.youtube.com/watch?v=bbbbbbbbbbb\t180\tBjork\tBjork - Joga\tNA\tOK Mix\t142";
+  "https://www.youtube.com/watch?v=aaaaaaaaaaa\t213\tRadiohead\tRadiohead - Creep\thttps://i.ytimg.com/a.jpg\tNA\tOK Mix\t142\n" +
+  "https://www.youtube.com/watch?v=bbbbbbbbbbb\t180\tBjork\tBjork - Joga\tNA\tNA\tOK Mix\t142";
 
 const VIDEO_URL = "https://vimeo.com/12345";
-const VIDEO_STDOUT = "https://vimeo.com/12345\t300\tSomeone\tA Film\tNA\tNA\tNA";
+const VIDEO_STDOUT = "https://vimeo.com/12345\t300\tSomeone\tA Film\tNA\tNA\tNA\tNA";
 
 const RULES = [
   { match: { cmd: "yt-dlp", argsInclude: [PLAYLIST_URL] }, result: { exitCode: 0, stdout: PLAYLIST_STDOUT } },

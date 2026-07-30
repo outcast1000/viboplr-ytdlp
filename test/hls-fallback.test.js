@@ -20,7 +20,8 @@ test("decodeHtmlEntities decodes the common entities", () => {
 });
 
 test("parseSearchOutput decodes entities in title, uploader and playlist title", () => {
-  const stdout = "https://x.example/a\t10\tA &amp; B\tClips &amp; More\tNA\tMix &amp; Match\t3\n";
+  // cols: url, dur, uploader, title, thumbnail, view_count, playlist_title, playlist_count
+  const stdout = "https://x.example/a\t10\tA &amp; B\tClips &amp; More\tNA\tNA\tMix &amp; Match\t3\n";
   const r = plugin._parseSearchOutput(stdout, true);
   assert.equal(r.candidates[0].title, "Clips & More");
   assert.equal(r.candidates[0].uploader, "A & B");
