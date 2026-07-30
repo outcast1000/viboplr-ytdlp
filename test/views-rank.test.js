@@ -81,3 +81,79 @@ test("rerankByViews is deterministic: equal views keep relevance order", () => {
   ];
   assert.deepEqual(urls(plugin._rerankByViews(cands.slice())), ["a", "b", "c"]);
 });
+
+test("rerankByViews stamps each candidate with its score breakdown", () => {
+  const cands = [
+    { url: "cover", views: 500000 },
+    { url: "official", views: 500000000 },
+  ];
+  const out = plugin._rerankByViews(cands.slice());
+  // Every candidate carries a _score, and rel is its PRE-rerank position.
+  const official = out.find((c) => c.url === "official");
+  const cover = out.find((c) => c.url === "cover");
+  assert.equal(official._score.rel, 1, "official was 2nd by relevance");
+  assert.equal(cover._score.rel, 0, "cover was 1st by relevance");
+  assert.ok(official._score.score > cover._score.score, "official outscores cover");
+  assert.equal(out[0].url, "official");
+});
+
+// ---------------------------------------------------------------------------
+// scoreCandidates (pure)
+// ---------------------------------------------------------------------------
+
+test("scoreCandidates: score = -rel + 1.5*log10(views+1) when views are in play", () => {
+  const bd = plugin._scoreCandidates([
+    { url: "a", views: 1000 },     // rel 0
+    { url: "b", views: 1000000 },  // rel 1
+  ]);
+  assert.equal(bd.length, 2);
+  assert.ok(bd.every((b) => b.viewsActive));
+  // a: -0 + 1.5*log10(1001) ≈ 4.5015
+  assert.ok(Math.abs(bd[0].score - (0 + 1.5 * Math.log10(1001))) < 1e-9);
+  // b: -1 + 1.5*log10(1000001) ≈ 8.0000
+  assert.ok(Math.abs(bd[1].score - (-1 + 1.5 * Math.log10(1000001))) < 1e-9);
+  assert.equal(bd[0].rel, 0);
+  assert.equal(bd[1].rel, 1);
+});
+
+test("scoreCandidates: viewsActive false when <2 report views -> boost 0, pure relevance", () => {
+  const bd = plugin._scoreCandidates([
+    { url: "a", views: null },
+    { url: "b", views: 9999999 },
+    { url: "c", views: 0 },
+  ]);
+  assert.ok(bd.every((b) => !b.viewsActive));
+  assert.ok(bd.every((b) => b.viewBoost === 0));
+  assert.deepEqual(bd.map((b) => b.score), [0, -1, -2]);
+});
+
+test("scoreCandidates: empty input -> empty breakdown", () => {
+  assert.deepEqual(plugin._scoreCandidates([]), []);
+  assert.deepEqual(plugin._scoreCandidates(null), []);
+});
+
+// ---------------------------------------------------------------------------
+// formatScoreDebug (pure)
+// ---------------------------------------------------------------------------
+
+test("formatScoreDebug: shows position, move, score and view boost", () => {
+  const cands = [
+    { url: "cover", views: 500000 },
+    { url: "official", views: 500000000 },
+  ];
+  const out = plugin._rerankByViews(cands.slice());
+  const top = plugin._formatScoreDebug(out[0], 0); // official, moved from #2 to #1
+  assert.match(top, /^#1 · was #2 · score /);
+  assert.match(top, /boost \+/);
+});
+
+test("formatScoreDebug: no view data annotation when views aren't in play", () => {
+  const bd = plugin._scoreCandidates([{ url: "a", views: null }, { url: "b", views: null }]);
+  const c = { url: "a", _score: bd[0] };
+  assert.match(plugin._formatScoreDebug(c, 0), /no view data/);
+});
+
+test("formatScoreDebug: empty string when candidate has no score", () => {
+  assert.equal(plugin._formatScoreDebug({ url: "x" }, 0), "");
+  assert.equal(plugin._formatScoreDebug(null, 0), "");
+});

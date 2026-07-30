@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.11.0
+- **Debug scoring (Settings → yt-dlp → Debugging).** A new "Show scoring in
+  results" toggle annotates every search result with how it was ranked — its
+  final position, whether the view boost moved it up or down, and the score that
+  put it there (e.g. `#1 · was #2 · score 12.34 · boost +13.34`). Searches, the
+  "Watch YouTube video" action and the playback/download fallback all rank the
+  same way, so typing a track's "title artist" in the sidebar shows exactly why
+  the automated pick chooses what it chooses. Off by default; nothing changes
+  about how results are ranked — this only makes the existing ranking visible.
+
 ## v1.10.0
 - **View counts in search results.** Each result now shows its video's view
   count in the row subtitle (e.g. `Radiohead · 1.5B views`), so it's easy to

@@ -29,6 +29,11 @@ var resolverSource = "youtube"; // site the metadata fallback resolver searches 
 // on the native mpv engine (which merges them); the browser engine still gets a
 // muxed stream regardless. 1080 by default to avoid pulling 4K by surprise.
 var maxVideoHeight = 1080;
+// When on, each sidebar search result shows its ranking score breakdown
+// (relevance position, view boost, final score) so you can see WHY a result
+// landed where it did — and why the automated pick (Watch / playback fallback,
+// same pipeline) chose what it chose. Off by default; persisted.
+var debugScoring = false;
 
 // Shared resolution choices, used for BOTH the streaming cap (Settings) and the
 // video download quality options. Order is best → lower (the first is default).
@@ -489,18 +494,43 @@ function parseSearchOutput(stdout, withPlaylistFields) {
 // sources that don't expose views (SoundCloud flat search) keep source order.
 // Stable on ties (falls back to relevance). Pure; exported for tests.
 var VIEW_WEIGHT = 1.5;
+
+// Compute the ranking score breakdown for each candidate, in the SAME order as
+// the input (i.e. yt-dlp's own relevance order). Returns a parallel array of
+// { rel, views, viewBoost, score, viewsActive }:
+//   - rel        the 0-based relevance position (yt-dlp's order; the tie-break)
+//   - views      the view count used (0 when unknown/zero)
+//   - viewBoost  VIEW_WEIGHT · log10(views+1), or 0 when views aren't in play
+//   - score      -rel + viewBoost  (higher = better)
+//   - viewsActive false when fewer than two candidates report a positive view
+//                 count — then every viewBoost is 0, so sorting by score is a
+//                 no-op and source order is preserved.
+// This is the single source of truth for ranking: rerankByViews sorts by it,
+// and the debug UI displays it. Pure; exported for tests.
+function scoreCandidates(candidates) {
+  var list = candidates || [];
+  var withViews = 0;
+  for (var k = 0; k < list.length; k++) {
+    if (list[k] && list[k].views != null && list[k].views > 0) withViews++;
+  }
+  var viewsActive = withViews >= 2;
+  return list.map(function (c, i) {
+    var v = c && c.views != null && c.views > 0 ? c.views : 0;
+    var viewBoost = viewsActive ? VIEW_WEIGHT * Math.log(v + 1) / Math.LN10 : 0;
+    return { rel: i, views: v, viewBoost: viewBoost, score: -i + viewBoost, viewsActive: viewsActive };
+  });
+}
+
 function rerankByViews(candidates, api) {
   if (!candidates || candidates.length < 2) return candidates || [];
-  var withViews = 0;
-  for (var k = 0; k < candidates.length; k++) {
-    if (candidates[k] && candidates[k].views != null && candidates[k].views > 0) withViews++;
-  }
-  if (withViews < 2) return candidates;
-  var scored = candidates.map(function (c, i) {
-    var v = c && c.views != null && c.views > 0 ? c.views : 0;
-    // Higher score = better: relevance (top result = 0 penalty) + view boost.
-    return { c: c, rel: i, score: -i + VIEW_WEIGHT * Math.log(v + 1) / Math.LN10 };
-  });
+  var breakdowns = scoreCandidates(candidates);
+  // Stamp each candidate with its breakdown so the debug UI can show it even
+  // after reordering (the pre-rerank position survives as _score.rel).
+  for (var i = 0; i < candidates.length; i++) candidates[i]._score = breakdowns[i];
+  // No-op when views aren't in play (SoundCloud flat search, etc.): keep the
+  // source array + order untouched so callers relying on identity still see it.
+  if (!breakdowns[0].viewsActive) return candidates;
+  var scored = candidates.map(function (c, idx) { return { c: c, rel: idx, score: breakdowns[idx].score }; });
   scored.sort(function (a, b) {
     if (b.score !== a.score) return b.score - a.score;
     return a.rel - b.rel; // deterministic tie-break: keep relevance order
@@ -511,6 +541,23 @@ function rerankByViews(candidates, api) {
       (reordered[0].title || reordered[0].url) + "\" (" + (reordered[0].views || 0) + " views)", "ytdlp");
   }
   return reordered;
+}
+
+// Compact one-line score breakdown for a candidate at final display position
+// `pos`, for the debug UI. "" when the candidate carries no score (link fetches
+// / playlists keep source order and aren't scored). Pure; exported for tests.
+function formatScoreDebug(c, pos) {
+  var s = c && c._score;
+  if (!s) return "";
+  var parts = ["#" + (pos + 1)];
+  if (s.rel !== pos) parts.push("was #" + (s.rel + 1)); // moved by the view rerank
+  parts.push("score " + s.score.toFixed(2));
+  if (s.viewsActive) {
+    if (s.viewBoost > 0) parts.push("boost +" + s.viewBoost.toFixed(2));
+  } else {
+    parts.push("no view data");
+  }
+  return parts.join(" · ");
 }
 
 // SoundCloud Go+/paid tracks expose only a 30s preview without auth. Real tracks
@@ -1033,13 +1080,15 @@ async function activate(api) {
     api.storage.get("playbackMode"),
     api.storage.get("searchSource"),
     api.storage.get("resolverSource"),
-    api.storage.get("maxVideoHeight")
+    api.storage.get("maxVideoHeight"),
+    api.storage.get("debugScoring")
   ]);
   if (stored[0] != null && typeof stored[0] === "number") cacheMaxMb = stored[0];
   if (stored[1] === "download" || stored[1] === "stream") playbackMode = stored[1];
   if (stored[2] && SOURCES[stored[2]]) searchSource = stored[2];
   if (stored[3] && SOURCES[stored[3]]) resolverSource = stored[3];
   if (stored[4] != null && typeof stored[4] === "number") maxVideoHeight = stored[4];
+  if (stored[5] === true) debugScoring = true;
 
   // Startup cleanup: wipe transcoded temp files; keep cached source downloads.
   scheduleCleanup(api, true).catch(function (e) { api.log("warn", "Startup cache cleanup failed: " + (e && e.message ? e.message : e), "ytdlp"); });
@@ -1389,6 +1438,11 @@ async function activate(api) {
     if (!v || !SOURCES[v]) return;
     resolverSource = v; await api.storage.set("resolverSource", v); renderSettings(api);
   });
+  api.ui.onAction("ytdlp-debug-scoring", async function (data) {
+    debugScoring = !!(data && data.value);
+    await api.storage.set("debugScoring", debugScoring);
+    renderSettings(api); renderSearchView(api);
+  });
 
   renderSettings(api);
   renderSearchView(api);
@@ -1474,6 +1528,12 @@ function renderSearchView(api) {
       // the user wants to see to spot the real music video.
       var viewsLabel = formatViews(c.views);
       var subtitle = artist && viewsLabel ? artist + " · " + viewsLabel : (artist || viewsLabel);
+      // Debug: fold the ranking score breakdown into the subtitle so you can see
+      // why this result placed where it did (and what the view rerank moved).
+      if (debugScoring) {
+        var dbg = formatScoreDebug(c, j);
+        if (dbg) subtitle = subtitle ? subtitle + "  ·  " + dbg : dbg;
+      }
       items.push({
         id: encodeRef(c.url, false),
         title: parsed.title || c.title || c.url,
@@ -1580,6 +1640,16 @@ function renderSettings(api) {
             ]
           }
         }]
+      },
+      {
+        type: "section", title: "Debugging", children: [{
+          type: "settings-row",
+          label: "Show scoring in results",
+          description: "Annotate each search result with its ranking score (relevance position, view boost, final score). Searches, the \"Watch YouTube video\" action and the playback/download fallback all rank the same way — type a track's \"title artist\" here to see exactly why a given video wins.",
+          control: {
+            type: "toggle", action: "ytdlp-debug-scoring", checked: debugScoring
+          }
+        }]
       }
     ]
   });
@@ -1599,7 +1669,9 @@ return {
   _parseTrackTitle: parseTrackTitle,
   _formatDuration: formatDuration,
   _formatViews: formatViews,
+  _scoreCandidates: scoreCandidates,
   _rerankByViews: rerankByViews,
+  _formatScoreDebug: formatScoreDebug,
   _encodeRef: encodeRef,
   _decodeRef: decodeRef,
   _cacheStem: cacheStem,
