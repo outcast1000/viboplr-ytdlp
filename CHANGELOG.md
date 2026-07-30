@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.10.0
+- **View counts in search results.** Each result now shows its video's view
+  count in the row subtitle (e.g. `Radiohead · 1.5B views`), so it's easy to
+  spot the real/official upload at a glance. Sources that don't report a view
+  count just show the artist as before.
+- **Searches lean toward popular results (usually the official music video).**
+  yt-dlp's relevance ordering stays the primary signal, but results now get a
+  gentle boost based on view count: a runaway view lead — an official video with
+  100–1000× the views of a cover or lyric re-upload — climbs to the top, while a
+  modest edge barely moves anything. Pasted links and playlists keep their
+  original order, and sources without view data are unaffected.
+
 ## v1.9.0
 - **Hi-res video streaming (up to 4K).** Watching a video no longer caps at the
   360–720p muxed stream. On the **native (mpv) playback engine**, the plugin now
