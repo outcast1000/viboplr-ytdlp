@@ -1157,6 +1157,122 @@ function candidatesFromFormats(formats, maxHeight) {
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Seek-preview storyboards
+// ---------------------------------------------------------------------------
+
+// Sheets to download for one track. YouTube publishes the same ~2-10s interval at
+// every level and grows the SHEET COUNT instead of the interval, so a 3-hour video
+// is 45 sheets at 160x90 but only 1 at 48x27. This caps the download; the picker
+// trades tile size for staying under it.
+var STORYBOARD_MAX_SHEETS = 8;
+// Below this a tile is too small to read in the host's hover bubble (~176px wide).
+var STORYBOARD_MIN_TILE_W = 120;
+
+// Pure: choose a storyboard level from a yt-dlp formats array and describe it in the
+// host's `Storyboard` shape, with `sheets` still holding REMOTE urls (the caller
+// downloads them). Returns null when the source publishes none — short clips often
+// don't, which is not an error.
+//
+// yt-dlp exposes storyboards as `sb0`-`sb3` formats carrying `rows`, `columns` and a
+// `fragments` array of sheet urls. The true tile interval is a fragment's duration
+// divided by its tiles-per-sheet; `sb3` is special (always one 10x10 sheet, so its
+// interval is duration/100 — an overview strip, useless on long videos).
+function storyboardFromFormats(formats) {
+  if (!formats || !formats.length) return null;
+  var levels = [];
+  for (var i = 0; i < formats.length; i++) {
+    var f = formats[i];
+    if (!f || typeof f.format_id !== "string" || f.format_id.indexOf("sb") !== 0) continue;
+    var cols = f.columns, rows = f.rows;
+    var frags = f.fragments;
+    if (!cols || !rows || !frags || !frags.length) continue;
+    var perSheet = cols * rows;
+    var fragDur = typeof frags[0].duration === "number" ? frags[0].duration : 0;
+    if (!(fragDur > 0)) continue;
+    var urls = [];
+    for (var j = 0; j < frags.length; j++) {
+      if (frags[j] && isHttpUrl(frags[j].url)) urls.push(frags[j].url);
+    }
+    if (!urls.length) continue;
+    levels.push({
+      id: f.format_id,
+      sheets: urls,
+      cols: cols,
+      rows: rows,
+      count: perSheet * urls.length,
+      tileW: f.width || 0,
+      tileH: f.height || 0,
+      startSecs: 0,
+      intervalSecs: fragDur / perSheet
+    });
+  }
+  if (!levels.length) return null;
+
+  // Prefer a readable tile size within the sheet budget; largest tile wins, fewest
+  // sheets breaks ties. If nothing qualifies, take whatever needs fewest downloads
+  // (a long video's only cheap level is the coarse one).
+  var eligible = levels.filter(function (l) {
+    return l.sheets.length <= STORYBOARD_MAX_SHEETS && l.tileW >= STORYBOARD_MIN_TILE_W;
+  });
+  var pool = eligible.length ? eligible : levels.slice();
+  pool.sort(function (a, b) {
+    if (eligible.length && b.tileW !== a.tileW) return b.tileW - a.tileW;
+    return a.sheets.length - b.sheets.length;
+  });
+  return pool[0];
+}
+
+// Fetch a source's storyboard and cache the SHEET BYTES under plugin storage.
+// Caching the bytes rather than the urls is essential: YouTube signs storyboard urls
+// with a short-lived `sqp` parameter while the images themselves never change, so a
+// cached url is dead within hours and cached pixels last forever.
+async function resolveStoryboard(api, url, refId) {
+  var args = ["-j", "--no-warnings", "--no-playlist", url];
+  var res;
+  try { res = await api.system.exec("yt-dlp", args, { cwd: null }); }
+  catch (e) { api.log("warn", "storyboard: yt-dlp exec failed: " + (e && e.message ? e.message : e), "ytdlp"); return null; }
+  if (res.exitCode !== 0 || !res.stdout) { noteBotGate(api, res.stderr); return null; }
+
+  var board;
+  try {
+    var info = JSON.parse(res.stdout.split("\n")[0]);
+    board = storyboardFromFormats(info.formats || []);
+  } catch (e) {
+    api.log("warn", "storyboard: parse failed: " + (e && e.message ? e.message : e), "ytdlp");
+    return null;
+  }
+  if (!board) { api.log("info", "No storyboard published for " + url, "ytdlp"); return null; }
+
+  var stem = cacheStem(refId || url);
+  var local = [];
+  for (var i = 0; i < board.sheets.length; i++) {
+    var name = stem + "-sb" + i + ".jpg";
+    var segs = ["storyboards", name];
+    try {
+      if (!(await api.storage.files.exists(segs))) {
+        await api.storage.files.download(segs, board.sheets[i]);
+      }
+      local.push(await api.storage.files.getPath(segs));
+    } catch (e) {
+      api.log("warn", "storyboard: sheet " + i + " failed: " + (e && e.message ? e.message : e), "ytdlp");
+      return null; // a partial sheet set would mis-address later tiles
+    }
+  }
+  api.log("info", "Storyboard " + board.id + " for " + url + ": " + board.count +
+    " tiles, " + local.length + " sheet(s), every " + board.intervalSecs.toFixed(1) + "s", "ytdlp");
+  return {
+    sheets: local,
+    cols: board.cols,
+    rows: board.rows,
+    count: board.count,
+    tileW: board.tileW,
+    tileH: board.tileH,
+    startSecs: board.startSecs,
+    intervalSecs: board.intervalSecs
+  };
+}
+
 // Enumerate a source's streams as a StreamCandidate menu via ONE `yt-dlp -j`
 // call (formats carry directly-usable URLs). Returns [] on any failure so the
 // caller can fall back to the single-stream muxed path.
@@ -1395,6 +1511,26 @@ async function activate(api) {
       return null;
     }
   });
+
+  // ---- Playback: seek-preview storyboards ----
+  // Uses YouTube's OWN published sprite sheets instead of extracting frames: no
+  // decoding, no second stream of the video, ~58 KB for a couple of hundred tiles.
+  // Guarded: an older host has no such method, and an unguarded call would throw
+  // inside activate() and take every other feature down with it.
+  if (typeof api.playback.onResolveStoryboard === "function") {
+  api.playback.onResolveStoryboard("ytdlp", async function (id) {
+    await ensureToolStatus(api);
+    if (!ytDlpVersion) return null;
+    var ref = decodeRef(id);
+    if (!ref) return null;
+    try {
+      return await resolveStoryboard(api, ref.url, id);
+    } catch (e) {
+      api.log("warn", "Storyboard resolve failed: " + (e && e.message ? e.message : e), "ytdlp");
+      return null;
+    }
+  });
+  }
 
   // ---- Playback: legacy youtube:// compatibility ----
   api.playback.onResolveStreamByUri("youtube", async function (id, quality) {
@@ -2193,6 +2329,7 @@ return {
   _isOlderVersion: isOlderVersion,
   _pickHlsMaster: pickHlsMaster,
   _candidatesFromFormats: candidatesFromFormats,
+  _storyboardFromFormats: storyboardFromFormats,
   _parseVideoFormat: parseVideoFormat,
   _videoFormatSelector: videoFormatSelector,
   _dropSoundcloudPreviews: dropSoundcloudPreviews,

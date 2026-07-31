@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+- **Seek-preview thumbnails.** Hovering the seek bar on a YouTube video now shows a
+  thumbnail of that moment. Uses YouTube's *own* published storyboard sprite sheets
+  (the `sb0`-`sb3` formats) rather than extracting frames — nothing decodes video and
+  the stream is never fetched twice, so it costs ~58-170 KB and one `yt-dlp -j` call.
+  Sheet **bytes** are cached under plugin storage, not their urls: YouTube signs
+  storyboard urls with a short-lived `sqp` parameter while the images themselves never
+  change, so a cached url would be dead within hours.
+
+  Level choice trades tile size against download size, because YouTube keeps the same
+  ~2-10 s interval at every level and grows the *sheet count* instead — a 3-hour video
+  is 45 sheets at 160x90 but one at 48x27. The picker takes the largest readable tile
+  that stays within an 8-sheet budget, falling back to the cheapest level when nothing
+  qualifies (so long videos get coarse previews rather than a 45-request download).
+
+  Requires a host with `api.playback.onResolveStoryboard`. `minAppVersion` is
+  deliberately unchanged — the registration is feature-detected, so on an older host
+  the plugin simply omits this one feature instead of being held back entirely.
+
 ## v1.13.0
 - **Separate audio & video scoring profiles for finding a track.** When the
   plugin has to *pick* a result from a search — the playback/download fallback

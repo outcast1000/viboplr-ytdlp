@@ -108,6 +108,7 @@ function makeApi(config) {
     playback: {
       onStreamResolve: (id, fn) => { handlers["stream:" + id] = fn; },
       onResolveStreamByUri: (scheme, fn) => { handlers["streamuri:" + scheme] = fn; },
+      onResolveStoryboard: (scheme, fn) => { handlers["storyboard:" + scheme] = fn; },
       playTracks: (tracks, startIndex, context) => { calls.playTracks.push({ tracks, startIndex, context }); },
       insertTracks: (tracks, position) => { calls.insertTracks.push({ tracks, position }); },
     },
