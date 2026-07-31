@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.14.0
 - **Seek-preview thumbnails.** Hovering the seek bar on a YouTube video now shows a
   thumbnail of that moment. Uses YouTube's *own* published storyboard sprite sheets
   (the `sb0`-`sb3` formats) rather than extracting frames — nothing decodes video and
