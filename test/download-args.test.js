@@ -25,9 +25,11 @@ test("buildDownloadArgs: audioFormat re-encodes via -x --audio-format", () => {
   assert.ok(args.includes("--audio-quality"));
 });
 
-test("buildDownloadArgs: video merges to mp4", () => {
+// mp4 alone would force incompatible codecs (AV1/VP9 + Opus) into a container
+// nothing can open; the list lets yt-dlp drop to .mkv and keep the name honest.
+test("buildDownloadArgs: video merges to mp4, with an mkv fallback", () => {
   const args = plugin._buildDownloadArgs({ url: "u", video: true }, "/tmp", 2, true);
-  assert.equal(args[args.indexOf("--merge-output-format") + 1], "mp4");
+  assert.equal(args[args.indexOf("--merge-output-format") + 1], "mp4/mkv");
   assert.ok(args.join(" ").includes("bestvideo"));
 });
 
@@ -46,8 +48,28 @@ test("parseVideoFormat: 'video' = best, 'video-720' = capped, else not video", (
 });
 
 test("videoFormatSelector: uncapped vs capped", () => {
-  assert.equal(plugin._videoFormatSelector(0), "bestvideo*+bestaudio/best");
-  assert.equal(plugin._videoFormatSelector(720), "bestvideo*[height<=720]+bestaudio/best[height<=720]");
+  assert.equal(
+    plugin._videoFormatSelector(0),
+    "bestvideo*[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo*[vcodec^=h264]+bestaudio[acodec^=aac]/bestvideo*+bestaudio/best"
+  );
+  assert.equal(
+    plugin._videoFormatSelector(720),
+    "bestvideo*[vcodec^=avc1][height<=720]+bestaudio[acodec^=mp4a]/bestvideo*[vcodec^=h264][height<=720]+bestaudio[acodec^=aac]/bestvideo*[height<=720]+bestaudio/best[height<=720]"
+  );
+});
+
+// A bare bestvideo*+bestaudio picks AV1+Opus (yt-dlp ranks those codecs first),
+// which forced into --merge-output-format mp4 produces a file QuickTime and the
+// webview show as audio-only. H.264/AAC must be tried before the open fallback.
+test("videoFormatSelector: H.264 + AAC are preferred over the codec-agnostic best", () => {
+  const tiers = plugin._videoFormatSelector(0).split("/");
+  assert.ok(tiers[0].includes("vcodec^=avc1") && tiers[0].includes("acodec^=mp4a"));
+  const openTier = tiers.findIndex((t) => t === "bestvideo*+bestaudio");
+  assert.ok(openTier > 0, "codec-agnostic tier exists as a fallback");
+  assert.ok(
+    tiers.slice(0, openTier).every((t) => /vcodec\^=(avc1|h264)/.test(t)),
+    "every tier before the fallback pins a playable video codec"
+  );
 });
 
 test("buildDownloadArgs: embeds metadata (never cover art) when ffmpeg present, omits when absent", () => {

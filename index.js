@@ -889,12 +889,32 @@ function parseVideoFormat(fmt) {
 }
 
 // yt-dlp `-f` selector for a merged video download, optionally height-capped.
+//
+// Codec choice matters as much as resolution: yt-dlp's DEFAULT ranking prefers
+// AV1 > VP9 > H.264 and Opus > AAC, so a bare `bestvideo*+bestaudio` merged into
+// .mp4 yields AV1 video + Opus audio in an MP4 — which QuickTime, Finder/Quick
+// Look and the app's own webview all refuse to decode (it opens as "an .mp4 with
+// no video"). So ask for H.264 + AAC first — universally playable, and on
+// YouTube available up to 1080p — and only fall back to the unconstrained best
+// when the source offers no such pair. `avc1`/`mp4a` is YouTube's naming,
+// `h264`/`aac` is what most other extractors report.
 // Pure; exported for tests.
 function videoFormatSelector(maxHeight) {
-  return maxHeight > 0
-    ? "bestvideo*[height<=" + maxHeight + "]+bestaudio/best[height<=" + maxHeight + "]"
-    : "bestvideo*+bestaudio/best";
+  var cap = maxHeight > 0 ? "[height<=" + maxHeight + "]" : "";
+  return [
+    "bestvideo*[vcodec^=avc1]" + cap + "+bestaudio[acodec^=mp4a]",
+    "bestvideo*[vcodec^=h264]" + cap + "+bestaudio[acodec^=aac]",
+    "bestvideo*" + cap + "+bestaudio",
+    "best" + cap
+  ].join("/");
 }
+
+// Containers offered to `--merge-output-format`, best-fit first. yt-dlp picks the
+// first one whose codecs are actually compatible, so the fallback tiers above
+// (AV1/VP9/Opus, when a source has no H.264) land in .mkv instead of being forced
+// into an .mp4 that no player can open. The saved file is named from the real
+// container (the host uses the resolver's `ext`), so the name never lies.
+var MERGE_CONTAINERS = "mp4/mkv";
 
 // Metadata --print template: first non-null of each comma group wins.
 // track/title | artist/creator/uploader | album | release_year | title
@@ -935,7 +955,7 @@ function parseMetadataLine(line) {
 function buildDownloadArgs(opts, outDir, seq, embed) {
   var args;
   if (opts.video) {
-    args = ["-f", videoFormatSelector(opts.maxHeight || 0), "--merge-output-format", "mp4"];
+    args = ["-f", videoFormatSelector(opts.maxHeight || 0), "--merge-output-format", MERGE_CONTAINERS];
   } else if (opts.audioFormat) {
     args = ["-x", "--audio-format", opts.audioFormat, "--audio-quality", "0"];
   } else if (embed) {
@@ -1307,7 +1327,8 @@ async function validateDirectUrl(api, url) {
 }
 
 // Download the source media to cache/<stem>.<ext>. audio: bestaudio; video:
-// bestvideo+bestaudio merged to mp4 (needs ffmpeg). Returns the file path or null.
+// bestvideo+bestaudio merged (needs ffmpeg) into an .mp4, or .mkv when the source
+// has no H.264/AAC pair — see videoFormatSelector. Returns the file path or null.
 async function downloadToCache(api, url, isVideo) {
   var stem = cacheStem(url, isVideo);
   var cached = await findCachedDownload(api, stem);
@@ -1318,7 +1339,7 @@ async function downloadToCache(api, url, isVideo) {
   var args;
   if (isVideo) {
     // "Download then play" honors the streaming resolution cap.
-    args = ["-f", videoFormatSelector(maxVideoHeight), "--merge-output-format", "mp4"];
+    args = ["-f", videoFormatSelector(maxVideoHeight), "--merge-output-format", MERGE_CONTAINERS];
   } else {
     args = ["-f", "bestaudio[ext=m4a]/bestaudio"];
   }
@@ -1586,8 +1607,8 @@ async function activate(api) {
         description: "No quality gain over Original — the source is already lossy, so FLAC only makes the file much larger. Only useful for a uniform-format library. Tags embedded."
       });
       // Video download options mirror the streaming resolution choices: best +
-      // per-resolution caps. Each merges the best video ≤ cap with the best
-      // audio into an .mp4. The host defaults to the first `video:true` option
+      // per-resolution caps. Each merges the best H.264 video ≤ cap with the best
+      // AAC audio into an .mp4. The host defaults to the first `video:true` option
       // when the item being downloaded is itself a video.
       for (var i = 0; i < VIDEO_RESOLUTIONS.length; i++) {
         var r = VIDEO_RESOLUTIONS[i];
@@ -1595,9 +1616,10 @@ async function activate(api) {
           value: r.height === 0 ? "video" : "video-" + r.height,
           label: "Video · MP4 · " + (r.height === 0 ? "Best" : r.label),
           video: true,
-          description: r.height === 0
-            ? "Downloads the best available video and audio streams and merges them into an .mp4."
-            : "Downloads the best video up to " + r.label + " and merges it with the best audio into an .mp4."
+          description: (r.height === 0
+            ? "Downloads the best video and merges it with the best audio into an .mp4. "
+            : "Downloads the best video up to " + r.label + " and merges it with the best audio into an .mp4. ")
+            + "Prefers H.264 + AAC so the file plays everywhere — a higher-resolution AV1/VP9 stream is skipped, since most players can't decode those. Sources with no H.264 are saved as .mkv instead."
         });
       }
     }

@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.14.1
+- **Fixed: video downloads produced an .mp4 that plays with no picture.** The
+  merged-video selector asked yt-dlp for `bestvideo*+bestaudio`, and yt-dlp's
+  default codec ranking prefers AV1 over H.264 and Opus over AAC — so a
+  "Video · MP4" download came back as AV1 + Opus forced into an MP4 container.
+  AVFoundation (QuickTime, Finder, the app's own webview) can't decode either in
+  that container, so the file opened as audio-only. Video downloads now ask for
+  H.264 + AAC first and only fall back to the codec-agnostic best when a source
+  offers no such pair. A higher-resolution AV1/VP9 stream is deliberately skipped
+  — on YouTube H.264 covers up to 1080p, and a playable file beats an extra 4K
+  that nothing opens.
+- The merge container is now `mp4/mkv` rather than a forced `mp4`. When the
+  fallback tiers do land on codecs MP4 can't legally carry, yt-dlp writes an
+  .mkv instead of mislabelling the file, and the saved name follows the real
+  container. Also applies to "download then play" playback.
+
 ## v1.14.0
 - **Seek-preview thumbnails.** Hovering the seek bar on a YouTube video now shows a
   thumbnail of that moment. Uses YouTube's *own* published storyboard sprite sheets
