@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.15.0
 - **Searchable from the app's global search (Cmd+K).** yt-dlp now registers as a
   search provider, so a query in the caption bar can be sent to it and its
   results play straight from the dropdown. Useful mainly when you have no local
