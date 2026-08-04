@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+- **Searchable from the app's global search (Cmd+K).** yt-dlp now registers as a
+  search provider, so a query in the caption bar can be sent to it and its
+  results play straight from the dropdown. Useful mainly when you have no local
+  library: that search only ever covered music on your machine, so for a
+  streaming-only setup it could never match anything.
+
+  The host asks **only when you pick the "Search … on yt-dlp" row** — never while
+  you type. A search shells out to the binary and takes seconds, so a
+  keystroke-triggered search would spawn a process per character. Results carry a
+  `ytdlp://` path, so playing one doesn't re-search through the fallback
+  resolver.
+
+  Registered at runtime and only when yt-dlp is actually installed — a provider
+  that can't answer shouldn't be offered at all. `minAppVersion` is deliberately
+  unchanged: the registration is feature-detected, so on an older host the plugin
+  simply omits this one feature instead of being held back entirely.
+
 ## v1.14.1
 - **Fixed: video downloads produced an .mp4 that plays with no picture.** The
   merged-video selector asked yt-dlp for `bestvideo*+bestaudio`, and yt-dlp's
