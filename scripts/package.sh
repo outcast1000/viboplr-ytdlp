@@ -29,5 +29,13 @@ console.log("wrote update.json:", JSON.stringify(info));
 '
 
 echo
-echo "To publish:"
-echo "  gh release create v${VERSION} ytdlp.zip update.json --repo outcast1000/viboplr-ytdlp --title \"v${VERSION}\" --notes-file CHANGELOG.md"
+echo "To publish: push the tag and let CI do it —"
+echo "  git tag v${VERSION} && git push origin v${VERSION}"
+echo
+echo "Do NOT run 'gh release create' by hand. The Release workflow publishes on"
+echo "the tag, so publishing locally creates the release first and CI's own"
+echo "'gh release create' then dies with 'a release with the same tag name"
+echo "already exists' — a red X on a release that is actually fine, which is"
+echo "indistinguishable from a real failure. Let CI be the only publisher."
+echo "(The zip + update.json built above are for local inspection; the workflow"
+echo "rebuilds both from source.)"
