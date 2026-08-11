@@ -920,6 +920,91 @@ var MERGE_CONTAINERS = "mp4/mkv";
 // track/title | artist/creator/uploader | album | release_year | title
 var META_PRINT = "%(track,title)s\t%(artist,creator,uploader)s\t%(album)s\t%(release_year)s\t%(title)s";
 
+// --- Download progress -----------------------------------------------------
+// A download resolve here is not a URL lookup: it fetches the whole file (and
+// for video, merges two streams through ffmpeg), which can take minutes. The
+// host can only show a spinner unless we tell it what's happening, so the
+// download run is asked for machine-readable progress on its own prefixed
+// lines, which the stdout parse then drops. `--progress` is required because
+// the run is `--quiet`; `--newline` because the default carriage-return redraw
+// never completes a line.
+var PROG_PREFIX = "[vbprog]";
+var PROG_PP_PREFIX = "[vbprog-pp]";
+var PROGRESS_ARGS = [
+  "--progress", "--newline",
+  "--progress-template",
+  // The real total is only known once the headers land; before that (and for a
+  // chunked stream) yt-dlp has an estimate, so ask for the exact size first and
+  // fall back — the comma group is the output template's "first non-null wins".
+  // vcodec identifies WHICH stream is downloading. A hi-res video is two
+  // separate downloads (video-only, then audio-only) and each runs 0→100%, so
+  // without this the bar restarts for no visible reason halfway through.
+  "download:" + PROG_PREFIX + "%(progress._percent_str)s|%(progress._downloaded_bytes_str)s|"
+    + "%(progress._total_bytes_str,progress._total_bytes_estimate_str)s|"
+    + "%(progress._speed_str)s|%(progress.eta)s|%(info.vcodec)s",
+  "--progress-template",
+  "postprocess:" + PROG_PP_PREFIX + "%(progress.status)s|%(progress.postprocessor)s"
+];
+
+function isProgressLine(line) {
+  var s = (line || "").trim();
+  return s.indexOf(PROG_PREFIX) === 0 || s.indexOf(PROG_PP_PREFIX) === 0;
+}
+
+// Parse one progress line into the host's DownloadResolveProgress shape, or
+// null when the line isn't one of ours. Pure.
+//
+// `isVideo` only colours the label: a video download runs the same two phases
+// (fetch, then merge) and naming them is most of the value here.
+function parseProgressLine(line, isVideo) {
+  var s = (line || "").trim();
+  if (s.indexOf(PROG_PP_PREFIX) === 0) {
+    var pp = s.substring(PROG_PP_PREFIX.length).split("|");
+    var name = (pp[1] || "").trim();
+    if (/^(NA)?$/.test(name)) name = "";
+    // No percentage exists for a merge — yt-dlp reports start/finish only, so
+    // reporting a number here would be inventing one.
+    return {
+      percent: null,
+      label: /merger/i.test(name) ? "Merging audio and video…"
+        : /extractaudio|ffmpegextract/i.test(name) ? "Extracting audio…"
+        : "Processing…",
+      detail: null
+    };
+  }
+  if (s.indexOf(PROG_PREFIX) !== 0) return null;
+  var f = s.substring(PROG_PREFIX.length).split("|");
+  // yt-dlp spells "don't know yet" three ways across these fields — a bare NA,
+  // a formatted "N/A" (the _str variants), and "Unknown B/s" for speed before
+  // the first sample. All three must read as absent: "1.0MiB / N/A at Unknown
+  // B/s" is worse than showing nothing.
+  function val(v) {
+    var t = (v || "").trim();
+    if (!t || /^n\/?a$/i.test(t) || /unknown/i.test(t)) return null;
+    return t;
+  }
+  var pctStr = val(f[0]);
+  var pct = pctStr ? parseFloat(pctStr.replace("%", "")) : NaN;
+  var got = val(f[1]), total = val(f[2]), speed = val(f[3]);
+  var etaStr = val(f[4]);
+  var eta = etaStr ? parseInt(etaStr, 10) : NaN;
+  var vcodec = val(f[5]);
+  var detail = [got && total ? got + " / " + total : got, speed ? speed : null]
+    .filter(Boolean).join(" at ");
+  // vcodec "none" is the audio half of a split download; a real codec is the
+  // video half. Absent (older yt-dlp, muxed stream) falls back to the caller's
+  // own idea of what it asked for.
+  var label = vcodec
+    ? (vcodec === "none" ? "Downloading audio" : "Downloading video")
+    : (isVideo ? "Downloading video" : "Downloading audio");
+  return {
+    percent: isFinite(pct) ? pct : null,
+    label: label,
+    detail: detail || null,
+    etaSecs: isFinite(eta) ? eta : null
+  };
+}
+
 // Parse a META_PRINT line into { title?, artist?, album?, year? }. Pure.
 function parseMetadataLine(line) {
   var cols = (line || "").split("\t");
@@ -968,7 +1053,7 @@ function buildDownloadArgs(opts, outDir, seq, embed) {
   // after the file is moved into place — so ONE run yields both the metadata
   // and the file (a separate metadata fetch doubled our request volume, which
   // is what provokes YouTube's bot gate).
-  return args.concat(ENCODING_ARGS).concat([
+  return args.concat(ENCODING_ARGS).concat(PROGRESS_ARGS).concat([
     "--no-warnings", "--quiet", "--no-simulate", "--no-playlist",
     "--print", META_PRINT,
     "--print", "after_move:filepath",
@@ -985,13 +1070,32 @@ function buildDownloadArgs(opts, outDir, seq, embed) {
 async function downloadForDownload(api, url, opts) {
   var outDir = await ensureDir(api, "temp");
   if (!outDir) throw new Error("The plugin's temp folder is unavailable — cannot download.");
+  // Forward yt-dlp's own progress to the host so the download modal shows a real
+  // bar instead of an unexplained spinner. Throttled: yt-dlp emits a line per
+  // downloaded block, and every one of those would be a host re-render.
+  var lastReport = 0, lastPct = -1;
+  var onOutput = function (line) {
+    if (!api.downloads || typeof api.downloads.reportProgress !== "function") return;
+    var p = parseProgressLine(line, !!opts.video);
+    if (!p) return;
+    var now = Date.now();
+    var pct = typeof p.percent === "number" ? p.percent : -1;
+    if (pct >= 0 && now - lastReport < 250 && Math.abs(pct - lastPct) < 1) return;
+    lastReport = now; lastPct = pct;
+    api.downloads.reportProgress(p);
+  };
   var attempt = async function () {
     var args = buildDownloadArgs({ url: url, video: opts.video, audioFormat: opts.audioFormat, maxHeight: opts.maxHeight }, outDir, convSeq++, !!ffmpegVersion);
     api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
     try {
-      return await api.system.exec("yt-dlp", args, { cwd: null });
+      return await api.system.exec("yt-dlp", args, { cwd: null, onOutput: onOutput });
     } catch (e) {
-      api.log("error", "yt-dlp download exec failed: " + (e && e.message ? e.message : e), "ytdlp");
+      var msg = e && e.message ? e.message : String(e);
+      // The host kills the process when the user cancels the download. That is
+      // not a broken install, so it must not be reported as one — rethrow it
+      // verbatim and let the host recognise its own cancellation.
+      if (msg.trim() === "Cancelled") throw e;
+      api.log("error", "yt-dlp download exec failed: " + msg, "ytdlp");
       throw new Error("yt-dlp could not be run — check Settings → Dependencies.");
     }
   };
@@ -1010,8 +1114,11 @@ async function downloadForDownload(api, url, opts) {
   }
   // stdout: the META_PRINT line (extraction time), then the after_move
   // filepath line. Anything that doesn't end in an absolute path means no
-  // file actually landed.
-  var lines = (res.stdout || "").split("\n").filter(function (l) { return l.trim(); });
+  // file actually landed. Progress lines share this stream, so they are
+  // dropped first — otherwise the metadata line is no longer the first one.
+  var lines = (res.stdout || "").split("\n").filter(function (l) {
+    return l.trim() && !isProgressLine(l);
+  });
   var last = lines.length ? lines[lines.length - 1].trim() : "";
   if (!looksLikePath(last)) {
     api.log("warn", "yt-dlp returned no file path — likely SABR/PO-token", "ytdlp");
@@ -2413,6 +2520,8 @@ return {
   _cacheStem: cacheStem,
   _buildDownloadArgs: buildDownloadArgs,
   _parseMetadataLine: parseMetadataLine,
+  _parseProgressLine: parseProgressLine,
+  _isProgressLine: isProgressLine,
   _thumbFor: thumbFor,
   _parseSearchOutput: parseSearchOutput,
   _decodeHtmlEntities: decodeHtmlEntities,

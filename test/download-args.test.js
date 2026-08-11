@@ -130,3 +130,78 @@ test("parseMetadataLine ignores a non-4-digit year (e.g. upload_date)", () => {
   const m = plugin._parseMetadataLine("T\tA\tB\t20200102\tT");
   assert.equal(m.year, undefined);
 });
+
+// --- Download progress -----------------------------------------------------
+// A download resolve fetches the whole file, so a real progress bar in the host
+// depends entirely on these lines parsing. They also share stdout with the
+// --print output, which is why isProgressLine has to be exact.
+
+test("buildDownloadArgs: asks for machine-readable progress on its own lines", () => {
+  const args = plugin._buildDownloadArgs({ url: "u", video: true }, "/tmp", 0, true);
+  // --quiet suppresses the progress display unless --progress is given, and the
+  // default carriage-return redraw never completes a line for a line reader.
+  assert.ok(args.includes("--progress"));
+  assert.ok(args.includes("--newline"));
+  const templates = args.filter((a, i) => args[i - 1] === "--progress-template");
+  assert.equal(templates.length, 2, "one template for the download, one for postprocessing");
+  assert.ok(templates.some((t) => t.startsWith("download:")));
+  assert.ok(templates.some((t) => t.startsWith("postprocess:")));
+});
+
+// Field spellings below are copied from a real run (yt-dlp 2026.03.17), not
+// invented — the padding, "N/A" and "Unknown B/s" are all things it really emits.
+test("parseProgressLine: a download line yields percent, detail and eta", () => {
+  const p = plugin._parseProgressLine("[vbprog]  3.4%| 789.28KiB|  22.52MiB| 121.35KiB/s|183|avc1.4d401f", true);
+  assert.equal(p.percent, 3.4);
+  assert.equal(p.label, "Downloading video");
+  assert.equal(p.detail, "789.28KiB / 22.52MiB at 121.35KiB/s");
+  assert.equal(p.etaSecs, 183);
+});
+
+// A hi-res video is TWO downloads (video-only, then audio-only) and each runs
+// 0→100%, so the bar restarts halfway through. vcodec is what lets the label
+// explain that instead of the progress looking broken.
+test("parseProgressLine: vcodec names which half of a split download is running", () => {
+  const video = plugin._parseProgressLine("[vbprog] 50.0%|1.0MiB|2.0MiB|1.0MiB/s|1|avc1.4d401f", true);
+  const audio = plugin._parseProgressLine("[vbprog] 50.0%|1.0MiB|2.0MiB|1.0MiB/s|1|none", true);
+  assert.equal(video.label, "Downloading video");
+  assert.equal(audio.label, "Downloading audio");
+});
+
+// yt-dlp spells "not known yet" three ways across these fields: a bare NA, a
+// formatted "N/A", and "Unknown B/s" before the first speed sample. All must
+// read as absent — a 0% bar and "0:00 left" are both lies the user would act on,
+// and "1.00KiB / N/A at Unknown B/s" is worse than showing nothing.
+test("parseProgressLine: unknown fields become null rather than zero or noise", () => {
+  const p = plugin._parseProgressLine("[vbprog]  0.2%|   1.00KiB|       N/A| Unknown B/s|NA|none", false);
+  assert.equal(p.percent, 0.2);
+  assert.equal(p.etaSecs, null);
+  assert.equal(p.detail, "1.00KiB", "no total, no speed — just what has landed");
+  assert.equal(p.label, "Downloading audio");
+});
+
+// The last line of a stream reports 100% with the byte count already dropped.
+test("parseProgressLine: the terminal 100% line still reports its percentage", () => {
+  const p = plugin._parseProgressLine("[vbprog]100.0%|NA|   3.15MiB|112.29KiB/s|NA|none", true);
+  assert.equal(p.percent, 100);
+  assert.equal(p.etaSecs, null);
+});
+
+// The merge is the second half of a video download and reports no percentage,
+// so the label carries the phase and percent stays null.
+test("parseProgressLine: a postprocess line names the phase with no percentage", () => {
+  const p = plugin._parseProgressLine("[vbprog-pp]started|Merger", true);
+  assert.equal(p.percent, null);
+  assert.equal(p.label, "Merging audio and video…");
+});
+
+// Progress shares stdout with --print (the metadata line and the final
+// filepath), and the parse there takes the FIRST line as metadata and the last
+// as the path — so a progress line that slipped through would break both.
+test("isProgressLine: matches only our own prefixes, so --print output survives", () => {
+  assert.ok(plugin._isProgressLine("[vbprog] 10.0%|a|b|c|1|none"));
+  assert.ok(plugin._isProgressLine("[vbprog-pp]started|Merger"));
+  assert.ok(!plugin._isProgressLine("/Users/x/Music/dl.0.mp4"));
+  assert.ok(!plugin._isProgressLine("Hey\tPixies\tDoolittle\t1989\tHey"));
+  assert.equal(plugin._parseProgressLine("/Users/x/Music/dl.0.mp4", false), null);
+});
