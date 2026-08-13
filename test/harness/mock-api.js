@@ -15,6 +15,7 @@ function makeStorage(seed) {
     }
   }
   const kv = new Map(Object.entries((seed && seed.kv) || {}));
+  const downloads = [];
   function dirOf(segs) { return dirs[segs[0]] || (dirs[segs[0]] = {}); }
 
   return {
@@ -39,8 +40,20 @@ function makeStorage(seed) {
         d[name] = { size: (text || "").length, modifiedAt: 0 };
         return joinSegs(segs);
       },
+      exists: async (segs) => {
+        const d = dirs[segs[0]];
+        if (!d) return false;
+        return Object.prototype.hasOwnProperty.call(d, segs[segs.length - 1]);
+      },
+      download: async (segs, url) => {
+        downloads.push({ segs, url });
+        const d = dirOf(segs.slice(0, 1));
+        d[segs[segs.length - 1]] = { size: 1024, modifiedAt: 0 };
+        return joinSegs(segs);
+      },
       getPath: async (segs) => joinSegs(segs),
     },
+    _downloads: downloads,
   };
 }
 

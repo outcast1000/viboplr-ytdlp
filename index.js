@@ -1350,11 +1350,117 @@ function storyboardFromFormats(formats) {
   return pool[0];
 }
 
+// ---------------------------------------------------------------------------
+// Storyboard descriptor cache
+// ---------------------------------------------------------------------------
+// The sheet BYTES have always been cached. What wasn't cached was the knowledge of
+// what those bytes are — the grid, the tile size, the interval — so every play paid a
+// full `yt-dlp -j` to rediscover it. Measured at ~12s on a dev machine, which is long
+// enough that the host's resolve budget expired first and the filmstrip simply never
+// appeared. Caching the descriptor makes a repeat play a couple of file checks.
+var STORYBOARD_CACHE_KEY = "storyboardCache";
+// Bounded so a heavy listener's cache can't grow forever. Entries are tiny (a grid
+// plus at most STORYBOARD_MAX_SHEETS names), so this is a few tens of KB.
+var STORYBOARD_CACHE_MAX = 200;
+// Bump when the cached shape or the level picker changes, so entries written by an
+// older build are ignored rather than replayed against new expectations.
+var STORYBOARD_CACHE_VERSION = 1;
+
+// Pure: insert `entry` under `stem`, dropping the oldest entries past `max`. Re-putting
+// an existing stem refreshes it in place rather than adding a duplicate.
+//
+// `at` orders eviction, NOT expiry: a published storyboard never changes, so an entry
+// is only ever stale because its sheet files are gone — which cachedStoryboard()
+// detects directly rather than guessing at with a TTL.
+function putStoryboardCache(map, stem, entry, max, at) {
+  var next = {};
+  var keys = Object.keys(map || {});
+  for (var i = 0; i < keys.length; i++) {
+    if (keys[i] !== stem) next[keys[i]] = map[keys[i]];
+  }
+  next[stem] = Object.assign({}, entry, { at: at });
+
+  var all = Object.keys(next);
+  if (all.length <= max) return next;
+  all.sort(function (a, b) { return (next[a].at || 0) - (next[b].at || 0); });
+  for (var j = 0; j < all.length - max; j++) delete next[all[j]];
+  return next;
+}
+
+async function readStoryboardCache(api) {
+  try {
+    var raw = await api.storage.get(STORYBOARD_CACHE_KEY);
+    return raw && typeof raw === "object" ? raw : {};
+  } catch (e) { return {}; }
+}
+
+// Rebuild a host descriptor from a cache entry, or null when there isn't a usable one.
+// Sheet NAMES are cached, never the absolute paths: a path embeds the profile
+// directory, which differs per profile and per machine, while the name is stable.
+async function cachedStoryboard(api, stem) {
+  var map = await readStoryboardCache(api);
+  var hit = map[stem];
+  if (!hit || hit.v !== STORYBOARD_CACHE_VERSION || !hit.names || !hit.names.length) return null;
+
+  var local = [];
+  for (var i = 0; i < hit.names.length; i++) {
+    var segs = ["storyboards", hit.names[i]];
+    try {
+      // Self-heal. Plugin storage can be cleared independently of this map, and a
+      // descriptor pointing at deleted files would render an empty filmstrip — worse
+      // than no filmstrip, because nothing would ever retry.
+      if (!(await api.storage.files.exists(segs))) return null;
+      local.push(await api.storage.files.getPath(segs));
+    } catch (e) { return null; }
+  }
+  return {
+    sheets: local,
+    cols: hit.cols,
+    rows: hit.rows,
+    count: hit.count,
+    tileW: hit.tileW,
+    tileH: hit.tileH,
+    startSecs: hit.startSecs,
+    intervalSecs: hit.intervalSecs
+  };
+}
+
+async function writeStoryboardCache(api, stem, board, names) {
+  try {
+    var map = await readStoryboardCache(api);
+    var entry = {
+      v: STORYBOARD_CACHE_VERSION,
+      names: names,
+      cols: board.cols,
+      rows: board.rows,
+      count: board.count,
+      tileW: board.tileW,
+      tileH: board.tileH,
+      startSecs: board.startSecs,
+      intervalSecs: board.intervalSecs
+    };
+    await api.storage.set(
+      STORYBOARD_CACHE_KEY,
+      putStoryboardCache(map, stem, entry, STORYBOARD_CACHE_MAX, Date.now())
+    );
+  } catch (e) {
+    // Non-fatal: the caller already holds a working storyboard, and failing to
+    // remember it only costs the next play the discovery pass again.
+    api.log("warn", "storyboard: cache write failed: " + (e && e.message ? e.message : e), "ytdlp");
+  }
+}
+
 // Fetch a source's storyboard and cache the SHEET BYTES under plugin storage.
 // Caching the bytes rather than the urls is essential: YouTube signs storyboard urls
 // with a short-lived `sqp` parameter while the images themselves never change, so a
 // cached url is dead within hours and cached pixels last forever.
 async function resolveStoryboard(api, url, refId) {
+  var stem = cacheStem(refId || url);
+
+  // Short-circuit the entire discovery pass when we already know this source.
+  var cached = await cachedStoryboard(api, stem);
+  if (cached) return cached;
+
   var args = ["-j", "--no-warnings", "--no-playlist", url];
   var res;
   try { res = await api.system.exec("yt-dlp", args, { cwd: null }); }
@@ -1369,10 +1475,13 @@ async function resolveStoryboard(api, url, refId) {
     api.log("warn", "storyboard: parse failed: " + (e && e.message ? e.message : e), "ytdlp");
     return null;
   }
+  // Deliberately NOT cached as a negative. A miss here can be transient — a bot gate,
+  // a network blip — and a sticky negative would mean this source never gets a
+  // filmstrip again. The cost of retrying is one discovery pass.
   if (!board) { api.log("info", "No storyboard published for " + url, "ytdlp"); return null; }
 
-  var stem = cacheStem(refId || url);
   var local = [];
+  var names = [];
   for (var i = 0; i < board.sheets.length; i++) {
     var name = stem + "-sb" + i + ".jpg";
     var segs = ["storyboards", name];
@@ -1381,11 +1490,16 @@ async function resolveStoryboard(api, url, refId) {
         await api.storage.files.download(segs, board.sheets[i]);
       }
       local.push(await api.storage.files.getPath(segs));
+      names.push(name);
     } catch (e) {
       api.log("warn", "storyboard: sheet " + i + " failed: " + (e && e.message ? e.message : e), "ytdlp");
       return null; // a partial sheet set would mis-address later tiles
     }
   }
+
+  // Only after every sheet landed — a half-written entry would be a cache hit that
+  // resolves to a broken strip.
+  await writeStoryboardCache(api, stem, board, names);
   api.log("info", "Storyboard " + board.id + " for " + url + ": " + board.count +
     " tiles, " + local.length + " sheet(s), every " + board.intervalSecs.toFixed(1) + "s", "ytdlp");
   return {
@@ -2530,6 +2644,7 @@ return {
   _pickHlsMaster: pickHlsMaster,
   _candidatesFromFormats: candidatesFromFormats,
   _storyboardFromFormats: storyboardFromFormats,
+  _putStoryboardCache: putStoryboardCache,
   _parseVideoFormat: parseVideoFormat,
   _videoFormatSelector: videoFormatSelector,
   _dropSoundcloudPreviews: dropSoundcloudPreviews,
