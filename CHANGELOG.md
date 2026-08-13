@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.16.0
+- **Fixed: the seek-bar filmstrip never appeared on a video.** Seek-preview
+  storyboards were being discovered from scratch on every single play. The sheet
+  images were cached, but not the description of what they are — the grid, tile
+  size and interval — so each play re-ran `yt-dlp -j` to work it out again.
+  That call takes around twelve seconds, and the app gives a plugin a bounded
+  window to answer; the answer arrived after the window closed, every time, so
+  the filmstrip silently fell back to a plain seek bar. The description is now
+  remembered alongside the images, and a video you have played before resolves
+  instantly.
+
+  Only successful lookups are remembered. A failure can be temporary — a bot
+  check, a dropped connection — and remembering those would mean a video that
+  failed once never showed a filmstrip again. If the cached images are cleared,
+  the plugin notices and fetches them again rather than pointing at files that
+  are no longer there.
+
+- **Download progress now comes from yt-dlp itself.** A download here *is* the
+  whole job — fetch both streams, merge them through ffmpeg — so the app had
+  nothing to show but a spinner, sometimes for minutes. yt-dlp is now asked for
+  machine-readable progress and it is forwarded to the app's download modal, so
+  you get a real bar with a size, a speed and an ETA.
+
+  A high-resolution video is two downloads (picture, then sound), each running
+  0→100%, so the stage is named as it goes: *Downloading video* → *Downloading
+  audio* → *Merging audio and video* — otherwise the bar appears to restart
+  halfway through for no reason. Before the first sample arrives, unknown
+  figures read as unknown rather than as zero: a 0% bar is a lie you would act
+  on. Cancelling a download is reported as a cancellation, not as a broken
+  install.
+
 ## v1.15.0
 - **Searchable from the app's global search (Cmd+K).** yt-dlp now registers as a
   search provider, so a query in the caption bar can be sent to it and its
