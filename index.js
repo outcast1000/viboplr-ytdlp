@@ -1278,6 +1278,7 @@ function candidatesFromFormats(formats, maxHeight) {
     if (hasV) c.vcodec = f.vcodec;
     if (hasA) c.acodec = f.acodec;
     if (typeof f.tbr === "number") c.tbr = f.tbr;
+    if (f.http_headers && typeof f.http_headers === "object") c.headers = f.http_headers;
     out.push(c);
   }
   // Sources with no progressive muxed stream (e.g. Reddit) still need a
