@@ -95,6 +95,27 @@ test("stream mode fails cleanly (null) when the direct URL fails validation — 
   assert.ok(!api.calls.exec.some((c) => c.args.includes("after_move:filepath")));
 });
 
+test("stream mode retries a fresh direct URL after a transient validation 403", async () => {
+  const firstUrl = "https://direct.example/expired.m4a";
+  const freshUrl = "https://direct.example/fresh.m4a";
+  let extractions = 0;
+  const directRule = {
+    match: { cmd: "yt-dlp", argsInclude: ["-g"] },
+    result: () => ({ exitCode: 0, stdout: ++extractions === 1 ? firstUrl : freshUrl }),
+  };
+  const { api, plugin } = await activated({
+    exec: toolsPresent([directRule]),
+    fetch: {
+      "direct.example": (url) => ({ status: url === firstUrl ? 403 : 206 }),
+    },
+  });
+  const id = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
+  const url = await api._handlers["streamuri:ytdlp"](id);
+  assert.equal(url, freshUrl);
+  assert.equal(api.calls.exec.filter((call) => call.args.includes("-g")).length, 2);
+  assert.ok(!api.calls.exec.some((call) => call.args.includes("after_move:filepath")));
+});
+
 test("download mode skips -g and downloads directly", async () => {
   const { api, plugin } = await activated({
     exec: toolsPresent(BEHAVIOR),

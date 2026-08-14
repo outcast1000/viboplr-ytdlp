@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.16.2
+- **Retry transient direct-stream 403s once.** YouTube can reject a newly
+  minted googlevideo URL even when the video is otherwise available. After a
+  failed direct-stream validation, the plugin now performs one fresh yt-dlp
+  extraction and validates the replacement URL before reporting playback
+  unavailable. Extractor failures such as bot checks and unavailable videos do
+  not retry.
+
+
 ## v1.16.1
 - **Improved direct-stream diagnostics.** When `yt-dlp -g` cannot obtain a
   playable URL, the plugin now logs its exit code and stderr to both the

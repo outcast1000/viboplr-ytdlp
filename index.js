@@ -1646,6 +1646,17 @@ async function resolvePlayable(api, url, isVideo) {
       api.log("info", "Streaming directly: " + url, "ytdlp");
       return { url: direct, downloaded: false };
     }
+    // YouTube occasionally rejects a just-minted googlevideo URL with a 403.
+    // A second extraction gets a fresh signed URL; only retry after extraction
+    // itself succeeded, so a bot gate or an unavailable video is not hammered.
+    if (direct) {
+      api.log("warn", "Direct stream validation failed — retrying with a fresh extraction", "ytdlp");
+      direct = await getDirectUrl(api, url, isVideo);
+      if (direct && await validateDirectUrl(api, direct)) {
+        api.log("info", "Streaming directly after fresh extraction: " + url, "ytdlp");
+        return { url: direct, downloaded: false };
+      }
+    }
     api.log("warn", "Direct stream unavailable: " + url, "ytdlp");
     return null;
   }
