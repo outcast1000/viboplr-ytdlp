@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.16.4
+- **Fixed native mpv YouTube playback.** yt-dlp now passes the request headers
+  required by its signed YouTube stream URLs to Viboplr's native mpv engine.
+  Without those headers YouTube returned 403 even for fresh, available streams.
+  Requires Viboplr 1.0.24 or newer.
+
 ## v1.16.3
 - **Removed direct-stream preflight requests.** Stream playback now hands the
   URL yt-dlp resolves directly to the selected playback engine. The old
