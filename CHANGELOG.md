@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.16.1
+- **Improved direct-stream diagnostics.** When `yt-dlp -g` cannot obtain a
+  playable URL, the plugin now logs its exit code and stderr to both the
+  frontend log and the DevTools console. A direct-stream validation failure now
+  logs the HTTP status too (for example, YouTube's temporary 403/rate gate),
+  instead of collapsing into the browser's generic "no supported source" error.
+
+
 ## v1.16.0
 - **Fixed: the seek-bar filmstrip never appeared on a video.** Seek-preview
   storyboards were being discovered from scratch on every single play. The sheet

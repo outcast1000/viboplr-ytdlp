@@ -1213,6 +1213,14 @@ async function getDirectUrl(api, url, isVideo) {
     for (var i = lines.length - 1; i >= 0; i--) { var l = lines[i].trim(); if (l) { direct = l; break; } }
     if (isHttpUrl(direct)) return direct;
   }
+  if (res.exitCode !== 0) {
+    var reason = await withOutdatedHint(api, classifyYtdlpError(res.stderr));
+    api.log("warn", "yt-dlp direct stream failed (exit " + res.exitCode + "): " + reason, "ytdlp");
+    console.error("[ytdlp] direct stream failed (exit " + res.exitCode + "):", (res.stderr || "").trim() || "no stderr");
+  } else {
+    api.log("warn", "yt-dlp direct stream returned no usable URL", "ytdlp");
+    console.warn("[ytdlp] direct stream returned no usable URL");
+  }
   noteBotGate(api, res.stderr);
   // Some sites (e.g. Reddit) have NO muxed video+audio format at all — only
   // split DASH/HLS streams — so `best` matches nothing. The HLS MASTER
@@ -1543,8 +1551,19 @@ async function validateDirectUrl(api, url) {
   if (!api.network || typeof api.network.fetch !== "function") return true; // can't check → trust it
   try {
     var res = await api.network.fetch(url, { headers: { Range: "bytes=0-1" } });
-    return !!res && res.status >= 200 && res.status < 400;
-  } catch (e) { return false; }
+    var valid = !!res && res.status >= 200 && res.status < 400;
+    if (!valid) {
+      var status = res && typeof res.status === "number" ? res.status : "unknown";
+      api.log("warn", "Direct stream validation failed (HTTP " + status + ")", "ytdlp");
+      console.warn("[ytdlp] direct stream validation failed (HTTP " + status + ")");
+    }
+    return valid;
+  } catch (e) {
+    var detail = e && e.message ? e.message : e;
+    api.log("warn", "Direct stream validation request failed: " + detail, "ytdlp");
+    console.warn("[ytdlp] direct stream validation request failed:", detail);
+    return false;
+  }
 }
 
 // Download the source media to cache/<stem>.<ext>. audio: bestaudio; video:
