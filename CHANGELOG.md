@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.16.3
+- **Removed direct-stream preflight requests.** Stream playback now hands the
+  URL yt-dlp resolves directly to the selected playback engine. The old
+  two-byte Rust range probe was not equivalent to mpv or WebKit playback and
+  could add an unnecessary request to signed YouTube media URLs.
+
 ## v1.16.2
 - **Retry transient direct-stream 403s once.** YouTube can reject a newly
   minted googlevideo URL even when the video is otherwise available. After a

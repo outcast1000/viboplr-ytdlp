@@ -24,10 +24,9 @@ from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via
 - **"Watch YouTube video" on any track.** A right-click action on every track
   (library, queue, playlists, search results, similar tracks) searches YouTube by
   the track's title + artist and plays the top match as a video in the theater.
-- **Hybrid playback.** Tracks stream directly whenever possible (`yt-dlp -g`, with
-  the direct URL validated by a tiny range request), falling back to
-  download-then-play when a direct stream isn't usable. Switch to **Download then
-  play** in the plugin settings for maximum reliability. Video on sites with no
+- **Hybrid playback.** Tracks stream directly whenever possible (`yt-dlp -g`) or
+  download-then-play. Switch to **Download then play** in the plugin settings for
+  maximum reliability. Video on sites with no
   muxed video+audio stream (e.g. Reddit — DASH/HLS only) streams via the site's
   HLS master playlist, which carries the video renditions and the audio group in
   one URL.

@@ -6,9 +6,8 @@
 //    api.system.getDependency (never probe --version, never check releases). The
 //    host surfaces missing/updatable yt-dlp/ffmpeg (sidebar dot + Settings →
 //    Dependencies). We just gate our work on what it reports.
-//  - Playback is HYBRID: try a direct stream URL (`yt-dlp -g`, validated with a
-//    tiny range request), fall back to download-then-play. A setting forces
-//    download-only for maximum reliability.
+//  - Playback is HYBRID: try a direct stream URL (`yt-dlp -g`) or download then
+//    play. A setting forces download-only for maximum reliability.
 //  - The sandbox has no Date.now()/Math.random(). Uniqueness comes from a
 //    monotonic counter; cache filenames from a deterministic hash of the source.
 
@@ -1544,28 +1543,6 @@ async function enumerateFormats(api, url, maxHeight) {
   }
 }
 
-// Best-effort check that a direct URL is actually fetchable with default headers
-// (some sources sign URLs or require a UA). A tiny range GET through the host's
-// CORS-bypassing proxy. Returns true on 2xx, false on anything else/errors.
-async function validateDirectUrl(api, url) {
-  if (!api.network || typeof api.network.fetch !== "function") return true; // can't check → trust it
-  try {
-    var res = await api.network.fetch(url, { headers: { Range: "bytes=0-1" } });
-    var valid = !!res && res.status >= 200 && res.status < 400;
-    if (!valid) {
-      var status = res && typeof res.status === "number" ? res.status : "unknown";
-      api.log("warn", "Direct stream validation failed (HTTP " + status + ")", "ytdlp");
-      console.warn("[ytdlp] direct stream validation failed (HTTP " + status + ")");
-    }
-    return valid;
-  } catch (e) {
-    var detail = e && e.message ? e.message : e;
-    api.log("warn", "Direct stream validation request failed: " + detail, "ytdlp");
-    console.warn("[ytdlp] direct stream validation request failed:", detail);
-    return false;
-  }
-}
-
 // Download the source media to cache/<stem>.<ext>. audio: bestaudio; video:
 // bestvideo+bestaudio merged (needs ffmpeg) into an .mp4, or .mkv when the source
 // has no H.264/AAC pair — see videoFormatSelector. Returns the file path or null.
@@ -1642,20 +1619,9 @@ async function withCacheProtection(api, filePath, work) {
 async function resolvePlayable(api, url, isVideo) {
   if (playbackMode === "stream") {
     var direct = await getDirectUrl(api, url, isVideo);
-    if (direct && await validateDirectUrl(api, direct)) {
+    if (direct) {
       api.log("info", "Streaming directly: " + url, "ytdlp");
       return { url: direct, downloaded: false };
-    }
-    // YouTube occasionally rejects a just-minted googlevideo URL with a 403.
-    // A second extraction gets a fresh signed URL; only retry after extraction
-    // itself succeeded, so a bot gate or an unavailable video is not hammered.
-    if (direct) {
-      api.log("warn", "Direct stream validation failed — retrying with a fresh extraction", "ytdlp");
-      direct = await getDirectUrl(api, url, isVideo);
-      if (direct && await validateDirectUrl(api, direct)) {
-        api.log("info", "Streaming directly after fresh extraction: " + url, "ytdlp");
-        return { url: direct, downloaded: false };
-      }
     }
     api.log("warn", "Direct stream unavailable: " + url, "ytdlp");
     return null;

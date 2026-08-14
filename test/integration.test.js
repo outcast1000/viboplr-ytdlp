@@ -79,41 +79,12 @@ test("qualities: original always; transcodes + video only when ffmpeg present", 
   assert.deepEqual(q2.map((x) => x.value), ["original"]);
 });
 
-test("stream URI resolve returns a validated direct URL in stream mode", async () => {
-  const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR), fetch: { "direct.example": { status: 200 } } });
+test("stream URI resolve returns the direct URL without a separate preflight request", async () => {
+  const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
   const id = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
   const url = await api._handlers["streamuri:ytdlp"](id);
   assert.equal(url, DIRECT_URL);
-});
-
-test("stream mode fails cleanly (null) when the direct URL fails validation — no download fallback", async () => {
-  const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR), fetch: { "direct.example": { status: 403 } } });
-  const id = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
-  const url = await api._handlers["streamuri:ytdlp"](id);
-  assert.equal(url, null);
-  // It must NOT have attempted a download (no after_move:filepath command).
-  assert.ok(!api.calls.exec.some((c) => c.args.includes("after_move:filepath")));
-});
-
-test("stream mode retries a fresh direct URL after a transient validation 403", async () => {
-  const firstUrl = "https://direct.example/expired.m4a";
-  const freshUrl = "https://direct.example/fresh.m4a";
-  let extractions = 0;
-  const directRule = {
-    match: { cmd: "yt-dlp", argsInclude: ["-g"] },
-    result: () => ({ exitCode: 0, stdout: ++extractions === 1 ? firstUrl : freshUrl }),
-  };
-  const { api, plugin } = await activated({
-    exec: toolsPresent([directRule]),
-    fetch: {
-      "direct.example": (url) => ({ status: url === firstUrl ? 403 : 206 }),
-    },
-  });
-  const id = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
-  const url = await api._handlers["streamuri:ytdlp"](id);
-  assert.equal(url, freshUrl);
-  assert.equal(api.calls.exec.filter((call) => call.args.includes("-g")).length, 2);
-  assert.ok(!api.calls.exec.some((call) => call.args.includes("after_move:filepath")));
+  assert.equal(api.calls.exec.filter((call) => call.args.includes("-g")).length, 1);
 });
 
 test("download mode skips -g and downloads directly", async () => {
