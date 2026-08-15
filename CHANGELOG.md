@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.21.1
+- Its own icon: YouTube’s play button, replacing a generic download arrow. The
+  qBittorrent plugin had picked the same glyph, so the two were indistinguishable
+  in the sidebar and in Extensions.
+
+
 ## v1.21.0
 - **Removed from the app's global search (Cmd+K).** Searching yt-dlp from the
   caption bar is gone; the plugin's own sidebar view is now the one place it
