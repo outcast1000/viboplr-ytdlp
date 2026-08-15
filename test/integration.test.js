@@ -42,6 +42,22 @@ async function activated(config) {
   return { api, plugin };
 }
 
+// index.js ships verbatim in the release zip and is executed by the host, so a
+// stray control byte lands on users' machines. One got in via a hand-typed
+// separator that looked like a space and was a NUL: JS accepted it inside a
+// string literal, every test passed, and the only visible symptom was `file`
+// reporting the source as binary and grep silently refusing to match it.
+test("index.js is clean text — no control bytes", () => {
+  const fs = require("node:fs");
+  const path = require("node:path");
+  const src = fs.readFileSync(path.join(__dirname, "..", "index.js"));
+  const bad = [];
+  for (const [i, b] of src.entries()) {
+    if (b < 0x09 || (b > 0x0d && b < 0x20)) bad.push({ byte: b, offset: i });
+  }
+  assert.deepEqual(bad, [], "control bytes in shipped source");
+});
+
 test("registers all expected handlers", async () => {
   const { api } = await activated({ exec: toolsPresent(BEHAVIOR), fetch: { "direct.example": { status: 200 } } });
   const expected = [
@@ -98,6 +114,62 @@ test("stream URI resolve returns one candidate carrying the stream's headers", a
   // Still ONE extraction — no separate preflight, and no format enumeration.
   assert.equal(api.calls.exec.filter((call) => call.args.includes("%(urls)s")).length, 1);
   assert.ok(!api.calls.exec.some((c) => c.args.includes("-j")), "no format enumeration for a plain audio resolve");
+});
+
+// Caching is about yt-dlp INVOCATIONS, not just latency: each extraction is a
+// request to the source, and YouTube rate-gates a device that makes too many.
+test("a repeat resolve of the same track runs no yt-dlp at all", async () => {
+  const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  const id = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
+  const resolves = () => api.calls.exec.filter((c) => c.args.includes("%(urls)s")).length;
+
+  const first = await api._handlers["streamuri:ytdlp"](id);
+  assert.equal(resolves(), 1);
+  const second = await api._handlers["streamuri:ytdlp"](id);
+  assert.equal(resolves(), 1, "second resolve served from cache");
+  assert.deepEqual(second, first, "and it is the same answer, headers included");
+});
+
+test("audio and video of one source are cached separately", async () => {
+  // The two use different format selectors, so an audio resolve must never be
+  // served a video URL just because the source page matches.
+  const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  const url = "https://www.youtube.com/watch?v=aaaaaaaaaaa";
+  await api._handlers["streamuri:ytdlp"](plugin._encodeRef(url, false).slice("ytdlp://".length));
+  await api._handlers["streamuri:ytdlp"](plugin._encodeRef(url, true).slice("ytdlp://".length));
+  assert.equal(api.calls.exec.filter((c) => c.args.includes("%(urls)s")).length, 2);
+});
+
+test("a repeat search runs no yt-dlp, and an empty one is never cached", async () => {
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  const searches = () => api.calls.exec.filter((c) => c.args.includes("--flat-playlist")).length;
+
+  const first = await api._handlers["isearch:ytdlp-download"]("radiohead", 10);
+  assert.equal(searches(), 1);
+  const second = await api._handlers["isearch:ytdlp-download"]("radiohead", 10);
+  assert.equal(searches(), 1, "repeat query served from cache");
+  assert.deepEqual(second, first);
+
+  // A different query is a different key.
+  await api._handlers["isearch:ytdlp-download"]("bjork", 10);
+  assert.equal(searches(), 2);
+});
+
+test("a failed search is not cached, so a retry really retries", async () => {
+  // This is the bot-gate guard: during a gate EVERY search comes back empty, and
+  // caching that would pin the outage in place for the whole TTL — precisely
+  // when a user retries most.
+  const failing = [
+    { match: { cmd: "yt-dlp", argsInclude: ["--flat-playlist"] }, result: { exitCode: 1, stderr: "Sign in to confirm you’re not a bot" } },
+    ...BEHAVIOR,
+  ];
+  const { api } = await activated({ exec: toolsPresent(failing) });
+  const searches = () => api.calls.exec.filter((c) => c.args.includes("--flat-playlist")).length;
+
+  assert.deepEqual(await api._handlers["isearch:ytdlp-download"]("radiohead", 10), []);
+  assert.equal(searches(), 1);
+  assert.deepEqual(await api._handlers["isearch:ytdlp-download"]("radiohead", 10), []);
+  assert.equal(searches(), 2, "the empty result was not cached");
 });
 
 test("stream URI resolve stays a bare URL when the stream needs no headers", async () => {

@@ -9,8 +9,10 @@
 //  - Playback is HYBRID: try a direct stream URL (one `yt-dlp` extraction that
 //    prints the url AND its http_headers) or download then play. A setting
 //    forces download-only for maximum reliability.
-//  - The sandbox has no Date.now()/Math.random(). Uniqueness comes from a
-//    monotonic counter; cache filenames from a deterministic hash of the source.
+//  - Cache filenames come from a deterministic hash of the source and temp names
+//    from a monotonic counter — so the same source always maps to the same file
+//    and a re-run can find it. (Date and Math ARE in the sandbox; this is a
+//    determinism choice, not a missing global. Expiry logic does use Date.now.)
 
 // ---------------------------------------------------------------------------
 // Module state
@@ -455,6 +457,83 @@ function maybeDeepDiagnostics(api, url, stderr) {
 }
 
 // ---------------------------------------------------------------------------
+// Caches — resolved stream URLs and search results
+// ---------------------------------------------------------------------------
+// These exist to cut yt-dlp INVOCATIONS, not just milliseconds. Every extraction
+// is an API request to the source, and YouTube rate-gates a device that makes
+// too many of them ("Sign in to confirm you're not a bot"), after which nothing
+// resolves until it lifts. So a hit is worth more than the seconds it saves.
+//
+// Measured: yt-dlp costs ~360ms to boot before doing any work; a search is
+// ~1.5s and a resolve ~1.8s, so playing a track found by metadata is ~3.2s
+// across two processes. Forcing a single `player_client` was tried and is NOT a
+// win — yt-dlp already picks the fastest (android_vr) and only tries one.
+//
+// Deliberately in MEMORY rather than plugin storage. A signed media URL is bound
+// to the IP that minted it (`ip=` is in the query string), so one persisted
+// across a restart could be handed to a different network and 403 — and the
+// plugin is never told about a playback failure, so it could not self-correct.
+// A restart is a free and honest invalidation point.
+
+var CACHE_MAX_ENTRIES = 200;
+
+// Pure: the live value for `key`, or null when absent or aged out. Expired
+// entries are dropped on read; there is no sweeper, because an entry nobody
+// looks up costs nothing but a little memory the cap already bounds.
+// Exported for tests.
+function cacheGet(store, key, now) {
+  var e = store[key];
+  if (!e) return null;
+  if (now >= e.expiresAt) { delete store[key]; return null; }
+  return e.value;
+}
+
+// Insert, then evict the SOONEST-TO-EXPIRE entries past `max` — not the oldest
+// inserted. The entries worth keeping are the ones with the most life left,
+// which is what a re-play or a repeated search is most likely to want.
+// Exported for tests.
+function cachePut(store, key, value, expiresAt, max) {
+  store[key] = { value: value, expiresAt: expiresAt };
+  var cap = max || CACHE_MAX_ENTRIES;
+  var keys = Object.keys(store);
+  if (keys.length <= cap) return;
+  keys.sort(function (a, b) { return store[a].expiresAt - store[b].expiresAt; });
+  for (var i = 0; i < keys.length - cap; i++) delete store[keys[i]];
+}
+
+// A signed URL carries its own deadline in the query string (`expire`, in unix
+// seconds — YouTube's observed window is 6 hours). Trust it, but never serve one
+// with less than this margin left: a track runs for minutes and the engine
+// re-requests ranges as it plays and seeks, so a URL that dies mid-song is a
+// worse outcome than one extra extraction.
+var STREAM_URL_EXPIRY_MARGIN_MS = 15 * 60 * 1000;
+// Hard ceiling regardless of what the URL claims, and the whole TTL for sources
+// that publish no `expire` at all. Bounds how long a cached URL can outlive the
+// network change that invalidated it.
+var STREAM_URL_MAX_AGE_MS = 30 * 60 * 1000;
+
+// Pure: when a resolved URL stops being safe to reuse, in epoch ms — or null if
+// it is already too close to its own deadline to be worth caching.
+// Exported for tests.
+function streamUrlExpiry(url, now) {
+  var ceiling = now + STREAM_URL_MAX_AGE_MS;
+  var m = /[?&]expire=(\d+)/.exec(url || "");
+  if (!m) return ceiling;
+  var signed = parseInt(m[1], 10) * 1000 - STREAM_URL_EXPIRY_MARGIN_MS;
+  if (!isFinite(signed)) return ceiling;
+  if (signed <= now) return null;
+  return signed < ceiling ? signed : ceiling;
+}
+
+// Search results move slowly, and a user re-runs the same query constantly —
+// retyping, going back, reopening the view. Short enough that a new upload
+// surfaces soon; long enough to cover a session's worth of navigation.
+var SEARCH_CACHE_TTL_MS = 10 * 60 * 1000;
+
+var streamUrlCache = {};
+var searchCache = {};
+
+// ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
 // Run a search (or resolve a pasted URL) and return candidates:
@@ -482,6 +561,17 @@ async function runSearchFull(api, source, query, count, opts) {
   var n = count || 25;
   var target;
   var isUrl = isHttpUrl(q);
+  // `rank` is in the key because it changes the ORDER of what we return, and a
+  // caller that ranks itself (the resolve paths, the Tuning tab) must not be
+  // handed the view-boosted order from a sidebar search of the same words.
+  // JSON rather than a joined string: no separator can collide with a query
+  // that happens to contain it.
+  var cacheKey = JSON.stringify([source, q, n, (opts && opts.rank) || "views"]);
+  var cached = cacheGet(searchCache, cacheKey, Date.now());
+  if (cached) {
+    api.log("info", "Search served from cache (" + cached.candidates.length + " result(s)): " + q, "ytdlp");
+    return cloneSearchResult(cached);
+  }
   if (isUrl) {
     // Pasted URL (any of yt-dlp's sites — Bandcamp/Vimeo/etc. have no search
     // prefix, but a direct URL always works). A single video → one row; a
@@ -532,7 +622,25 @@ async function runSearchFull(api, source, query, count, opts) {
   // source order untouched, and callers that rank themselves (resolve paths,
   // Tuning tab) pass rank: "none" to get the raw relevance order.
   if (!isUrl && !(opts && opts.rank === "none")) candidates = rerankByViews(candidates, api);
-  return { candidates: candidates, meta: parsed.meta };
+  var result = { candidates: candidates, meta: parsed.meta };
+  // Only cache a NON-EMPTY result. Every failure above returns `none`, and a bot
+  // gate makes every search empty — caching that would pin the outage in place
+  // for the whole TTL and make a retry pointless, which is exactly when a user
+  // retries most.
+  if (candidates.length) cachePut(searchCache, cacheKey, result, Date.now() + SEARCH_CACHE_TTL_MS, CACHE_MAX_ENTRIES);
+  return cloneSearchResult(result);
+}
+
+// Hand every caller its OWN candidate objects. `rankByProfile` stamps
+// `_profileScore` onto each one and the sidebar keeps results in view state, so
+// sharing the cached objects would let one caller's ranking show up in another's
+// list — and let the view mutate what the cache hands out next.
+// Pure; exported for tests.
+function cloneSearchResult(result) {
+  return {
+    candidates: (result.candidates || []).map(function (c) { return Object.assign({}, c); }),
+    meta: result.meta,
+  };
 }
 
 // Parse `--print` output lines into candidates, plus the playlist meta when
@@ -1701,8 +1809,22 @@ async function withCacheProtection(api, filePath, work) {
 // Users who want the reliability of a local copy pick "Download then play".
 async function resolvePlayable(api, url, isVideo) {
   if (playbackMode === "stream") {
+    // Keyed per (source, kind) exactly like the download cache: the two format
+    // selectors differ, so an audio resolve must never serve a video's URL.
+    var key = cacheStem(url, isVideo);
+    var hit = cacheGet(streamUrlCache, key, Date.now());
+    if (hit) {
+      api.log("info", "Streaming directly (cached resolve, no yt-dlp call): " + url, "ytdlp");
+      return { url: hit.url, downloaded: false, headers: hit.headers };
+    }
     var direct = await getDirectUrl(api, url, isVideo);
     if (direct && direct.url) {
+      var expiresAt = streamUrlExpiry(direct.url, Date.now());
+      // null = the URL is already near its own deadline, so caching it would
+      // only guarantee a dead hit later. Play it now, resolve again next time.
+      if (expiresAt) {
+        cachePut(streamUrlCache, key, { url: direct.url, headers: direct.headers || null }, expiresAt, CACHE_MAX_ENTRIES);
+      }
       api.log("info", "Streaming directly: " + url, "ytdlp");
       return { url: direct.url, downloaded: false, headers: direct.headers || null };
     }
@@ -2709,6 +2831,9 @@ function deactivate() {
   inFlightFiles = {}; lastSourceFile = null;
   tabState = {}; searching = false; searchingSource = null; searchGen = 0;
   botGateNotified = false; deepDiagnosticsRun = false; lastResolve = null;
+  // Drop both caches: a disable/enable cycle is the user's way of saying "start
+  // over", and a stale signed URL surviving it would be the first thing to fail.
+  streamUrlCache = {}; searchCache = {};
   scoringAudio = null; scoringVideo = null;
   resolveOpen = false;
   tuneOpen = false; tuneProfile = "audio"; tuneQuery = ""; tuneTarget = null;
@@ -2747,6 +2872,10 @@ return {
   _decodeHtmlEntities: decodeHtmlEntities,
   _classifyYtdlpError: classifyYtdlpError,
   _warrantsDeepDiagnostics: warrantsDeepDiagnostics,
+  _cacheGet: cacheGet,
+  _cachePut: cachePut,
+  _streamUrlExpiry: streamUrlExpiry,
+  _cloneSearchResult: cloneSearchResult,
   _isOlderVersion: isOlderVersion,
   _pickHlsMaster: pickHlsMaster,
   _parseDirectOutput: parseDirectOutput,

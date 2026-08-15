@@ -115,3 +115,79 @@ test("streamUriResult: nothing resolved means null", () => {
   assert.equal(plugin._streamUriResult(null, false), null);
   assert.equal(plugin._streamUriResult({ url: null }, false), null);
 });
+
+// --- caches ------------------------------------------------------------------
+// These cut yt-dlp INVOCATIONS, not just latency: every extraction is a request
+// to the source, and YouTube rate-gates a device that makes too many.
+
+test("cacheGet: returns a live value and drops an expired one", () => {
+  const store = {};
+  plugin._cachePut(store, "k", "v", 1000, 10);
+  assert.equal(plugin._cacheGet(store, "k", 999), "v");
+  assert.equal(plugin._cacheGet(store, "k", 1000), null, "expiry is exclusive of the deadline");
+  assert.deepEqual(Object.keys(store), [], "an expired entry is deleted on read, not left to rot");
+  assert.equal(plugin._cacheGet(store, "missing", 0), null);
+});
+
+test("cachePut: evicts the soonest-to-expire past the cap, not the oldest inserted", () => {
+  const store = {};
+  plugin._cachePut(store, "dies-first", "a", 100, 2);
+  plugin._cachePut(store, "lives-long", "b", 9000, 2);
+  plugin._cachePut(store, "middle", "c", 500, 2);
+  // The entries worth keeping are the ones with the most life left.
+  assert.deepEqual(Object.keys(store).sort(), ["lives-long", "middle"]);
+});
+
+test("cachePut: re-putting a key refreshes rather than duplicating", () => {
+  const store = {};
+  plugin._cachePut(store, "k", "old", 100, 10);
+  plugin._cachePut(store, "k", "new", 900, 10);
+  assert.equal(Object.keys(store).length, 1);
+  assert.equal(plugin._cacheGet(store, "k", 500), "new");
+});
+
+test("streamUrlExpiry: honours the URL's own expire, minus a safety margin", () => {
+  const now = 1_000_000_000_000;              // epoch ms
+  const expireSecs = Math.floor(now / 1000) + 6 * 3600; // YouTube's 6h window
+  const got = plugin._streamUrlExpiry(`https://x/v?id=1&expire=${expireSecs}&ip=1.2.3.4`, now);
+  // 6h out, less the 15min margin — but clamped by the 30min hard ceiling.
+  assert.equal(got, now + 30 * 60 * 1000);
+});
+
+test("streamUrlExpiry: a signed deadline nearer than the ceiling wins", () => {
+  const now = 1_000_000_000_000;
+  const expireSecs = Math.floor(now / 1000) + 20 * 60; // 20min out
+  const got = plugin._streamUrlExpiry(`https://x/v?expire=${expireSecs}`, now);
+  assert.equal(got, expireSecs * 1000 - 15 * 60 * 1000, "20min − 15min margin = 5min");
+});
+
+test("streamUrlExpiry: refuses to cache a url already inside the margin", () => {
+  const now = 1_000_000_000_000;
+  // Ten minutes left is less than the margin: caching it only guarantees a dead
+  // hit later, mid-track, which is worse than one more extraction.
+  const soon = Math.floor(now / 1000) + 10 * 60;
+  assert.equal(plugin._streamUrlExpiry(`https://x/v?expire=${soon}`, now), null);
+  const past = Math.floor(now / 1000) - 60;
+  assert.equal(plugin._streamUrlExpiry(`https://x/v?expire=${past}`, now), null);
+});
+
+test("streamUrlExpiry: a url with no expire falls back to the hard ceiling", () => {
+  const now = 1_000_000_000_000;
+  // Non-YouTube sources often publish no deadline; they still must not be
+  // cached indefinitely, because a network change silently invalidates them.
+  assert.equal(plugin._streamUrlExpiry("https://bandcamp.example/track.mp3", now), now + 30 * 60 * 1000);
+  assert.equal(plugin._streamUrlExpiry("https://x/v?expire=notanumber", now), now + 30 * 60 * 1000);
+});
+
+test("cloneSearchResult: hands out independent candidate objects", () => {
+  // rankByProfile stamps _profileScore onto candidates and the sidebar keeps
+  // results in view state, so a shared object would leak one caller's ranking
+  // into another's list.
+  const cached = { candidates: [{ url: "u", title: "t" }], meta: { title: "m" } };
+  const a = plugin._cloneSearchResult(cached);
+  a.candidates[0]._profileScore = { pos: 0 };
+  a.candidates.push({ url: "extra" });
+  const b = plugin._cloneSearchResult(cached);
+  assert.equal(b.candidates.length, 1, "the cached array is not appended to");
+  assert.equal(b.candidates[0]._profileScore, undefined, "the cached object is not stamped");
+});
