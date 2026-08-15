@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.16.5
+- TODO: describe changes
+
 ## v1.16.4
 - **Fixed native mpv YouTube playback.** yt-dlp now passes the request headers
   required by its signed YouTube stream URLs to Viboplr's native mpv engine.
