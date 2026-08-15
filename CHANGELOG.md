@@ -1,5 +1,38 @@
 # Changelog
 
+## v1.20.0
+- **The log now explains why a track played the way it did.** Until now it
+  recorded the commands it ran and little else, so a report of "this played at
+  360p" or "this wouldn't play" had nothing behind it. Each resolve is now
+  written as one readable story: what was searched, which stream was picked,
+  what was retried and what fell back — each step with how long it took and, on
+  failure, the reason. Resolves are tagged, so the two that overlap while the
+  next track is being prepared can be told apart instead of interleaving into
+  one another.
+
+  It also records the video and audio formats a source actually publishes, and
+  which one was taken — including any hidden by your resolution limit. That is
+  the difference between "this source had nothing better" and "something chose
+  badly", which was previously impossible to tell from the outside. All of it
+  comes from information yt-dlp had already returned, so nothing extra is run
+  and nothing is slower.
+
+  Turn on logging in Settings → Debug, and "Report a problem" there picks up the
+  tail of it.
+
+- **A yt-dlp track now shows the page it came from.** Hovering the source icon
+  next to a playing track showed a long encoded line beginning `ytdlp://` — the
+  right address, but scrambled, and with no way to open it. It now shows the
+  plain YouTube (or SoundCloud, Bandcamp, …) address, with a button to open it
+  in your browser, and names the plugin properly instead of "Ytdlp". Tracks the
+  plugin found by searching already did this; now the ones you played from its
+  own view or from your queue do too.
+
+  Needs the matching app change, which ships in the next Viboplr release. On
+  earlier versions the panel reads as it did before and nothing else in this
+  release is affected.
+
+
 ## v1.19.0
 - **Video played through "prefer video" is no longer stuck at 360p.** Asked to
   find a video for a track you were playing as audio, the plugin handed the app
