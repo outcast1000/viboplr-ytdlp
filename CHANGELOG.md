@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.18.0
+- **Playing a track you've already played is now instant, and searches you
+  repeat are too.** Resolving a track meant running yt-dlp twice — once to find
+  it, once to get a playable link — about three seconds before any sound. Both
+  answers are now remembered for a while, so a replay, a re-queue, or the same
+  search again costs nothing.
+
+  The bigger reason is not the wait. Every lookup is a request to YouTube, and
+  it starts refusing a device that makes too many of them — that is the "sign
+  in to confirm you're not a bot" block, and once it lands nothing plays until
+  it lifts. Roughly halving the requests a listening session makes is the point;
+  the speed is a side effect.
+
+  A playable link is remembered for at most 30 minutes, and never past its own
+  expiry with less than 15 minutes to spare — these links are short-lived and
+  tied to your network, and one that dies mid-song is worse than a short wait
+  before it starts. Searches are remembered for 10 minutes. A search that
+  *fails* is never remembered, so retrying after a block really retries.
+
+  Also makes the scoring Tuning tab usable: adjusting weights re-ranks the same
+  results instantly instead of re-fetching them every time.
+
 ## v1.17.0
 - **Fixed YouTube playback failing with 403 and skipping to the next track.**
   v1.16.4 fixed this for videos, but only for videos: that fix works by handing
