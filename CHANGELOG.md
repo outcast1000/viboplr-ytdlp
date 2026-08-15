@@ -17,6 +17,22 @@
   Viboplr 1.0.25 or newer. On 1.0.24 those tracks behave as they did before;
   nothing regresses.
 
+- **Playback failures now say why.** When a track can't be played, the plugin
+  re-runs the extraction in verbose mode and logs what it finds — YouTube's
+  token and player-client details, which is what separates a temporary block
+  from a genuinely unavailable video. This ran for downloads already; playback
+  only ever logged "direct stream unavailable".
+
+  It runs **once per session** and never delays playback: a block affects every
+  track, so probing each one would add a pile of extra requests to a service
+  that is already turning us away, and the app has already moved on to its next
+  source by then. Failures that already explain themselves — a removed video, a
+  sign-in wall, a region block — are not re-probed at all.
+
+- **Fixed region-locked videos being reported as an unknown error.** The check
+  looked for "not available in your country", but the wording is "has not made
+  this video available in your country", so it never matched.
+
 ## v1.16.5
 - Relaxed the minimum app version to 1.0.23.
 

@@ -333,7 +333,10 @@ function classifyYtdlpError(stderr) {
   if (/requested format is not available/i.test(s)) {
     return "The requested format isn't available for this item.";
   }
-  if (/video unavailable|private video|has been removed|geo.?restricted|not available in your country/i.test(s)) {
+  // "available in your country", not "not available in your country": yt-dlp's
+  // actual geo-block wording is "The uploader has not made this video available
+  // in your country", where the negation is nowhere near the phrase.
+  if (/video unavailable|private video|has been removed|geo.?restricted|available in your country/i.test(s)) {
     return "The video is unavailable (removed, private or region-locked).";
   }
   if (/HTTP Error 403/i.test(s)) {
@@ -392,8 +395,13 @@ function noteBotGate(api, stderr) {
 // ---------------------------------------------------------------------------
 // Diagnostics — re-run extraction in verbose simulate mode to surface WHY a
 // download/stream failed (PO-token/SABR/403). Best-effort; never throws.
+//
+// This is a SECOND full extraction, so who waits for it differs by caller. A
+// download is one deliberate action with a user watching a modal: it awaits,
+// because the answer is the point. Playback is automatic and repeats per track:
+// it goes through maybeDeepDiagnostics below, which neither waits nor repeats.
 // ---------------------------------------------------------------------------
-async function logDownloadDiagnostics(api, url) {
+async function logExtractionDiagnostics(api, url) {
   try {
     var diag = await api.system.exec("yt-dlp", ["-v", "--simulate", "-f", "bestaudio", url], { cwd: null });
     var out = ((diag.stderr || "") + "\n" + (diag.stdout || "")).trim();
@@ -408,6 +416,42 @@ async function logDownloadDiagnostics(api, url) {
   } catch (e) {
     api.log("warn", "yt-dlp diagnostics probe failed: " + (e && e.message ? e.message : e), "ytdlp");
   }
+}
+
+// Which stream failures a deep probe can actually explain. A bot gate, a removed
+// or private video and a login wall already say exactly what they are, and
+// re-running the extraction verbosely would add a request to a source that is
+// already refusing us to learn nothing. The ambiguous ones — a 403, a missing
+// format, or an exit 0 that produced no URL — are precisely where a PO-token /
+// SABR gate hides, and they are what this probe exists to name.
+// Pure; exported for tests.
+function warrantsDeepDiagnostics(stderr) {
+  var s = stderr || "";
+  if (/sign in to confirm|account authentication is required|--cookies/i.test(s)) return false;
+  if (/video unavailable|private video|has been removed|geo.?restricted|available in your country/i.test(s)) return false;
+  return true;
+}
+
+// Deep diagnostics for a FAILED playback resolve. Two deliberate restraints,
+// because unlike a download this runs by itself and once per track:
+//
+//  - Not awaited. The host has already given up on us and moved to the next
+//    resolver in its chain; blocking that fallback for seconds to produce a log
+//    line nobody is waiting on would turn a diagnostic into a stall.
+//  - Once per session. A bot gate or an offline network fails every track, and
+//    a probe per failure would mean dozens of extra extractions aimed at a
+//    source that is already rate-limiting us — making the problem worse while
+//    logging the same paragraph each time. The first one has the answer.
+//
+// Settings → Debug's on-demand report is the way to get a fresh one after this.
+var deepDiagnosticsRun = false;
+function maybeDeepDiagnostics(api, url, stderr) {
+  if (deepDiagnosticsRun || !warrantsDeepDiagnostics(stderr)) return;
+  deepDiagnosticsRun = true;
+  api.log("info", "Probing why the stream failed (once per session) — " + url, "ytdlp");
+  logExtractionDiagnostics(api, url).catch(function (e) {
+    api.log("warn", "Stream diagnostics probe failed: " + (e && e.message ? e.message : e), "ytdlp");
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,7 +1153,7 @@ async function downloadForDownload(api, url, opts) {
   }
   if (res.exitCode !== 0) {
     api.log("error", "yt-dlp download failed (exit " + res.exitCode + "): " + (res.stderr || "").trim(), "ytdlp");
-    await logDownloadDiagnostics(api, url);
+    await logExtractionDiagnostics(api, url);
     throw new Error(await withOutdatedHint(api, classifyYtdlpError(res.stderr)));
   }
   // stdout: the META_PRINT line (extraction time), then the after_move
@@ -1122,7 +1166,7 @@ async function downloadForDownload(api, url, opts) {
   var last = lines.length ? lines[lines.length - 1].trim() : "";
   if (!looksLikePath(last)) {
     api.log("warn", "yt-dlp returned no file path — likely SABR/PO-token", "ytdlp");
-    await logDownloadDiagnostics(api, url);
+    await logExtractionDiagnostics(api, url);
     throw new Error("The download produced no file — often a YouTube restriction; updating yt-dlp usually fixes this.");
   }
   api.log("info", "Downloaded to: " + last, "ytdlp");
@@ -1253,9 +1297,15 @@ async function getDirectUrl(api, url, isVideo) {
   // split DASH/HLS streams — so `best` matches nothing. The HLS MASTER
   // playlist is one URL carrying the video renditions + the audio group,
   // playable by mpv and the macOS webview alike.
-  if (!isVideo) return null;
-  var master = await getHlsMasterUrl(api, url);
-  return master ? { url: master, headers: null } : null;
+  if (isVideo) {
+    var master = await getHlsMasterUrl(api, url);
+    if (master) return { url: master, headers: null };
+  }
+  // Nothing playable came out of this source. Probe only HERE, not at the
+  // classification above: for video the HLS master often rescues the resolve,
+  // and diagnosing a failure that then succeeded would be noise.
+  maybeDeepDiagnostics(api, url, res.stderr);
+  return null;
 }
 
 // Pure: the master manifest URL of the best (last) m3u8 format, or null.
@@ -1608,7 +1658,7 @@ async function downloadToCache(api, url, isVideo) {
     }
     if (res.exitCode !== 0) {
       api.log("error", "yt-dlp download failed (exit " + res.exitCode + "): " + (res.stderr || "").trim(), "ytdlp");
-      await logDownloadDiagnostics(api, url);
+      await logExtractionDiagnostics(api, url);
       return null;
     }
     filePath = res.stdout ? res.stdout.trim() || null : null;
@@ -1618,7 +1668,7 @@ async function downloadToCache(api, url, isVideo) {
   }
   if (!filePath) {
     api.log("warn", "yt-dlp returned no file path (exit 0, no output) — likely SABR/PO-token", "ytdlp");
-    await logDownloadDiagnostics(api, url);
+    await logExtractionDiagnostics(api, url);
     return null;
   }
   api.log("info", "Downloaded to: " + filePath, "ytdlp");
@@ -2658,7 +2708,7 @@ function deactivate() {
   globalSearchRegistered = false;
   inFlightFiles = {}; lastSourceFile = null;
   tabState = {}; searching = false; searchingSource = null; searchGen = 0;
-  botGateNotified = false; lastResolve = null;
+  botGateNotified = false; deepDiagnosticsRun = false; lastResolve = null;
   scoringAudio = null; scoringVideo = null;
   resolveOpen = false;
   tuneOpen = false; tuneProfile = "audio"; tuneQuery = ""; tuneTarget = null;
@@ -2696,6 +2746,7 @@ return {
   _parseSearchOutput: parseSearchOutput,
   _decodeHtmlEntities: decodeHtmlEntities,
   _classifyYtdlpError: classifyYtdlpError,
+  _warrantsDeepDiagnostics: warrantsDeepDiagnostics,
   _isOlderVersion: isOlderVersion,
   _pickHlsMaster: pickHlsMaster,
   _parseDirectOutput: parseDirectOutput,

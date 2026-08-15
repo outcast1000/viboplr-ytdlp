@@ -123,3 +123,79 @@ test("audio resolve does NOT fall back to the HLS master (audio extraction failu
   assert.equal(url, null);
   assert.ok(!api.calls.exec.some((c) => c.args.includes("%(formats)j")), "audio path must not run the formats dump");
 });
+
+// ---------------------------------------------------------------------------
+// Deep diagnostics on a failed stream resolve
+// ---------------------------------------------------------------------------
+// A failed playback resolve used to say only "Direct stream unavailable", which
+// cannot distinguish a PO-token/SABR gate from anything else. The verbose probe
+// that downloads already ran now runs for streams too — but only where it can
+// learn something, and never in a way that costs the user time.
+
+test("warrantsDeepDiagnostics: skips failures that already explain themselves", () => {
+  // Re-probing these adds a request to a source that is already refusing us and
+  // returns the same sentence the cheap classifier produced.
+  for (const s of [
+    "ERROR: [youtube] x: Sign in to confirm you’re not a bot.",
+    "ERROR: [generic] account authentication is required",
+    "ERROR: Use --cookies-from-browser to pass browser cookies",
+    "ERROR: [youtube] x: Video unavailable",
+    "ERROR: [youtube] x: Private video. Sign in if you've been granted access",
+    "ERROR: This video has been removed by the uploader",
+    "ERROR: The uploader has not made this video available in your country",
+  ]) {
+    assert.equal(plugin._warrantsDeepDiagnostics(s), false, s);
+  }
+});
+
+test("warrantsDeepDiagnostics: probes the ambiguous failures a token gate hides behind", () => {
+  for (const s of [
+    "ERROR: unable to download video data: HTTP Error 403: Forbidden",
+    "ERROR: [youtube] x: Requested format is not available",
+    "",           // exit 0, no URL printed — the silent SABR case
+    "some unrecognised extractor noise",
+  ]) {
+    assert.equal(plugin._warrantsDeepDiagnostics(s), true, JSON.stringify(s));
+  }
+});
+
+test("a failed stream resolve probes deeply — once per session, without blocking", async () => {
+  const { api, plugin: p } = await activated({
+    exec: rules([
+      { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s"] }, result: { exitCode: 1, stderr: "HTTP Error 403: Forbidden" } },
+      { match: { cmd: "yt-dlp", argsInclude: ["--simulate"] }, result: { exitCode: 1, stderr: "[debug] PO Token for gvs was not provided" } },
+    ]),
+  });
+  const id = p._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
+
+  assert.equal(await api._handlers["streamuri:ytdlp"](id), null);
+  // The probe is deliberately NOT awaited — the host is already falling through
+  // to its next resolver — so it lands a tick later, not before the return.
+  await new Promise((r) => setTimeout(r, 5));
+  const probes = () => api.calls.exec.filter((c) => c.args.includes("--simulate"));
+  assert.equal(probes().length, 1);
+  assert.ok(
+    api.calls.log.some((l) => /PO Token for gvs/.test(l.msg)),
+    "the probe's finding reaches the log",
+  );
+
+  // A second failure must not re-probe: a token gate fails every track, and one
+  // extra extraction per track would worsen the rate limiting it is diagnosing.
+  assert.equal(await api._handlers["streamuri:ytdlp"](id), null);
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(probes().length, 1, "probed once per session, not once per failure");
+});
+
+test("a bot gate is not probed deeply — it already says what it is", async () => {
+  const BOT = "ERROR: [youtube] x: Sign in to confirm you’re not a bot. Use --cookies-from-browser ...";
+  const { api, plugin: p } = await activated({
+    exec: rules([
+      { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s"] }, result: { exitCode: 1, stderr: BOT } },
+      { match: { cmd: "yt-dlp", argsInclude: ["--simulate"] }, result: { exitCode: 1, stderr: "should never run" } },
+    ]),
+  });
+  const id = p._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
+  assert.equal(await api._handlers["streamuri:ytdlp"](id), null);
+  await new Promise((r) => setTimeout(r, 5));
+  assert.ok(!api.calls.exec.some((c) => c.args.includes("--simulate")), "no probe for a self-explanatory failure");
+});
