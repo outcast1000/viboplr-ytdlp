@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v1.17.0
 - **Fixed YouTube playback failing with 403 and skipping to the next track.**
   v1.16.4 fixed this for videos, but only for videos: that fix works by handing
   the app a list of streams to choose from, and a list was the only thing that
