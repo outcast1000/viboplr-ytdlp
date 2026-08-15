@@ -6,8 +6,9 @@
 //    api.system.getDependency (never probe --version, never check releases). The
 //    host surfaces missing/updatable yt-dlp/ffmpeg (sidebar dot + Settings →
 //    Dependencies). We just gate our work on what it reports.
-//  - Playback is HYBRID: try a direct stream URL (`yt-dlp -g`) or download then
-//    play. A setting forces download-only for maximum reliability.
+//  - Playback is HYBRID: try a direct stream URL (one `yt-dlp` extraction that
+//    prints the url AND its http_headers) or download then play. A setting
+//    forces download-only for maximum reliability.
 //  - The sandbox has no Date.now()/Math.random(). Uniqueness comes from a
 //    monotonic counter; cache filenames from a deterministic hash of the source.
 
@@ -1194,23 +1195,50 @@ function scheduleCleanup(api, wipeTemp) {
 // ---------------------------------------------------------------------------
 // Resolution primitives
 // ---------------------------------------------------------------------------
-// Get a direct stream URL via `yt-dlp -g`. audio: bestaudio; video: a single
-// muxed stream (streamable without a local merge). Returns a URL or null.
+// Pure: split the two `--print` lines getDirectUrl asks for into a playable
+// stream. `%(urls)s` is newline-separated when a selector picks more than one
+// format, so the URL is the FIRST http line and the headers are the LAST line
+// that parses as a JSON object — which holds whether one or several were
+// printed. Bad/absent header JSON degrades to no headers, never to no URL.
+// Exported for tests.
+function parseDirectOutput(stdout) {
+  var lines = String(stdout || "").split("\n"), url = null, headers = null;
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i].trim();
+    if (!l) continue;
+    if (!url && isHttpUrl(l)) { url = l; continue; }
+    if (l.charAt(0) === "{") {
+      try {
+        var parsed = JSON.parse(l);
+        if (parsed && typeof parsed === "object" && Object.keys(parsed).length) headers = parsed;
+      } catch (e) { /* not the header line — leave headers null */ }
+    }
+  }
+  return { url: url, headers: headers };
+}
+
+// Get a direct stream URL. audio: bestaudio; video: a single muxed stream
+// (streamable without a local merge). Returns `{ url, headers }` or null.
+//
+// `--print` rather than `-g`, because -g prints URLs and nothing else: signed
+// CDN links are commonly bound to the User-Agent that minted them, so the host
+// needs `http_headers` to hand mpv alongside the URL (see the plugin API's
+// StreamResolveResult.headers). Both come from ONE extraction — asking twice
+// would mint a second, differently-signed URL.
+//
 // Video falls back to the HLS MASTER playlist when no muxed stream exists —
 // see getHlsMasterUrl.
 async function getDirectUrl(api, url, isVideo) {
   var fmt = isVideo ? "best[ext=mp4]/best" : "bestaudio[ext=m4a]/bestaudio";
-  var args = ["-g", "-f", fmt, "--no-warnings", "--no-playlist", url];
+  var args = ["-f", fmt, "--print", "%(urls)s", "--print", "%(http_headers)j",
+              "--no-warnings", "--no-playlist", url];
   api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
   var res;
   try { res = await api.system.exec("yt-dlp", args, { cwd: null }); }
-  catch (e) { api.log("warn", "yt-dlp -g exec failed: " + (e && e.message ? e.message : e), "ytdlp"); return null; }
+  catch (e) { api.log("warn", "yt-dlp direct-url exec failed: " + (e && e.message ? e.message : e), "ytdlp"); return null; }
   if (res.exitCode === 0 && res.stdout) {
-    // -g prints one URL per selected stream. For our single-stream selectors
-    // the last non-empty line is the (only) media URL.
-    var lines = res.stdout.split("\n"), direct = null;
-    for (var i = lines.length - 1; i >= 0; i--) { var l = lines[i].trim(); if (l) { direct = l; break; } }
-    if (isHttpUrl(direct)) return direct;
+    var out = parseDirectOutput(res.stdout);
+    if (out.url) return { url: out.url, headers: out.headers };
   }
   if (res.exitCode !== 0) {
     var reason = await withOutdatedHint(api, classifyYtdlpError(res.stderr));
@@ -1225,7 +1253,9 @@ async function getDirectUrl(api, url, isVideo) {
   // split DASH/HLS streams — so `best` matches nothing. The HLS MASTER
   // playlist is one URL carrying the video renditions + the audio group,
   // playable by mpv and the macOS webview alike.
-  return isVideo ? await getHlsMasterUrl(api, url) : null;
+  if (!isVideo) return null;
+  var master = await getHlsMasterUrl(api, url);
+  return master ? { url: master, headers: null } : null;
 }
 
 // Pure: the master manifest URL of the best (last) m3u8 format, or null.
@@ -1610,7 +1640,9 @@ async function withCacheProtection(api, filePath, work) {
   }
 }
 
-// Resolve a source URL to a PLAYABLE url. Returns { url, downloaded } or null.
+// Resolve a source URL to a PLAYABLE url. Returns { url, downloaded, headers }
+// or null. `headers` is set only for a direct stream (a downloaded file needs
+// none) and only when the source asked for some.
 //
 // "stream" mode returns a direct URL only — it does NOT fall back to downloading
 // on failure. A download of the same source doesn't fix a codec the engine can't
@@ -1620,9 +1652,9 @@ async function withCacheProtection(api, filePath, work) {
 async function resolvePlayable(api, url, isVideo) {
   if (playbackMode === "stream") {
     var direct = await getDirectUrl(api, url, isVideo);
-    if (direct) {
+    if (direct && direct.url) {
       api.log("info", "Streaming directly: " + url, "ytdlp");
-      return { url: direct, downloaded: false };
+      return { url: direct.url, downloaded: false, headers: direct.headers || null };
     }
     api.log("warn", "Direct stream unavailable: " + url, "ytdlp");
     return null;
@@ -1711,12 +1743,15 @@ async function activate(api) {
       if (!cand) { api.log("warn", "No match for: " + title, "ytdlp"); return null; }
       if (preferVideo) {
         var vid = await resolvePlayable(api, cand.url, true);
-        if (vid) return { url: vid.url, label: "yt-dlp (video)", sourceUrl: cand.url, video: true };
+        // `headers` rides along so the host can hand them to mpv: a signed CDN
+        // URL is often bound to the User-Agent that minted it, and this path
+        // (unlike the by-URI candidate list) has no other way to carry them.
+        if (vid) return { url: vid.url, label: "yt-dlp (video)", sourceUrl: cand.url, video: true, headers: vid.headers || undefined };
         api.log("warn", "No video stream — falling back to audio: " + cand.url, "ytdlp");
       }
       var playable = await resolvePlayable(api, cand.url, false);
       if (!playable) return null;
-      return { url: playable.url, label: "yt-dlp", sourceUrl: cand.url };
+      return { url: playable.url, label: "yt-dlp", sourceUrl: cand.url, headers: playable.headers || undefined };
     } catch (e) {
       api.log("error", "Stream resolve failed: " + (e && e.message ? e.message : e), "ytdlp");
       return null;
@@ -2639,6 +2674,7 @@ return {
   _classifyYtdlpError: classifyYtdlpError,
   _isOlderVersion: isOlderVersion,
   _pickHlsMaster: pickHlsMaster,
+  _parseDirectOutput: parseDirectOutput,
   _candidatesFromFormats: candidatesFromFormats,
   _storyboardFromFormats: storyboardFromFormats,
   _putStoryboardCache: putStoryboardCache,

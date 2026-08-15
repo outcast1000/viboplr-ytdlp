@@ -68,11 +68,11 @@ async function activated(config) {
   return { api, plugin: p };
 }
 
-test("video resolve: no muxed stream -> -g fails -> HLS master is returned", async () => {
+test("video resolve: no muxed stream -> direct-url extraction fails -> HLS master is returned", async () => {
   const { api, plugin: p } = await activated({
     exec: rules([
-      // -g with the muxed selector fails (Reddit: no combined format).
-      { match: { cmd: "yt-dlp", argsInclude: ["-g", "best[ext=mp4]/best"] }, result: { exitCode: 1, stderr: "Requested format is not available" } },
+      // The direct-url extraction with the muxed selector fails (Reddit: no combined format).
+      { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s", "best[ext=mp4]/best"] }, result: { exitCode: 1, stderr: "Requested format is not available" } },
       // The formats dump carries the m3u8 master.
       { match: { cmd: "yt-dlp", argsInclude: ["%(formats)j"] }, result: { exitCode: 0, stdout: FORMATS_JSON } },
     ]),
@@ -83,24 +83,24 @@ test("video resolve: no muxed stream -> -g fails -> HLS master is returned", asy
   assert.equal(url, MASTER);
 });
 
-test("video resolve still prefers a muxed -g URL when one exists (no formats dump)", async () => {
+test("video resolve still prefers a muxed direct URL when one exists (no formats dump)", async () => {
   const { api, plugin: p } = await activated({
     exec: rules([
-      { match: { cmd: "yt-dlp", argsInclude: ["-g", "best[ext=mp4]/best"] }, result: { exitCode: 0, stdout: "https://direct.example/muxed.mp4" } },
+      { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s", "best[ext=mp4]/best"] }, result: { exitCode: 0, stdout: "https://direct.example/muxed.mp4" } },
     ]),
     fetch: { "direct.example": { status: 200 } },
   });
   const id = p._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", true).slice("ytdlp://".length);
   const url = await api._handlers["streamuri:ytdlp"](id);
   assert.equal(url, "https://direct.example/muxed.mp4");
-  assert.ok(!api.calls.exec.some((c) => c.args.includes("%(formats)j")), "no fallback lookup when -g succeeds");
+  assert.ok(!api.calls.exec.some((c) => c.args.includes("%(formats)j")), "no fallback lookup when the direct-url extraction succeeds");
 });
 
 test("YouTube bot gate on stream resolve notifies the user ONCE per session", async () => {
   const BOT = "ERROR: [youtube] x: Sign in to confirm you’re not a bot. Use --cookies-from-browser ...";
   const { api, plugin: p } = await activated({
     exec: rules([
-      { match: { cmd: "yt-dlp", argsInclude: ["-g"] }, result: { exitCode: 1, stderr: BOT } },
+      { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s"] }, result: { exitCode: 1, stderr: BOT } },
       { match: { cmd: "yt-dlp", argsInclude: ["%(formats)j"] }, result: { exitCode: 1, stderr: BOT } },
     ]),
   });
@@ -111,10 +111,10 @@ test("YouTube bot gate on stream resolve notifies the user ONCE per session", as
   assert.equal(gate.length, 1, "notified exactly once, not per failure");
 });
 
-test("audio resolve does NOT fall back to the HLS master (audio -g failure fails cleanly)", async () => {
+test("audio resolve does NOT fall back to the HLS master (audio extraction failure fails cleanly)", async () => {
   const { api, plugin: p } = await activated({
     exec: rules([
-      { match: { cmd: "yt-dlp", argsInclude: ["-g"] }, result: { exitCode: 1, stderr: "no formats" } },
+      { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s"] }, result: { exitCode: 1, stderr: "no formats" } },
       { match: { cmd: "yt-dlp", argsInclude: ["%(formats)j"] }, result: { exitCode: 0, stdout: FORMATS_JSON } },
     ]),
   });

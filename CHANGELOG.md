@@ -1,7 +1,20 @@
 # Changelog
 
+## Unreleased
+- **Stream request headers now reach playback for tracks resolved by metadata.**
+  v1.16.4 fixed this for videos played from a `ytdlp://` link, but that path
+  works by handing the app a list of streams to choose from, and it is the only
+  one that could carry headers. An ordinary library track resolves by *title and
+  artist* instead and gets back a single URL, so its headers had nowhere to go —
+  the app received a bare link and played it with no `User-Agent`. Signed CDN
+  links are frequently bound to the agent that requested them, and the ones that
+  are answered 403. Resolving by metadata now reports the headers too.
+
+  Requires Viboplr 1.0.25 or newer; on older versions the headers are ignored
+  and playback behaves exactly as before.
+
 ## v1.16.5
-- TODO: describe changes
+- Relaxed the minimum app version to 1.0.23.
 
 ## v1.16.4
 - **Fixed native mpv YouTube playback.** yt-dlp now passes the request headers

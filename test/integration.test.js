@@ -20,8 +20,13 @@ const SEARCH_STDOUT =
   "https://www.youtube.com/watch?v=aaaaaaaaaaa\t213\tRadiohead\tRadiohead - Creep\thttps://i.ytimg.com/x.jpg\t1000000\n" +
   "https://www.youtube.com/watch?v=bbbbbbbbbbb\t180\tBjork\tBjork - Joga\tNA\t5000";
 
+// getDirectUrl asks for two --print lines in one extraction: the media url, then
+// that format's http_headers as JSON. `%(urls)s` identifies the call.
+const DIRECT_HEADERS = { "User-Agent": "Mozilla/5.0 (mock)", Referer: "https://example/" };
+const DIRECT_STDOUT = DIRECT_URL + "\n" + JSON.stringify(DIRECT_HEADERS);
+
 const BEHAVIOR = [
-  { match: { cmd: "yt-dlp", argsInclude: ["-g"] }, result: { exitCode: 0, stdout: DIRECT_URL } },
+  { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s"] }, result: { exitCode: 0, stdout: DIRECT_STDOUT } },
   { match: { cmd: "yt-dlp", argsInclude: ["after_move:filepath"] }, result: { exitCode: 0, stdout: "/mock-plugin-data/cache/abc.m4a" } },
   { match: { cmd: "yt-dlp", argsInclude: ["--flat-playlist"] }, result: { exitCode: 0, stdout: SEARCH_STDOUT } },
 ];
@@ -84,10 +89,10 @@ test("stream URI resolve returns the direct URL without a separate preflight req
   const id = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
   const url = await api._handlers["streamuri:ytdlp"](id);
   assert.equal(url, DIRECT_URL);
-  assert.equal(api.calls.exec.filter((call) => call.args.includes("-g")).length, 1);
+  assert.equal(api.calls.exec.filter((call) => call.args.includes("%(urls)s")).length, 1);
 });
 
-test("download mode skips -g and downloads directly", async () => {
+test("download mode skips the direct-url extraction and downloads directly", async () => {
   const { api, plugin } = await activated({
     exec: toolsPresent(BEHAVIOR),
     storage: { kv: { playbackMode: "download" } },
@@ -95,8 +100,8 @@ test("download mode skips -g and downloads directly", async () => {
   const id = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
   const url = await api._handlers["streamuri:ytdlp"](id);
   assert.equal(url, "file:///mock-plugin-data/cache/abc.m4a");
-  // No -g should have been attempted.
-  assert.ok(!api.calls.exec.some((c) => c.args.includes("-g")));
+  // No direct-url extraction should have been attempted.
+  assert.ok(!api.calls.exec.some((c) => c.args.includes("%(urls)s")));
 });
 
 test("legacy youtube:// scheme still resolves", async () => {
@@ -320,7 +325,7 @@ test("prefer-video hint → fallback resolver returns a video stream flagged vid
   assert.equal(r.video, true);
   assert.equal(r.url, DIRECT_URL);
   // Used the video (muxed) format selector, not bestaudio.
-  assert.ok(api.calls.exec.some((c) => c.args.includes("-g") && c.args.join(" ").includes("best[ext=mp4]/best")));
+  assert.ok(api.calls.exec.some((c) => c.args.includes("%(urls)s") && c.args.join(" ").includes("best[ext=mp4]/best")));
 });
 
 test("no hint → fallback resolver returns audio (no video flag)", async () => {
@@ -328,6 +333,33 @@ test("no hint → fallback resolver returns audio (no video flag)", async () => 
   const r = await api._handlers["stream:ytdlp-fallback"]("Creep", "Radiohead", null, 213);
   assert.equal(r.url, DIRECT_URL);
   assert.ok(!r.video);
+});
+
+// The metadata fallback resolver is the path a plain library track takes, and it
+// returns ONE url rather than the by-URI resolver's candidate list — so this is
+// its only way to tell the host which headers the signed url needs. Without them
+// the host hands mpv a bare url and a UA-bound CDN answers 403.
+test("fallback resolver carries the stream's http_headers to the host", async () => {
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR), fetch: { "direct.example": { status: 200 } } });
+
+  const audio = await api._handlers["stream:ytdlp-fallback"]("Creep", "Radiohead", null, 213);
+  assert.deepEqual(audio.headers, DIRECT_HEADERS);
+
+  const video = await api._handlers["stream:ytdlp-fallback"]("Creep", "Radiohead", null, 213, { preferVideo: true });
+  assert.deepEqual(video.headers, DIRECT_HEADERS);
+});
+
+test("fallback resolver omits headers when the extraction reported none", async () => {
+  // An extractor with no per-format headers must not produce `headers: {}` — the
+  // host would set an empty http-header-fields on mpv instead of leaving it alone.
+  const noHeaders = [
+    { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s"] }, result: { exitCode: 0, stdout: DIRECT_URL } },
+    ...BEHAVIOR,
+  ];
+  const { api } = await activated({ exec: toolsPresent(noHeaders), fetch: { "direct.example": { status: 200 } } });
+  const r = await api._handlers["stream:ytdlp-fallback"]("Creep", "Radiohead", null, 213);
+  assert.equal(r.url, DIRECT_URL);
+  assert.equal(r.headers, undefined);
 });
 
 test("Fallback source setting switches the resolver to SoundCloud", async () => {

@@ -45,3 +45,46 @@ test("candidatesFromFormats adds an HLS master as muxed when no progressive muxe
   assert.ok(mux, "an HLS master fills in for the missing muxed stream");
   assert.equal(mux.url, "https://h/master.m3u8");
 });
+
+// --- parseDirectOutput -------------------------------------------------------
+// getDirectUrl asks yt-dlp for two --print lines in ONE extraction: `%(urls)s`
+// then `%(http_headers)j`. Signed CDN links are commonly bound to the UA that
+// minted them, so the headers must survive to the host — but never at the cost
+// of the URL, which is the thing that actually plays.
+
+test("parseDirectOutput: takes the url and the header JSON", () => {
+  const out = plugin._parseDirectOutput(
+    'https://cdn.example/media.m4a\n{"User-Agent": "Mozilla/5.0", "Referer": "https://x/"}',
+  );
+  assert.equal(out.url, "https://cdn.example/media.m4a");
+  assert.deepEqual(out.headers, { "User-Agent": "Mozilla/5.0", Referer: "https://x/" });
+});
+
+test("parseDirectOutput: a multi-url selection still yields the FIRST url and the headers", () => {
+  // %(urls)s is newline-separated when a selector picks more than one format, so
+  // the header line is not simply "the second line".
+  const out = plugin._parseDirectOutput(
+    'https://cdn.example/video.mp4\nhttps://cdn.example/audio.m4a\n{"User-Agent": "ua"}',
+  );
+  assert.equal(out.url, "https://cdn.example/video.mp4");
+  assert.deepEqual(out.headers, { "User-Agent": "ua" });
+});
+
+test("parseDirectOutput: malformed or absent headers still yield the url", () => {
+  for (const stdout of [
+    "https://cdn.example/media.m4a",             // older yt-dlp: no header line
+    "https://cdn.example/media.m4a\n{not json",  // truncated
+    "https://cdn.example/media.m4a\nNA",         // template resolved to nothing
+    "https://cdn.example/media.m4a\n{}",         // empty object is not headers
+  ]) {
+    const out = plugin._parseDirectOutput(stdout);
+    assert.equal(out.url, "https://cdn.example/media.m4a", stdout);
+    assert.equal(out.headers, null, stdout);
+  }
+});
+
+test("parseDirectOutput: no url means no result, whatever else printed", () => {
+  assert.equal(plugin._parseDirectOutput('{"User-Agent": "ua"}').url, null);
+  assert.equal(plugin._parseDirectOutput("").url, null);
+  assert.equal(plugin._parseDirectOutput("ERROR: nope").url, null);
+});
