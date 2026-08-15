@@ -1665,6 +1665,30 @@ async function resolvePlayable(api, url, isVideo) {
   return { url: "file://" + filePath, downloaded: true, filePath: filePath };
 }
 
+// Turn a resolvePlayable result into what onResolveStreamByUri should return.
+//
+// A bare URL string is the simpler half of that contract and stays the answer
+// whenever the stream needs no headers. When it DOES, a candidate list is the
+// only shape that can carry them (`StreamCandidate.headers`) — so wrap the one
+// stream yt-dlp already picked in a single-element list rather than enumerating
+// every format and handing selection to the host. Enumerating would change
+// WHICH stream plays; this is a headers fix, not a quality change.
+//
+// `kind` follows what was asked for: `muxed` for video (splitting video from
+// audio is the externalAudio path's job, not this one), `audio` otherwise.
+// Container and codecs are deliberately absent — we never measured them here,
+// and with a single candidate they'd only feed a browser-safe preference that
+// has nothing to choose between.
+//
+// Downloads ("download then play") and the HLS-master fallback both come back
+// headerless, so both keep returning a plain URL exactly as before.
+// Pure; exported for tests.
+function streamUriResult(playable, isVideo) {
+  if (!playable || !playable.url) return null;
+  if (!playable.headers) return playable.url;
+  return { candidates: [{ url: playable.url, kind: isVideo ? "muxed" : "audio", headers: playable.headers }] };
+}
+
 // Produce the host download-resolve result for a source URL + chosen format.
 // Always downloads locally so yt-dlp can embed tags (using its rich metadata)
 // into a correctly-named file. `caller` carries any AUTHORITATIVE
@@ -1779,7 +1803,7 @@ async function activate(api) {
         api.log("warn", "No candidates enumerated — falling back to muxed stream", "ytdlp");
       }
       var playable = await resolvePlayable(api, ref.url, ref.isVideo);
-      return playable ? playable.url : null;
+      return streamUriResult(playable, ref.isVideo);
     } catch (e) {
       api.log("error", "URI resolve failed: " + (e && e.message ? e.message : e), "ytdlp");
       return null;
@@ -1813,7 +1837,7 @@ async function activate(api) {
     if (!YT_ID_RE.test(id)) { api.log("warn", "Legacy youtube:// resolve: bad id " + id, "ytdlp"); return null; }
     try {
       var playable = await resolvePlayable(api, youtubeWatchUrl(id), false);
-      return playable ? playable.url : null;
+      return streamUriResult(playable, false);
     } catch (e) {
       api.log("error", "Legacy youtube:// resolve failed: " + (e && e.message ? e.message : e), "ytdlp");
       return null;
@@ -2675,6 +2699,7 @@ return {
   _isOlderVersion: isOlderVersion,
   _pickHlsMaster: pickHlsMaster,
   _parseDirectOutput: parseDirectOutput,
+  _streamUriResult: streamUriResult,
   _candidatesFromFormats: candidatesFromFormats,
   _storyboardFromFormats: storyboardFromFormats,
   _putStoryboardCache: putStoryboardCache,

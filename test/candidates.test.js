@@ -88,3 +88,30 @@ test("parseDirectOutput: no url means no result, whatever else printed", () => {
   assert.equal(plugin._parseDirectOutput("").url, null);
   assert.equal(plugin._parseDirectOutput("ERROR: nope").url, null);
 });
+
+// --- streamUriResult ---------------------------------------------------------
+// onResolveStreamByUri may answer with a URL string or a candidate list. Only
+// the list can carry headers, so the shape is chosen by whether there are any.
+
+test("streamUriResult: a headerless stream stays a plain url", () => {
+  // Covers "download then play" (a local file) and the HLS-master fallback,
+  // both of which resolve without headers and must behave exactly as before.
+  assert.equal(plugin._streamUriResult({ url: "https://a/x.m4a" }, false), "https://a/x.m4a");
+  assert.equal(plugin._streamUriResult({ url: "file:///tmp/x.m4a", downloaded: true }, false), "file:///tmp/x.m4a");
+  assert.equal(plugin._streamUriResult({ url: "https://a/m.m3u8", headers: null }, true), "https://a/m.m3u8");
+});
+
+test("streamUriResult: headers force the candidate-list shape, kind following the request", () => {
+  const h = { "User-Agent": "ua" };
+  assert.deepEqual(plugin._streamUriResult({ url: "https://a/x.m4a", headers: h }, false), {
+    candidates: [{ url: "https://a/x.m4a", kind: "audio", headers: h }],
+  });
+  assert.deepEqual(plugin._streamUriResult({ url: "https://a/x.mp4", headers: h }, true), {
+    candidates: [{ url: "https://a/x.mp4", kind: "muxed", headers: h }],
+  });
+});
+
+test("streamUriResult: nothing resolved means null", () => {
+  assert.equal(plugin._streamUriResult(null, false), null);
+  assert.equal(plugin._streamUriResult({ url: null }, false), null);
+});

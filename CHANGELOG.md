@@ -1,17 +1,21 @@
 # Changelog
 
 ## Unreleased
-- **Stream request headers now reach playback for tracks resolved by metadata.**
-  v1.16.4 fixed this for videos played from a `ytdlp://` link, but that path
-  works by handing the app a list of streams to choose from, and it is the only
-  one that could carry headers. An ordinary library track resolves by *title and
-  artist* instead and gets back a single URL, so its headers had nowhere to go —
-  the app received a bare link and played it with no `User-Agent`. Signed CDN
-  links are frequently bound to the agent that requested them, and the ones that
-  are answered 403. Resolving by metadata now reports the headers too.
+- **Fixed YouTube playback failing with 403 and skipping to the next track.**
+  v1.16.4 fixed this for videos, but only for videos: that fix works by handing
+  the app a list of streams to choose from, and a list was the only thing that
+  could carry the request headers a signed link needs. Every other kind of
+  playback returned a single URL and had nowhere to put them, so the app played
+  a bare link with no `User-Agent`. YouTube's links are bound to the agent that
+  requested them and refuse anything else. Audio now reports its headers too.
 
-  Requires Viboplr 1.0.25 or newer; on older versions the headers are ignored
-  and playback behaves exactly as before.
+  This covers **audio played from a yt-dlp search result or a saved playlist**,
+  and works on Viboplr 1.0.24.
+
+  It also covers **tracks from your own library that yt-dlp resolves by title
+  and artist**, which needed a matching change in the app — that half needs
+  Viboplr 1.0.25 or newer. On 1.0.24 those tracks behave as they did before;
+  nothing regresses.
 
 ## v1.16.5
 - Relaxed the minimum app version to 1.0.23.

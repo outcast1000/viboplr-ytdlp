@@ -84,12 +84,30 @@ test("qualities: original always; transcodes + video only when ffmpeg present", 
   assert.deepEqual(q2.map((x) => x.value), ["original"]);
 });
 
-test("stream URI resolve returns the direct URL without a separate preflight request", async () => {
+// A ytdlp:// audio track (sidebar search, Cmd+K, a saved playlist of either)
+// resolves here, not through the metadata fallback. A single URL string cannot
+// carry headers, so when the stream needs them the answer is a one-element
+// candidate list — the only shape in the host contract that can.
+test("stream URI resolve returns one candidate carrying the stream's headers", async () => {
   const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
   const id = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
-  const url = await api._handlers["streamuri:ytdlp"](id);
-  assert.equal(url, DIRECT_URL);
+  const res = await api._handlers["streamuri:ytdlp"](id);
+  assert.deepEqual(res, {
+    candidates: [{ url: DIRECT_URL, kind: "audio", headers: DIRECT_HEADERS }],
+  });
+  // Still ONE extraction — no separate preflight, and no format enumeration.
   assert.equal(api.calls.exec.filter((call) => call.args.includes("%(urls)s")).length, 1);
+  assert.ok(!api.calls.exec.some((c) => c.args.includes("-j")), "no format enumeration for a plain audio resolve");
+});
+
+test("stream URI resolve stays a bare URL when the stream needs no headers", async () => {
+  const noHeaders = [
+    { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s"] }, result: { exitCode: 0, stdout: DIRECT_URL } },
+    ...BEHAVIOR,
+  ];
+  const { api, plugin } = await activated({ exec: toolsPresent(noHeaders) });
+  const id = plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false).slice("ytdlp://".length);
+  assert.equal(await api._handlers["streamuri:ytdlp"](id), DIRECT_URL);
 });
 
 test("download mode skips the direct-url extraction and downloads directly", async () => {
@@ -104,10 +122,12 @@ test("download mode skips the direct-url extraction and downloads directly", asy
   assert.ok(!api.calls.exec.some((c) => c.args.includes("%(urls)s")));
 });
 
-test("legacy youtube:// scheme still resolves", async () => {
+test("legacy youtube:// scheme still resolves, with headers", async () => {
   const { api } = await activated({ exec: toolsPresent(BEHAVIOR), fetch: { "direct.example": { status: 200 } } });
-  const url = await api._handlers["streamuri:youtube"]("dQw4w9WgXcQ");
-  assert.equal(url, DIRECT_URL);
+  const res = await api._handlers["streamuri:youtube"]("dQw4w9WgXcQ");
+  assert.deepEqual(res, {
+    candidates: [{ url: DIRECT_URL, kind: "audio", headers: DIRECT_HEADERS }],
+  });
   // Bad id is rejected.
   assert.equal(await api._handlers["streamuri:youtube"]("not-an-id"), null);
 });
