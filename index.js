@@ -1480,6 +1480,29 @@ function candidatesFromFormats(formats, maxHeight) {
   return out;
 }
 
+// Pure: the self-contained stream from a candidate menu — what the host's
+// `StreamResolveResult.url` has to be, since that field predates candidates and
+// is still what an older host (or the browser engine) plays. Prefers a
+// browser-safe muxed mp4, then any muxed, and only then a bare video stream,
+// which is the last resort precisely because it has no audio: it is better than
+// failing the resolve outright, but every caller that can should be picking from
+// the candidate list instead. Null when the menu holds nothing self-contained.
+// Exported for tests.
+function selfContainedUrl(candidates) {
+  if (!candidates || !candidates.length) return null;
+  var muxed = [], anyVideo = null;
+  for (var i = 0; i < candidates.length; i++) {
+    var c = candidates[i];
+    if (c.kind === "muxed") muxed.push(c);
+    else if (c.kind === "video" && !anyVideo) anyVideo = c;
+  }
+  for (var j = 0; j < muxed.length; j++) {
+    if (muxed[j].container === "mp4") return muxed[j].url;
+  }
+  if (muxed.length) return muxed[0].url;
+  return anyVideo ? anyVideo.url : null;
+}
+
 // ---------------------------------------------------------------------------
 // Seek-preview storyboards
 // ---------------------------------------------------------------------------
@@ -1807,11 +1830,16 @@ async function withCacheProtection(api, filePath, work) {
 // play (that's the mpv engine's job), and downloading the whole file first is
 // slow; so a direct-stream failure fails cleanly and the host surfaces an error.
 // Users who want the reliability of a local copy pick "Download then play".
-async function resolvePlayable(api, url, isVideo) {
+async function resolvePlayable(api, url, isVideo, fresh) {
   if (playbackMode === "stream") {
     // Keyed per (source, kind) exactly like the download cache: the two format
     // selectors differ, so an audio resolve must never serve a video's URL.
     var key = cacheStem(url, isVideo);
+    // `fresh` = the host is retrying because what we last handed it wouldn't
+    // play. A signed URL that has been refused stays refused, so the remembered
+    // one is worse than useless here: serving it would burn the retry and make
+    // the failure look permanent. Drop it and mint a new one.
+    if (fresh) delete streamUrlCache[key];
     var hit = cacheGet(streamUrlCache, key, Date.now());
     if (hit) {
       api.log("info", "Streaming directly (cached resolve, no yt-dlp call): " + url, "ytdlp");
@@ -1932,20 +1960,36 @@ async function activate(api) {
     if (!ytDlpVersion) { api.log("warn", "Stream resolve skipped — yt-dlp not available", "ytdlp"); return null; }
     title = stripRemasterSuffix(title);
     var preferVideo = !!(opts && opts.preferVideo);
+    var fresh = !!(opts && opts.fresh);
     try {
       // preferVideo → rank with the VIDEO profile (official MV / VEVO); plain
       // audio playback → the AUDIO profile (clean official-audio / Topic).
       var cand = await searchByMetadata(api, title, artistName, durationSecs, preferVideo ? "video" : "audio");
       if (!cand) { api.log("warn", "No match for: " + title, "ytdlp"); return null; }
       if (preferVideo) {
-        var vid = await resolvePlayable(api, cand.url, true);
+        // The host can merge a separate audio track (native mpv engine): hand it
+        // the whole menu so it can pair a hi-res video-only stream with an
+        // audio-only one. Without this the answer is whatever `getDirectUrl`
+        // finds with `best[ext=mp4]/best` — a MUXED stream — and YouTube's only
+        // muxed format is itag 18 at 360p, so "Watch YouTube video" was capped
+        // there on every engine no matter how good the source was.
+        if (opts && opts.externalAudio && playbackMode === "stream") {
+          var menu = await enumerateFormats(api, cand.url, maxVideoHeight);
+          var selfContained = selfContainedUrl(menu);
+          if (menu.length && selfContained) {
+            api.log("info", "Resolved " + menu.length + " stream candidate(s) for " + cand.url, "ytdlp");
+            return { url: selfContained, candidates: menu, label: "yt-dlp (video)", sourceUrl: cand.url, video: true };
+          }
+          api.log("warn", "No candidates enumerated — falling back to muxed stream", "ytdlp");
+        }
+        var vid = await resolvePlayable(api, cand.url, true, fresh);
         // `headers` rides along so the host can hand them to mpv: a signed CDN
         // URL is often bound to the User-Agent that minted it, and this path
         // (unlike the by-URI candidate list) has no other way to carry them.
         if (vid) return { url: vid.url, label: "yt-dlp (video)", sourceUrl: cand.url, video: true, headers: vid.headers || undefined };
         api.log("warn", "No video stream — falling back to audio: " + cand.url, "ytdlp");
       }
-      var playable = await resolvePlayable(api, cand.url, false);
+      var playable = await resolvePlayable(api, cand.url, false, fresh);
       if (!playable) return null;
       return { url: playable.url, label: "yt-dlp", sourceUrl: cand.url, headers: playable.headers || undefined };
     } catch (e) {
@@ -1974,7 +2018,7 @@ async function activate(api) {
         }
         api.log("warn", "No candidates enumerated — falling back to muxed stream", "ytdlp");
       }
-      var playable = await resolvePlayable(api, ref.url, ref.isVideo);
+      var playable = await resolvePlayable(api, ref.url, ref.isVideo, opts && opts.fresh);
       return streamUriResult(playable, ref.isVideo);
     } catch (e) {
       api.log("error", "URI resolve failed: " + (e && e.message ? e.message : e), "ytdlp");
@@ -2003,12 +2047,12 @@ async function activate(api) {
   }
 
   // ---- Playback: legacy youtube:// compatibility ----
-  api.playback.onResolveStreamByUri("youtube", async function (id, quality) {
+  api.playback.onResolveStreamByUri("youtube", async function (id, quality, opts) {
     await ensureToolStatus(api);
     if (!ytDlpVersion) return null;
     if (!YT_ID_RE.test(id)) { api.log("warn", "Legacy youtube:// resolve: bad id " + id, "ytdlp"); return null; }
     try {
-      var playable = await resolvePlayable(api, youtubeWatchUrl(id), false);
+      var playable = await resolvePlayable(api, youtubeWatchUrl(id), false, opts && opts.fresh);
       return streamUriResult(playable, false);
     } catch (e) {
       api.log("error", "Legacy youtube:// resolve failed: " + (e && e.message ? e.message : e), "ytdlp");
@@ -2881,6 +2925,7 @@ return {
   _parseDirectOutput: parseDirectOutput,
   _streamUriResult: streamUriResult,
   _candidatesFromFormats: candidatesFromFormats,
+  _selfContainedUrl: selfContainedUrl,
   _storyboardFromFormats: storyboardFromFormats,
   _putStoryboardCache: putStoryboardCache,
   _parseVideoFormat: parseVideoFormat,

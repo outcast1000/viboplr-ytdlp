@@ -46,6 +46,50 @@ test("candidatesFromFormats adds an HLS master as muxed when no progressive muxe
   assert.equal(mux.url, "https://h/master.m3u8");
 });
 
+// --- selfContainedUrl --------------------------------------------------------
+// The metadata resolver answers `opts.externalAudio` with a candidate menu, but
+// StreamResolveResult.url is still required and must be something an older host
+// (or the browser engine) can play on its own.
+
+test("selfContainedUrl prefers a browser-safe mp4 muxed stream over other muxed ones", () => {
+  const url = plugin._selfContainedUrl([
+    { url: "https://h/master.m3u8", kind: "muxed", container: "m3u8" },
+    { url: "https://v/mux360", kind: "muxed", container: "mp4" },
+    { url: "https://v/v1080", kind: "video" },
+  ]);
+  assert.equal(url, "https://v/mux360");
+});
+
+test("selfContainedUrl falls back to a non-mp4 muxed stream when that's all there is", () => {
+  const url = plugin._selfContainedUrl([
+    { url: "https://v/v1080", kind: "video" },
+    { url: "https://h/master.m3u8", kind: "muxed", container: "m3u8" },
+  ]);
+  assert.equal(url, "https://h/master.m3u8");
+});
+
+test("selfContainedUrl uses a video-only stream only as a last resort", () => {
+  // Silent, but a picture beats failing the resolve outright — and any host that
+  // understands candidates will have picked a pair from the menu instead.
+  const url = plugin._selfContainedUrl([
+    { url: "https://a/m4a", kind: "audio" },
+    { url: "https://v/v1080", kind: "video" },
+  ]);
+  assert.equal(url, "https://v/v1080");
+});
+
+test("selfContainedUrl returns null when nothing is self-contained", () => {
+  assert.equal(plugin._selfContainedUrl([{ url: "https://a/m4a", kind: "audio" }]), null);
+  assert.equal(plugin._selfContainedUrl([]), null);
+  assert.equal(plugin._selfContainedUrl(null), null);
+});
+
+test("selfContainedUrl picks a real muxed stream out of a full YouTube menu", () => {
+  // The end-to-end shape: the menu the resolver actually returns for a watch URL.
+  const url = plugin._selfContainedUrl(plugin._candidatesFromFormats(FORMATS, 0));
+  assert.equal(url, "https://v/mux360", "itag 18 is YouTube's only self-contained format");
+});
+
 // --- parseDirectOutput -------------------------------------------------------
 // getDirectUrl asks yt-dlp for two --print lines in ONE extraction: `%(urls)s`
 // then `%(http_headers)j`. Signed CDN links are commonly bound to the UA that
