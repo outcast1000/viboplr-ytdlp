@@ -96,12 +96,18 @@ test("buildDownloadArgs forces --encoding utf-8 (yt-dlp's own preferredencoding(
   assert.equal(args[args.indexOf("--encoding") + 1], "utf-8");
 });
 
-test("buildDownloadArgs prints metadata AND filepath in the one run", () => {
+test("buildDownloadArgs prints metadata, the chosen format AND the filepath in the one run", () => {
+  // One run, three answers. A second invocation for any of them would double our
+  // request volume against a source that rate-gates on exactly that.
   const args = plugin._buildDownloadArgs({ url: "u" }, "/tmp", 0, true);
   const prints = args.reduce((acc, a, i) => (a === "--print" ? [...acc, args[i + 1]] : acc), []);
-  assert.equal(prints.length, 2);
+  assert.equal(prints.length, 3);
   assert.ok(prints[0].includes("%(track,title)s"), "metadata template printed at extraction time");
-  assert.equal(prints[1], "after_move:filepath");
+  assert.equal(prints[1], plugin._CHOSEN_FMT_PRINT, "which format the selector chain resolved to");
+  assert.equal(prints[2], "after_move:filepath");
+  // Ordering is load-bearing: the metadata line must stay FIRST and the path
+  // LAST, because downloadForDownload reads them positionally.
+  assert.equal(args[args.length - 1], "u");
 });
 
 test("classifyYtdlpError maps common failures to friendly reasons", () => {

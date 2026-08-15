@@ -403,9 +403,9 @@ function noteBotGate(api, stderr) {
 // because the answer is the point. Playback is automatic and repeats per track:
 // it goes through maybeDeepDiagnostics below, which neither waits nor repeats.
 // ---------------------------------------------------------------------------
-async function logExtractionDiagnostics(api, url) {
+async function logExtractionDiagnostics(api, url, trace) {
   try {
-    var diag = await api.system.exec("yt-dlp", ["-v", "--simulate", "-f", "bestaudio", url], { cwd: null });
+    var diag = await execLogged(api, trace, "diagnostics probe", ["-v", "--simulate", "-f", "bestaudio", url], { cwd: null });
     var out = ((diag.stderr || "") + "\n" + (diag.stdout || "")).trim();
     var keep = [], lines = out.split("\n");
     for (var i = 0; i < lines.length; i++) {
@@ -414,9 +414,9 @@ async function logExtractionDiagnostics(api, url) {
       }
     }
     var summary = keep.length ? keep.join("\n") : out;
-    if (summary) api.log("warn", "yt-dlp diagnostics:\n" + summary, "ytdlp");
+    if (summary) logLine(api, trace, "warn", "yt-dlp diagnostics:\n" + summary);
   } catch (e) {
-    api.log("warn", "yt-dlp diagnostics probe failed: " + (e && e.message ? e.message : e), "ytdlp");
+    logLine(api, trace, "warn", "yt-dlp diagnostics probe failed: " + errText(e));
   }
 }
 
@@ -447,13 +447,336 @@ function warrantsDeepDiagnostics(stderr) {
 //
 // Settings → Debug's on-demand report is the way to get a fresh one after this.
 var deepDiagnosticsRun = false;
-function maybeDeepDiagnostics(api, url, stderr) {
+function maybeDeepDiagnostics(api, url, stderr, trace) {
   if (deepDiagnosticsRun || !warrantsDeepDiagnostics(stderr)) return;
   deepDiagnosticsRun = true;
-  api.log("info", "Probing why the stream failed (once per session) — " + url, "ytdlp");
-  logExtractionDiagnostics(api, url).catch(function (e) {
-    api.log("warn", "Stream diagnostics probe failed: " + (e && e.message ? e.message : e), "ytdlp");
+  // Not awaited, so these lines land AFTER the resolve's own "done:" line. They
+  // still carry its id, which is the point — they explain the failure it has
+  // just reported.
+  logLine(api, trace, "info", "probing why the stream failed (once per session) — " + url);
+  logExtractionDiagnostics(api, url, trace).catch(function (e) {
+    logLine(api, trace, "warn", "stream diagnostics probe failed: " + errText(e));
   });
+}
+
+// ---------------------------------------------------------------------------
+// Trace logging — what was tried, with what, and what came back
+// ---------------------------------------------------------------------------
+// One playback resolve is several yt-dlp invocations deep (search → enumerate
+// formats → mint a direct URL → HLS master → audio fallback), and two of them
+// are routinely in flight at once: the host preloads the NEXT track while the
+// current one is still playing. Flat lines from two resolves interleave into
+// something nobody can read afterwards, so every line a resolve emits carries a
+// short id and a step number. The id is a counter rather than a random token so
+// a test can assert on it, and so a user reading the log can see the order the
+// resolves actually started in.
+//
+// Every helper here is null-safe on `trace`: the resolvers own the traces, and
+// the primitives underneath them are also called from paths that have none.
+var traceSeq = 0;
+
+function errText(e) { return e && e.message ? e.message : String(e); }
+
+// Pure: a duration a human reads at a glance. Sub-second work is the
+// interesting kind here (a cache hit vs. a real extraction), so it keeps
+// millisecond resolution instead of rounding everything to "0.0s".
+function fmtMs(ms) {
+  if (typeof ms !== "number" || !isFinite(ms)) return "?";
+  return ms < 1000 ? Math.round(ms) + "ms" : (ms / 1000).toFixed(1) + "s";
+}
+
+// Pure: the only thing the host ever tells us about which engine will render
+// what we return. `externalAudio` is set exactly when the native mpv engine is
+// about to play this as video — mpv merges a video-only stream with a separate
+// audio-only one, so that one flag decides whether we may hand back a candidate
+// menu or have to find a single self-contained stream. It is also the answer to
+// "why did I only get 360p": YouTube's sole muxed format is itag 18 at 360p, so
+// a browser-engine resolve is capped there no matter how good the source is.
+// Exported for tests.
+function engineLabel(externalAudio) {
+  return externalAudio
+    ? "native mpv (merges separate video+audio streams)"
+    : "browser/audio-only (needs one self-contained stream)";
+}
+
+// Pure: a resolve's decision inputs on one line. All of it is context the
+// resolve had no choice about, so a log without it can't explain the outcome —
+// the same track resolves to a different stream depending on the engine, the
+// playback mode and the resolution cap, and none of those are visible in the
+// argv we log below. Exported for tests.
+function describeContext(ctx) {
+  ctx = ctx || {};
+  var parts = [];
+  // Omitted entirely when the caller had no such hint to report — a download
+  // resolve involves no playback engine, and printing one there would be an
+  // invented fact rather than a missing one.
+  if (ctx.externalAudio != null) parts.push("engine=" + engineLabel(ctx.externalAudio));
+  if (ctx.mode) parts.push("playback=" + ctx.mode);
+  if (ctx.preferVideo != null) parts.push("preferVideo=" + (ctx.preferVideo ? "yes" : "no"));
+  // `fresh` means the host is retrying because what we last handed it would not
+  // play, which is why the resolve below deliberately ignores its own cache.
+  if (ctx.fresh) parts.push("fresh=yes (host retrying a refused stream)");
+  parts.push("cap=" + (ctx.maxHeight > 0 ? ctx.maxHeight + "p" : "none"));
+  parts.push("yt-dlp=" + (ctx.ytDlp || "missing"));
+  parts.push("ffmpeg=" + (ctx.ffmpeg || "missing"));
+  return parts.join(" · ");
+}
+
+// The context of the CURRENT module state, for a trace header. Impure by
+// design — describeContext above is the pure half the tests drive.
+function currentContext(extra) {
+  var ctx = { mode: playbackMode, maxHeight: maxVideoHeight, ytDlp: ytDlpVersion, ffmpeg: ffmpegVersion };
+  if (extra) for (var k in extra) if (Object.prototype.hasOwnProperty.call(extra, k)) ctx[k] = extra[k];
+  return ctx;
+}
+
+function traceLog(trace, level, msg) {
+  if (!trace || !trace.api) return;
+  trace.api.log(level, "[" + trace.id + "] " + msg, "ytdlp");
+}
+
+// A line that belongs to a trace when there is one and stands alone when there
+// isn't. The primitives below are also reachable from paths that own no trace,
+// and a line that vanished on those paths would be a worse bug than an
+// unattributed one.
+function logLine(api, trace, level, msg) {
+  if (trace && trace.api) traceLog(trace, level, msg);
+  else if (api) api.log(level, msg, "ytdlp");
+}
+
+// Open a trace: one header line naming what is being resolved, one context line.
+function startTrace(api, kind, subject, ctx) {
+  traceSeq++;
+  var trace = { api: api, id: "r" + traceSeq, n: 0, startedAt: Date.now() };
+  traceLog(trace, "info", kind + " — " + subject);
+  traceLog(trace, "info", "  " + describeContext(ctx));
+  return trace;
+}
+
+// Begin a step; returns the settle function. Only the SETTLE is logged (with
+// its duration) — the exec wrapper below already announces the work as it
+// starts, and logging both ends of every step would double the line count for
+// nothing.
+function traceStep(trace, name) {
+  if (!trace) return function () {};
+  trace.n++;
+  var n = trace.n, t0 = Date.now();
+  return function (outcome, level) {
+    traceLog(trace, level || "info", n + ". " + name + " → " + outcome + " (" + fmtMs(Date.now() - t0) + ")");
+  };
+}
+
+function traceDone(trace, outcome, level) {
+  if (!trace) return;
+  traceLog(trace, level || "info", "done: " + outcome + " (total " + fmtMs(Date.now() - trace.startedAt) + ")");
+}
+
+// The first ERROR: line of a stderr blob, else its first non-empty line —
+// enough to tell a bot gate from a missing format without pasting a whole
+// verbose dump into the log. Pure; exported for tests.
+function stderrGist(stderr, max) {
+  var lines = String(stderr || "").split("\n"), first = "";
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i].trim();
+    if (!l) continue;
+    if (!first) first = l;
+    if (/^ERROR:/i.test(l)) { first = l; break; }
+  }
+  max = max || 200;
+  return first.length > max ? first.slice(0, max) + "…" : first;
+}
+
+// Run yt-dlp, logging the invocation AND its outcome. Every call site already
+// logged its argv; the missing half was whether it worked, how long it ran, and
+// why not — "yt-dlp is slow" and "yt-dlp failed instantly" are different
+// problems and the old log could not tell them apart. Rethrows exec failures
+// verbatim, because callers discriminate on the message (the host's "Cancelled").
+//
+// `opts` is passed to the host VERBATIM, including when it is undefined: an
+// absent `cwd` means the app data dir while `{ cwd: null }` means none, so
+// defaulting one to the other here would quietly change where a child runs.
+async function execLogged(api, trace, label, args, opts) {
+  var t0 = Date.now();
+  logLine(api, trace, "info", "run " + label + ": " + formatCmd("yt-dlp", args));
+  var res;
+  try {
+    res = await api.system.exec("yt-dlp", args, opts);
+  } catch (e) {
+    var msg = errText(e);
+    // A cancel is the user's own doing, not a fault — the host kills the
+    // process group when they dismiss a download. Logging it as a failure
+    // sends whoever reads this log hunting for a broken install.
+    var cancelled = msg.trim() === "Cancelled";
+    traceLog(trace, cancelled ? "info" : "warn",
+      label + (cancelled ? " cancelled" : " could not be run") + " after " + fmtMs(Date.now() - t0) + (cancelled ? "" : " — " + msg));
+    throw e;
+  }
+  var outcome = "exit " + res.exitCode + " in " + fmtMs(Date.now() - t0);
+  if (res.exitCode !== 0) {
+    var gist = stderrGist(res.stderr);
+    traceLog(trace, "warn", label + ": " + outcome + (gist ? " — " + gist : ""));
+  } else {
+    traceLog(trace, "info", label + ": " + outcome);
+  }
+  return res;
+}
+
+// ---------------------------------------------------------------------------
+// Format reporting
+// ---------------------------------------------------------------------------
+// Which streams a source actually offers is the single most useful fact when a
+// playback or download result is disappointing, and until now none of it was
+// written anywhere: the log said "42 candidates" and left the reader to guess
+// whether the 4K stream was absent, filtered by the resolution cap, or present
+// but unusable by the engine in play. Both summaries below are derived from
+// data an extraction ALREADY returned — neither spawns a process of its own.
+
+// Rows past this are counted, not printed: some extractors publish 60+ formats
+// and a full table per track would bury everything else in the log.
+var FORMAT_ROWS_MAX = 30;
+
+function padCol(s, n) {
+  s = s == null ? "" : String(s);
+  while (s.length < n) s += " ";
+  return s;
+}
+
+function fmtSize(bytes) {
+  if (typeof bytes !== "number" || !isFinite(bytes) || bytes <= 0) return "";
+  if (bytes >= 1024 * 1024 * 1024) return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
+  if (bytes >= 1024 * 1024) return Math.round(bytes / 1024 / 1024) + " MB";
+  return Math.round(bytes / 1024) + " KB";
+}
+
+function formatKind(f) {
+  var hasV = f && f.vcodec && f.vcodec !== "none";
+  var hasA = f && f.acodec && f.acodec !== "none";
+  return hasV && hasA ? "muxed" : hasV ? "video" : hasA ? "audio" : "other";
+}
+
+// Pure: yt-dlp's `formats` array as a readable table. `maxHeight` (0 = no cap)
+// is reported rather than applied — a format the user's own setting hid is the
+// most confusing kind of absence, so the table names it explicitly instead of
+// silently omitting it. Exported for tests.
+function summarizeFormats(formats, maxHeight) {
+  formats = formats || [];
+  var counts = { video: 0, audio: 0, muxed: 0, other: 0 };
+  var rows = [], hidden = [];
+  for (var i = 0; i < formats.length; i++) {
+    var f = formats[i] || {};
+    var kind = formatKind(f);
+    counts[kind]++;
+    // "other" is storyboards, images and mhtml — never playable, always
+    // numerous, and they are what makes a raw format list unreadable.
+    if (kind === "other") continue;
+    if (kind !== "audio" && maxHeight > 0 && f.height && f.height > maxHeight) hidden.push(f.height + "p");
+    var res = kind === "audio" ? "" : (f.width || "?") + "x" + (f.height || "?") + (f.fps ? "@" + Math.round(f.fps) : "");
+    var codecs = kind === "audio"
+      ? (f.acodec || "?")
+      : (f.vcodec || "?") + (kind === "muxed" ? " + " + f.acodec : "");
+    var rate = typeof f.tbr === "number" ? Math.round(f.tbr) + "k"
+      : typeof f.abr === "number" ? Math.round(f.abr) + "k" : "";
+    var row = "  " + padCol(kind, 6) + padCol(f.format_id, 8) + padCol(f.ext, 6) +
+      padCol(res, 15) + padCol(codecs, 26) + padCol(rate, 8) +
+      padCol(fmtSize(typeof f.filesize === "number" ? f.filesize : f.filesize_approx), 9) +
+      (f.format_note || "");
+    rows.push(row.replace(/\s+$/, ""));
+  }
+  var head = formats.length + " format(s): " + counts.video + " video-only · " +
+    counts.audio + " audio-only · " + counts.muxed + " muxed · " + counts.other + " other";
+  var out = [head].concat(rows.slice(0, FORMAT_ROWS_MAX));
+  if (rows.length > FORMAT_ROWS_MAX) out.push("  (+" + (rows.length - FORMAT_ROWS_MAX) + " more)");
+  if (hidden.length) out.push("  cap " + maxHeight + "p hides " + hidden.length + " video format(s): " + hidden.join(", "));
+  return out.join("\n");
+}
+
+// Pure: describe one StreamCandidate compactly (the menu rows the host chooses
+// from). Exported for tests.
+function describeCandidate(c) {
+  if (!c) return "none";
+  var bits = [c.kind];
+  if (c.height) bits.push(c.height + "p");
+  if (c.container) bits.push(c.container);
+  var codec = c.kind === "audio" ? c.acodec : c.vcodec;
+  if (codec) bits.push(codec);
+  if (typeof c.tbr === "number") bits.push(Math.round(c.tbr) + "k");
+  return bits.join(" ");
+}
+
+// Pure: the candidate MENU we hand the host, summarized by kind with the best of
+// each. This is the list the host's selectStream picks from, so it — not the raw
+// format table — is what explains the stream that actually played. Exported for
+// tests.
+function summarizeCandidates(candidates) {
+  candidates = candidates || [];
+  if (!candidates.length) return "0 candidates";
+  var groups = { video: [], audio: [], muxed: [] };
+  for (var i = 0; i < candidates.length; i++) {
+    var c = candidates[i];
+    if (groups[c.kind]) groups[c.kind].push(c);
+  }
+  function best(list) {
+    var top = null;
+    for (var j = 0; j < list.length; j++) {
+      var c = list[j];
+      if (!top) { top = c; continue; }
+      var a = (c.height || 0), b = (top.height || 0);
+      if (a > b || (a === b && (c.tbr || 0) > (top.tbr || 0))) top = c;
+    }
+    return top;
+  }
+  var parts = [];
+  var order = ["video", "audio", "muxed"];
+  for (var k = 0; k < order.length; k++) {
+    var list = groups[order[k]];
+    if (list.length) parts.push(order[k] + " " + list.length + " (best " + describeCandidate(best(list)) + ")");
+  }
+  return candidates.length + " candidate(s): " + parts.join(" · ");
+}
+
+// A tagged `--print` line so a direct-URL extraction can also name the format
+// yt-dlp actually chose — free, since it rides the extraction we already run.
+// The tag is what keeps it unambiguous: parseDirectOutput scans the same stdout
+// for the URL and the header JSON, and a bare tab-separated line would be one
+// more thing for it to guess about.
+var CHOSEN_FMT_TAG = "ytdlp-fmt";
+var CHOSEN_FMT_PRINT = CHOSEN_FMT_TAG +
+  "\t%(format_id)s\t%(ext)s\t%(vcodec)s\t%(acodec)s\t%(height)s\t%(tbr)s\t%(protocol)s\t%(format)s";
+
+// Pure: parse that line back out of a direct-URL extraction's stdout, or null
+// when yt-dlp printed none (an older build, or an extraction that failed before
+// format selection). Exported for tests.
+function parseChosenFormat(stdout) {
+  var lines = String(stdout || "").split("\n");
+  for (var i = 0; i < lines.length; i++) {
+    var l = lines[i].trim();
+    if (l.indexOf(CHOSEN_FMT_TAG + "\t") !== 0) continue;
+    var c = l.split("\t");
+    var num = function (v) { var n = parseFloat(v); return isFinite(n) ? n : null; };
+    var str = function (v) { return v && v !== "NA" ? v : null; };
+    return {
+      id: str(c[1]), ext: str(c[2]), vcodec: str(c[3]), acodec: str(c[4]),
+      height: num(c[5]), tbr: num(c[6]), protocol: str(c[7]), format: str(c[8])
+    };
+  }
+  return null;
+}
+
+// Pure: that chosen format as one readable line. Exported for tests.
+function describeChosenFormat(f) {
+  if (!f) return "format not reported by yt-dlp";
+  var bits = [];
+  if (f.id) bits.push("id " + f.id);
+  if (f.height) bits.push(Math.round(f.height) + "p");
+  if (f.ext) bits.push(f.ext);
+  // yt-dlp says "none" for the absent half of a split stream; printing
+  // "v:none" reads as a codec rather than as "this is audio only".
+  if (f.vcodec && f.vcodec !== "none") bits.push("v:" + f.vcodec);
+  if (f.acodec && f.acodec !== "none") bits.push("a:" + f.acodec);
+  if (f.tbr) bits.push(Math.round(f.tbr) + "k");
+  if (f.protocol) bits.push(f.protocol);
+  if (!bits.length) return "format not reported by yt-dlp";
+  return bits.join(" · ") + (f.format ? "  [" + f.format + "]" : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -546,15 +869,15 @@ async function runSearch(api, source, query, count) {
 // Raw variant: candidates in yt-dlp's own relevance order (NO view rerank), so a
 // profile can score them off the true relevance position. Used by the resolve
 // paths and the Tuning tab, which do their own ranking.
-async function runSearchRaw(api, source, query, count) {
-  return (await runSearchFull(api, source, query, count, { rank: "none" })).candidates;
+async function runSearchRaw(api, source, query, count, trace) {
+  return (await runSearchFull(api, source, query, count, { rank: "none" }, trace)).candidates;
 }
 
 // Full variant: also returns `meta` — the fetched playlist's { title, count }
 // for a pasted URL, null for plain searches and single videos. The sidebar
 // Link tab uses it for its playlist header; every other caller goes through
 // runSearch and ignores it.
-async function runSearchFull(api, source, query, count, opts) {
+async function runSearchFull(api, source, query, count, opts, trace) {
   var none = { candidates: [], meta: null };
   var q = (query || "").trim();
   if (!q) return none;
@@ -569,7 +892,7 @@ async function runSearchFull(api, source, query, count, opts) {
   var cacheKey = JSON.stringify([source, q, n, (opts && opts.rank) || "views"]);
   var cached = cacheGet(searchCache, cacheKey, Date.now());
   if (cached) {
-    api.log("info", "Search served from cache (" + cached.candidates.length + " result(s)): " + q, "ytdlp");
+    logLine(api, trace, "info", "search served from cache (" + cached.candidates.length + " result(s)): " + q);
     return cloneSearchResult(cached);
   }
   if (isUrl) {
@@ -601,17 +924,16 @@ async function runSearchFull(api, source, query, count, opts) {
   var printFields = "%(url,webpage_url)s\t%(duration)s\t%(uploader,channel,uploader_id)s\t%(title)s\t%(thumbnail)s\t%(view_count)s";
   if (isUrl) printFields += "\t%(playlist_title)s\t%(playlist_count)s";
   args.push("--print", printFields);
-  api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
   var res;
   try {
-    res = await api.system.exec("yt-dlp", args);
+    res = await execLogged(api, trace, "search", args, undefined);
   } catch (e) {
-    api.log("warn", "yt-dlp search exec failed: " + (e && e.message ? e.message : e), "ytdlp");
+    logLine(api, trace, "warn", "yt-dlp search exec failed: " + errText(e));
     return none;
   }
   if (res.exitCode !== 0 || !res.stdout) {
-    api.log("warn", "yt-dlp search returned no results (exit " + res.exitCode + ")" +
-      (res.stderr ? ": " + res.stderr.trim() : ""), "ytdlp");
+    logLine(api, trace, "warn", "yt-dlp search returned no results (exit " + res.exitCode + ")" +
+      (res.stderr ? ": " + res.stderr.trim() : ""));
     noteBotGate(api, res.stderr);
     return none;
   }
@@ -967,15 +1289,20 @@ function recordResolve(api, info) {
 // the given profile ("audio" | "video"), record the resolve for the debug panel
 // and return the winner (or null). `target` is the known duration in secs (or
 // null); `resolveKind` is the human label shown in the panel.
-async function resolvePick(api, source, query, target, profileKind, resolveKind) {
-  var candidates = await runSearchRaw(api, source, query, 7);
+async function resolvePick(api, source, query, target, profileKind, resolveKind, trace) {
+  var settle = traceStep(trace, "search " + source + " for “" + query + "”" +
+    (target != null ? " (target " + Math.round(target) + "s)" : ""));
+  var candidates = await runSearchRaw(api, source, query, 7, trace);
   var ranked = rankByProfile(candidates, profileFor(profileKind), target);
   var cand = ranked.length ? ranked[0] : null;
-  if (api) {
-    if (!cand) api.log("warn", "yt-dlp search parsed 0 valid candidates", "ytdlp");
-    else api.log("info", ranked.length + " candidate(s); " + profileKind + " profile chose " +
-      cand.url + " (score " + cand._profileScore.score.toFixed(2) + ")", "ytdlp");
-  }
+  var pick = cand
+    ? ranked.length + " hit(s); " + profileKind + " profile chose " + cand.url +
+      " (score " + cand._profileScore.score.toFixed(2) + ")"
+    : "no usable results (parsed 0 valid candidates)";
+  settle(pick, cand ? "info" : "warn");
+  // Without a trace this is a search run from the sidebar or the tuner, where
+  // the pick is still the one line worth keeping.
+  if (!trace && api) api.log(cand ? "info" : "warn", pick, "ytdlp");
   recordResolve(api, {
     kind: resolveKind, query: query, source: source, profile: profileKind,
     target: target != null ? target : null, candidates: ranked, chosen: cand
@@ -987,12 +1314,12 @@ async function resolvePick(api, source, query, target, profileKind, resolveKind)
 // library miss, or a metadata download) via the configurable fallback source
 // (YouTube by default). `profileKind` selects the scoring profile — "audio" for
 // ordinary playback/downloads, "video" when the host wants a video stream.
-async function searchByMetadata(api, title, artistName, durationSecs, profileKind) {
+async function searchByMetadata(api, title, artistName, durationSecs, profileKind, trace) {
   var query = artistName ? title + " " + artistName : title;
   return resolvePick(api, resolverSource, query,
     durationSecs != null ? durationSecs : null,
     profileKind === "video" ? "video" : "audio",
-    "Playback / download fallback");
+    "Playback / download fallback", trace);
 }
 
 // Context-menu "Watch YouTube video": search YouTube by the track's metadata and
@@ -1009,16 +1336,23 @@ async function watchVideoFor(api, title, artistName) {
   var clean = stripRemasterSuffix((title || "").trim());
   if (!clean) return;
   api.ui.showNotification("Searching YouTube for a video…");
+  var trace = startTrace(api, "watch video", clean + (artistName ? " — " + artistName : ""),
+    currentContext({ preferVideo: true }));
   try {
     var query = artistName ? clean + " " + artistName : clean;
-    var cand = await resolvePick(api, "youtube", query, null, "video", "Watch YouTube video");
+    var cand = await resolvePick(api, "youtube", query, null, "video", "Watch YouTube video", trace);
     if (!cand) {
+      traceDone(trace, "no video found", "warn");
       api.ui.showNotification("No video found for “" + clean + "”.");
       return;
     }
+    // The queued track resolves its own stream on play (the ytdlp:// resolver
+    // above), so this trace ends at the pick — the stream resolve gets its own.
+    traceDone(trace, "queued " + cand.url);
     api.playback.playTracks([buildTrack(cand, true)], 0);
   } catch (e) {
-    api.log("error", "Watch video failed: " + (e && e.message ? e.message : e), "ytdlp");
+    traceDone(trace, "threw — " + errText(e), "error");
+    api.log("error", "Watch video failed: " + errText(e), "ytdlp");
     api.ui.showNotification("Couldn't find a video for “" + clean + "”.");
   }
 }
@@ -1208,6 +1542,11 @@ function buildDownloadArgs(opts, outDir, seq, embed) {
   return args.concat(ENCODING_ARGS).concat(PROGRESS_ARGS).concat([
     "--no-warnings", "--quiet", "--no-simulate", "--no-playlist",
     "--print", META_PRINT,
+    // Which format the selector above actually resolved to. The selectors are
+    // long fallback chains ("avc1+mp4a, else h264+aac, else anything"), so the
+    // argv alone never says which tier won — and that is exactly the question
+    // behind "why is this download only 480p / why is it an .mkv".
+    "--print", CHOSEN_FMT_PRINT,
     "--print", "after_move:filepath",
     "-P", outDir, "-o", "dl." + seq + ".%(ext)s", opts.url
   ]);
@@ -1219,7 +1558,7 @@ function buildDownloadArgs(opts, outDir, seq, embed) {
 // Error with a user-facing reason on failure; the host download modal shows
 // thrown messages, so the real cause (bot check, region lock, missing format)
 // reaches the user.
-async function downloadForDownload(api, url, opts) {
+async function downloadForDownload(api, url, opts, trace) {
   var outDir = await ensureDir(api, "temp");
   if (!outDir) throw new Error("The plugin's temp folder is unavailable — cannot download.");
   // Forward yt-dlp's own progress to the host so the download modal shows a real
@@ -1236,32 +1575,36 @@ async function downloadForDownload(api, url, opts) {
     lastReport = now; lastPct = pct;
     api.downloads.reportProgress(p);
   };
-  var attempt = async function () {
+  var attemptNo = 0;
+  var attempt = async function (why) {
+    attemptNo++;
     var args = buildDownloadArgs({ url: url, video: opts.video, audioFormat: opts.audioFormat, maxHeight: opts.maxHeight }, outDir, convSeq++, !!ffmpegVersion);
-    api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
+    var label = "download attempt " + attemptNo + (why ? " (" + why + ")" : "");
     try {
-      return await api.system.exec("yt-dlp", args, { cwd: null, onOutput: onOutput });
+      return await execLogged(api, trace, label, args, { cwd: null, onOutput: onOutput });
     } catch (e) {
-      var msg = e && e.message ? e.message : String(e);
+      var msg = errText(e);
       // The host kills the process when the user cancels the download. That is
       // not a broken install, so it must not be reported as one — rethrow it
       // verbatim and let the host recognise its own cancellation.
       if (msg.trim() === "Cancelled") throw e;
-      api.log("error", "yt-dlp download exec failed: " + msg, "ytdlp");
       throw new Error("yt-dlp could not be run — check Settings → Dependencies.");
     }
   };
+  var settle = traceStep(trace, "download " + (opts.video ? "video" : opts.audioFormat ? "audio → " + opts.audioFormat : "audio (original)"));
   var res = await attempt();
   if (res.exitCode !== 0 && /HTTP Error 403|403 Forbidden/i.test(res.stderr || "")) {
     // A 403 on the media URLs is usually YouTube's transient PO-token/SABR
     // gate on the just-minted URLs; a NEW extraction mints fresh URLs and
     // often passes. Retry once before giving up.
-    api.log("warn", "HTTP 403 on media download — retrying with a fresh extraction", "ytdlp");
-    res = await attempt();
+    logLine(api, trace, "warn", "HTTP 403 on media download — retrying with a fresh extraction");
+    res = await attempt("403 retry");
   }
   if (res.exitCode !== 0) {
-    api.log("error", "yt-dlp download failed (exit " + res.exitCode + "): " + (res.stderr || "").trim(), "ytdlp");
-    await logExtractionDiagnostics(api, url);
+    settle("failed after " + attemptNo + " attempt(s) (exit " + res.exitCode + ") — " + stderrGist(res.stderr), "warn");
+    // The gist above is the headline; a bug report needs the whole of stderr.
+    logLine(api, trace, "error", "yt-dlp download stderr:\n" + (res.stderr || "").trim());
+    await logExtractionDiagnostics(api, url, trace);
     throw new Error(await withOutdatedHint(api, classifyYtdlpError(res.stderr)));
   }
   // stdout: the META_PRINT line (extraction time), then the after_move
@@ -1273,11 +1616,12 @@ async function downloadForDownload(api, url, opts) {
   });
   var last = lines.length ? lines[lines.length - 1].trim() : "";
   if (!looksLikePath(last)) {
-    api.log("warn", "yt-dlp returned no file path — likely SABR/PO-token", "ytdlp");
-    await logExtractionDiagnostics(api, url);
+    settle("exit 0 but no file — likely SABR/PO-token", "warn");
+    await logExtractionDiagnostics(api, url, trace);
     throw new Error("The download produced no file — often a YouTube restriction; updating yt-dlp usually fixes this.");
   }
-  api.log("info", "Downloaded to: " + last, "ytdlp");
+  settle("saved " + last + " after " + attemptNo + " attempt(s) — " +
+    describeChosenFormat(parseChosenFormat(res.stdout)));
   return { filePath: last, meta: lines.length > 1 ? parseMetadataLine(lines[0]) : {} };
 }
 
@@ -1380,24 +1724,33 @@ function parseDirectOutput(stdout) {
 //
 // Video falls back to the HLS MASTER playlist when no muxed stream exists —
 // see getHlsMasterUrl.
-async function getDirectUrl(api, url, isVideo) {
+async function getDirectUrl(api, url, isVideo, trace) {
   var fmt = isVideo ? "best[ext=mp4]/best" : "bestaudio[ext=m4a]/bestaudio";
+  // The third `--print` costs nothing (same extraction) and is the only way this
+  // path can say WHICH format it handed over — the URL itself is opaque.
   var args = ["-f", fmt, "--print", "%(urls)s", "--print", "%(http_headers)j",
-              "--no-warnings", "--no-playlist", url];
-  api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
+              "--print", CHOSEN_FMT_PRINT, "--no-warnings", "--no-playlist", url];
+  var settle = traceStep(trace, "direct " + (isVideo ? "video" : "audio") + " URL (selector " + fmt + ")");
   var res;
-  try { res = await api.system.exec("yt-dlp", args, { cwd: null }); }
-  catch (e) { api.log("warn", "yt-dlp direct-url exec failed: " + (e && e.message ? e.message : e), "ytdlp"); return null; }
+  try { res = await execLogged(api, trace, "direct-url", args, { cwd: null }); }
+  catch (e) {
+    settle("exec failed — " + errText(e), "warn");
+    return null;
+  }
   if (res.exitCode === 0 && res.stdout) {
     var out = parseDirectOutput(res.stdout);
-    if (out.url) return { url: out.url, headers: out.headers };
+    if (out.url) {
+      var chosen = describeChosenFormat(parseChosenFormat(res.stdout));
+      settle("got a stream — " + chosen + (out.headers ? " · " + Object.keys(out.headers).length + " header(s)" : " · no headers"));
+      return { url: out.url, headers: out.headers };
+    }
   }
   if (res.exitCode !== 0) {
     var reason = await withOutdatedHint(api, classifyYtdlpError(res.stderr));
-    api.log("warn", "yt-dlp direct stream failed (exit " + res.exitCode + "): " + reason, "ytdlp");
+    settle("failed (exit " + res.exitCode + ") — " + reason, "warn");
     console.error("[ytdlp] direct stream failed (exit " + res.exitCode + "):", (res.stderr || "").trim() || "no stderr");
   } else {
-    api.log("warn", "yt-dlp direct stream returned no usable URL", "ytdlp");
+    settle("exit 0 but no usable URL — likely SABR/PO-token", "warn");
     console.warn("[ytdlp] direct stream returned no usable URL");
   }
   noteBotGate(api, res.stderr);
@@ -1406,13 +1759,13 @@ async function getDirectUrl(api, url, isVideo) {
   // playlist is one URL carrying the video renditions + the audio group,
   // playable by mpv and the macOS webview alike.
   if (isVideo) {
-    var master = await getHlsMasterUrl(api, url);
+    var master = await getHlsMasterUrl(api, url, trace);
     if (master) return { url: master, headers: null };
   }
   // Nothing playable came out of this source. Probe only HERE, not at the
   // classification above: for video the HLS master often rescues the resolve,
   // and diagnosing a failure that then succeeded would be noise.
-  maybeDeepDiagnostics(api, url, res.stderr);
+  maybeDeepDiagnostics(api, url, res.stderr, trace);
   return null;
 }
 
@@ -1428,16 +1781,23 @@ function pickHlsMaster(formats) {
   return null;
 }
 
-async function getHlsMasterUrl(api, url) {
+async function getHlsMasterUrl(api, url, trace) {
   var args = ["--no-warnings", "--no-playlist", "--skip-download", "--print", "%(formats)j", url];
+  var settle = traceStep(trace, "HLS master lookup (no muxed stream)");
   try {
-    var res = await api.system.exec("yt-dlp", args, { cwd: null });
-    if (res.exitCode !== 0 || !res.stdout) return null;
-    var master = pickHlsMaster(JSON.parse(res.stdout.split("\n")[0]));
-    if (master) api.log("info", "No muxed stream — using HLS master: " + master, "ytdlp");
+    var res = await execLogged(api, trace, "formats-dump", args, { cwd: null });
+    if (res.exitCode !== 0 || !res.stdout) { settle("no formats returned", "warn"); return null; }
+    var formats = JSON.parse(res.stdout.split("\n")[0]);
+    // This is a failure path by definition, so the full table earns its lines:
+    // it is the one place that can show a source publishes only split DASH/HLS
+    // streams rather than the muxed one the selector asked for.
+    traceLog(trace, "info", "formats for " + url + "\n" + summarizeFormats(formats, 0));
+    var master = pickHlsMaster(formats);
+    settle(master ? "no muxed stream — using master playlist " + master : "no m3u8 master published",
+      master ? "info" : "warn");
     return master;
   } catch (e) {
-    api.log("warn", "HLS master lookup failed: " + (e && e.message ? e.message : e), "ytdlp");
+    settle("lookup failed — " + errText(e), "warn");
     return null;
   }
 }
@@ -1682,8 +2042,12 @@ async function resolveStoryboard(api, url, refId) {
 
   var args = ["-j", "--no-warnings", "--no-playlist", url];
   var res;
-  try { res = await api.system.exec("yt-dlp", args, { cwd: null }); }
-  catch (e) { api.log("warn", "storyboard: yt-dlp exec failed: " + (e && e.message ? e.message : e), "ytdlp"); return null; }
+  // No trace: a storyboard is its own host callback, not part of a resolve.
+  // It still goes through execLogged so every yt-dlp invocation the plugin makes
+  // shows up in the log with its exit code and duration — this one runs against
+  // a 10 s host timeout, so how long it took is the whole diagnosis.
+  try { res = await execLogged(api, null, "storyboard", args, { cwd: null }); }
+  catch (e) { api.log("warn", "storyboard: yt-dlp exec failed: " + errText(e), "ytdlp"); return null; }
   if (res.exitCode !== 0 || !res.stdout) { noteBotGate(api, res.stderr); return null; }
 
   var board;
@@ -1736,21 +2100,33 @@ async function resolveStoryboard(api, url, refId) {
 // Enumerate a source's streams as a StreamCandidate menu via ONE `yt-dlp -j`
 // call (formats carry directly-usable URLs). Returns [] on any failure so the
 // caller can fall back to the single-stream muxed path.
-async function enumerateFormats(api, url, maxHeight) {
+async function enumerateFormats(api, url, maxHeight, trace) {
   var args = ["-j", "--no-warnings", "--no-playlist", url];
-  api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
+  var settle = traceStep(trace, "enumerate formats");
   var res;
-  try { res = await api.system.exec("yt-dlp", args, { cwd: null }); }
-  catch (e) { api.log("warn", "yt-dlp -j exec failed: " + (e && e.message ? e.message : e), "ytdlp"); return []; }
+  try { res = await execLogged(api, trace, "formats-json", args, { cwd: null }); }
+  catch (e) {
+    settle("exec failed — " + errText(e), "warn");
+    return [];
+  }
   if (res.exitCode !== 0 || !res.stdout) {
+    settle("no format list (exit " + res.exitCode + ")", "warn");
     noteBotGate(api, res.stderr);
     return [];
   }
   try {
     var info = JSON.parse(res.stdout.split("\n")[0]);
-    return candidatesFromFormats(info.formats || [], maxHeight || 0);
+    var formats = info.formats || [];
+    // The full table, from data this extraction already returned. It is the only
+    // record of what the source OFFERED, as opposed to what we ended up playing
+    // — without it a disappointing result can't be told apart from a source that
+    // never published anything better.
+    traceLog(trace, "info", "formats for " + url + "\n" + summarizeFormats(formats, maxHeight || 0));
+    var candidates = candidatesFromFormats(formats, maxHeight || 0);
+    settle(summarizeCandidates(candidates), candidates.length ? "info" : "warn");
+    return candidates;
   } catch (e) {
-    api.log("warn", "yt-dlp -j parse failed: " + (e && e.message ? e.message : e), "ytdlp");
+    settle("parse failed — " + errText(e), "warn");
     return [];
   }
 }
@@ -1758,51 +2134,68 @@ async function enumerateFormats(api, url, maxHeight) {
 // Download the source media to cache/<stem>.<ext>. audio: bestaudio; video:
 // bestvideo+bestaudio merged (needs ffmpeg) into an .mp4, or .mkv when the source
 // has no H.264/AAC pair — see videoFormatSelector. Returns the file path or null.
-async function downloadToCache(api, url, isVideo) {
+async function downloadToCache(api, url, isVideo, trace) {
   var stem = cacheStem(url, isVideo);
+  var cacheSettle = traceStep(trace, "cache lookup");
   var cached = await findCachedDownload(api, stem);
-  if (cached) { api.log("info", "Using cached download: " + cached, "ytdlp"); return cached; }
+  if (cached) {
+    cacheSettle("hit — " + cached);
+    return cached;
+  }
+  cacheSettle("miss (" + stem + ")");
 
   var cacheDir = await ensureDir(api, "cache");
   if (!cacheDir) { api.log("error", "Cache dir unavailable — cannot download", "ytdlp"); return null; }
-  var args;
+  var args, selector;
   if (isVideo) {
     // "Download then play" honors the streaming resolution cap.
-    args = ["-f", videoFormatSelector(maxVideoHeight), "--merge-output-format", MERGE_CONTAINERS];
+    selector = videoFormatSelector(maxVideoHeight);
+    args = ["-f", selector, "--merge-output-format", MERGE_CONTAINERS];
   } else {
-    args = ["-f", "bestaudio[ext=m4a]/bestaudio"];
+    selector = "bestaudio[ext=m4a]/bestaudio";
+    args = ["-f", selector];
   }
   args = args.concat([
     "--no-warnings", "--quiet", "--no-simulate", "--no-playlist",
+    // Same reasoning as buildDownloadArgs: the selector is a fallback chain and
+    // only yt-dlp can say which tier it landed on.
+    "--print", CHOSEN_FMT_PRINT,
     "--print", "after_move:filepath",
     "-P", cacheDir, "-o", stem + ".%(ext)s", url
   ]);
-  api.log("info", "Running: " + formatCmd("yt-dlp", args), "ytdlp");
+  var settle = traceStep(trace, "download to cache (selector " + selector + ")");
   var filePath = null;
   try {
-    var res = await api.system.exec("yt-dlp", args, { cwd: null });
+    var res = await execLogged(api, trace, "download attempt 1", args, { cwd: null });
     if (res.exitCode !== 0 && /HTTP Error 403|403 Forbidden/i.test(res.stderr || "")) {
       // Transient PO-token/SABR gate on the minted URLs — a fresh extraction
       // often passes (same retry as downloadForDownload).
-      api.log("warn", "HTTP 403 on media download — retrying with a fresh extraction", "ytdlp");
-      res = await api.system.exec("yt-dlp", args, { cwd: null });
+      logLine(api, trace, "warn", "HTTP 403 on media download — retrying with a fresh extraction");
+      res = await execLogged(api, trace, "download attempt 2 (403 retry)", args, { cwd: null });
     }
     if (res.exitCode !== 0) {
-      api.log("error", "yt-dlp download failed (exit " + res.exitCode + "): " + (res.stderr || "").trim(), "ytdlp");
-      await logExtractionDiagnostics(api, url);
+      settle("failed (exit " + res.exitCode + ") — " + stderrGist(res.stderr), "warn");
+      // The gist above is the headline; this is the whole of yt-dlp's stderr,
+      // which is what a bug report actually needs.
+      logLine(api, trace, "error", "yt-dlp download stderr:\n" + (res.stderr || "").trim());
+      await logExtractionDiagnostics(api, url, trace);
       return null;
     }
-    filePath = res.stdout ? res.stdout.trim() || null : null;
+    // stdout now carries the chosen-format line as well as the path, so take the
+    // LAST non-empty line rather than the whole of stdout.
+    var outLines = (res.stdout || "").split("\n").filter(function (l) { return l.trim(); });
+    var tail = outLines.length ? outLines[outLines.length - 1].trim() : "";
+    filePath = looksLikePath(tail) ? tail : null;
   } catch (e) {
-    api.log("error", "yt-dlp exec failed: " + (e && e.message ? e.message : e), "ytdlp");
+    settle("exec failed — " + errText(e), "warn");
     return null;
   }
   if (!filePath) {
-    api.log("warn", "yt-dlp returned no file path (exit 0, no output) — likely SABR/PO-token", "ytdlp");
-    await logExtractionDiagnostics(api, url);
+    settle("exit 0 but no file — likely SABR/PO-token", "warn");
+    await logExtractionDiagnostics(api, url, trace);
     return null;
   }
-  api.log("info", "Downloaded to: " + filePath, "ytdlp");
+  settle("saved " + filePath + " — " + describeChosenFormat(parseChosenFormat(res.stdout)));
   return filePath;
 }
 
@@ -1830,7 +2223,7 @@ async function withCacheProtection(api, filePath, work) {
 // play (that's the mpv engine's job), and downloading the whole file first is
 // slow; so a direct-stream failure fails cleanly and the host surfaces an error.
 // Users who want the reliability of a local copy pick "Download then play".
-async function resolvePlayable(api, url, isVideo, fresh) {
+async function resolvePlayable(api, url, isVideo, fresh, trace) {
   if (playbackMode === "stream") {
     // Keyed per (source, kind) exactly like the download cache: the two format
     // selectors differ, so an audio resolve must never serve a video's URL.
@@ -1840,12 +2233,14 @@ async function resolvePlayable(api, url, isVideo, fresh) {
     // one is worse than useless here: serving it would burn the retry and make
     // the failure look permanent. Drop it and mint a new one.
     if (fresh) delete streamUrlCache[key];
+    var cacheSettle = traceStep(trace, "signed-URL cache" + (fresh ? " (dropped: host asked for a fresh URL)" : ""));
     var hit = cacheGet(streamUrlCache, key, Date.now());
     if (hit) {
-      api.log("info", "Streaming directly (cached resolve, no yt-dlp call): " + url, "ytdlp");
+      cacheSettle("hit — streaming the remembered URL, no yt-dlp call");
       return { url: hit.url, downloaded: false, headers: hit.headers };
     }
-    var direct = await getDirectUrl(api, url, isVideo);
+    cacheSettle("miss");
+    var direct = await getDirectUrl(api, url, isVideo, trace);
     if (direct && direct.url) {
       var expiresAt = streamUrlExpiry(direct.url, Date.now());
       // null = the URL is already near its own deadline, so caching it would
@@ -1853,14 +2248,16 @@ async function resolvePlayable(api, url, isVideo, fresh) {
       if (expiresAt) {
         cachePut(streamUrlCache, key, { url: direct.url, headers: direct.headers || null }, expiresAt, CACHE_MAX_ENTRIES);
       }
-      api.log("info", "Streaming directly: " + url, "ytdlp");
+      logLine(api, trace, "info", "signed URL " + (expiresAt
+        ? "cached until it expires in " + Math.round((expiresAt - Date.now()) / 60000) + " min"
+        : "not cached — already near its own expiry"));
       return { url: direct.url, downloaded: false, headers: direct.headers || null };
     }
-    api.log("warn", "Direct stream unavailable: " + url, "ytdlp");
+    logLine(api, trace, "warn", "direct stream unavailable: " + url);
     return null;
   }
   // "download" mode: fetch a local copy (browser-friendly m4a / merged mp4).
-  var filePath = await downloadToCache(api, url, isVideo);
+  var filePath = await downloadToCache(api, url, isVideo, trace);
   if (!filePath) return null;
   return { url: "file://" + filePath, downloaded: true, filePath: filePath };
 }
@@ -1883,10 +2280,22 @@ async function resolvePlayable(api, url, isVideo, fresh) {
 // Downloads ("download then play") and the HLS-master fallback both come back
 // headerless, so both keep returning a plain URL exactly as before.
 // Pure; exported for tests.
-function streamUriResult(playable, isVideo) {
+// `sourceUrl` is the source WEBPAGE (the watch URL), not the stream — it is what
+// the host's source panel shows and what its "Open on yt-dlp" button opens. A
+// ytdlp:// track would otherwise be attributed by its own URI, which is the
+// percent-encoded webpage URL behind a scheme: unreadable, and not something the
+// host can hand to a browser. Reporting it needs the object form, so this no
+// longer returns a bare URL string even when there are no headers — the host
+// treats a one-candidate list identically (see its selectStream), and older
+// hosts, which have always accepted `{ candidates }`, simply ignore the extra
+// field.
+function streamUriResult(playable, isVideo, sourceUrl) {
   if (!playable || !playable.url) return null;
-  if (!playable.headers) return playable.url;
-  return { candidates: [{ url: playable.url, kind: isVideo ? "muxed" : "audio", headers: playable.headers }] };
+  var candidate = { url: playable.url, kind: isVideo ? "muxed" : "audio" };
+  if (playable.headers) candidate.headers = playable.headers;
+  var result = { candidates: [candidate] };
+  if (sourceUrl) result.sourceUrl = sourceUrl;
+  return result;
 }
 
 // Produce the host download-resolve result for a source URL + chosen format.
@@ -1895,17 +2304,32 @@ function streamUriResult(playable, isVideo) {
 // metadata the host already has (e.g. a library track's real title/artist/album),
 // which overrides yt-dlp's guesses; when absent, yt-dlp's own metadata is used.
 // Throws (via downloadForDownload) with a user-facing reason on failure.
-async function resolveDownload(api, url, format, caller) {
+async function resolveDownload(api, url, format, caller, trace) {
   var fmt = format || "original";
   var vf = parseVideoFormat(fmt);
   var isVideo = vf.isVideo;
   var audioFormat = null;
   if (!isVideo && TRANSCODE_FORMATS[fmt]) {
     if (ffmpegVersion) audioFormat = fmt;
-    else api.log("warn", "ffmpeg missing — downloading original audio instead of " + fmt, "ytdlp");
+    else logLine(api, trace, "warn", "ffmpeg missing — downloading original audio instead of " + fmt);
+  }
+  if (!trace) {
+    trace = startTrace(api, "download resolve", url + " as " + fmt,
+      currentContext({ preferVideo: isVideo, maxHeight: isVideo ? vf.maxHeight : 0 }));
   }
 
-  var dl = await downloadForDownload(api, url, { video: isVideo, audioFormat: audioFormat, maxHeight: vf.maxHeight });
+  var dl;
+  try {
+    dl = await downloadForDownload(api, url, { video: isVideo, audioFormat: audioFormat, maxHeight: vf.maxHeight }, trace);
+  } catch (e) {
+    // The reason itself is already logged by the step that produced it; this
+    // only closes the trace, so a reader can see the resolve ended here rather
+    // than trailing off mid-way.
+    var msg = errText(e);
+    traceDone(trace, msg.trim() === "Cancelled" ? "cancelled by the user" : "failed — " + msg,
+      msg.trim() === "Cancelled" ? "info" : "warn");
+    throw e;
+  }
   // Rich metadata from yt-dlp (printed by the download run itself);
   // caller-supplied fields win.
   var meta = dl.meta || {};
@@ -1917,6 +2341,7 @@ async function resolveDownload(api, url, format, caller) {
   if (album) md.album = album;
   if (meta.year) md.year = meta.year;
 
+  traceDone(trace, "downloaded " + dl.filePath + " (" + fmt + ")");
   return await withCacheProtection(api, dl.filePath, function () {
     return { url: "file://" + dl.filePath, headers: null, ext: extOf(dl.filePath) || undefined, metadata: md };
   });
@@ -1961,11 +2386,14 @@ async function activate(api) {
     title = stripRemasterSuffix(title);
     var preferVideo = !!(opts && opts.preferVideo);
     var fresh = !!(opts && opts.fresh);
+    var trace = startTrace(api, "stream resolve by metadata",
+      title + (artistName ? " — " + artistName : "") + (durationSecs != null ? " (" + Math.round(durationSecs) + "s)" : ""),
+      currentContext({ preferVideo: preferVideo, externalAudio: !!(opts && opts.externalAudio), fresh: fresh }));
     try {
       // preferVideo → rank with the VIDEO profile (official MV / VEVO); plain
       // audio playback → the AUDIO profile (clean official-audio / Topic).
-      var cand = await searchByMetadata(api, title, artistName, durationSecs, preferVideo ? "video" : "audio");
-      if (!cand) { api.log("warn", "No match for: " + title, "ytdlp"); return null; }
+      var cand = await searchByMetadata(api, title, artistName, durationSecs, preferVideo ? "video" : "audio", trace);
+      if (!cand) { traceDone(trace, "no match for “" + title + "”", "warn"); return null; }
       if (preferVideo) {
         // The host can merge a separate audio track (native mpv engine): hand it
         // the whole menu so it can pair a hi-res video-only stream with an
@@ -1974,26 +2402,31 @@ async function activate(api) {
         // muxed format is itag 18 at 360p, so "Watch YouTube video" was capped
         // there on every engine no matter how good the source was.
         if (opts && opts.externalAudio && playbackMode === "stream") {
-          var menu = await enumerateFormats(api, cand.url, maxVideoHeight);
+          var menu = await enumerateFormats(api, cand.url, maxVideoHeight, trace);
           var selfContained = selfContainedUrl(menu);
           if (menu.length && selfContained) {
-            api.log("info", "Resolved " + menu.length + " stream candidate(s) for " + cand.url, "ytdlp");
+            traceDone(trace, "candidate menu of " + menu.length + " (host picks per its engine)");
             return { url: selfContained, candidates: menu, label: "yt-dlp (video)", sourceUrl: cand.url, video: true };
           }
-          api.log("warn", "No candidates enumerated — falling back to muxed stream", "ytdlp");
+          traceLog(trace, "warn", "no usable candidates — falling back to a single muxed stream");
         }
-        var vid = await resolvePlayable(api, cand.url, true, fresh);
+        var vid = await resolvePlayable(api, cand.url, true, fresh, trace);
         // `headers` rides along so the host can hand them to mpv: a signed CDN
         // URL is often bound to the User-Agent that minted it, and this path
         // (unlike the by-URI candidate list) has no other way to carry them.
-        if (vid) return { url: vid.url, label: "yt-dlp (video)", sourceUrl: cand.url, video: true, headers: vid.headers || undefined };
-        api.log("warn", "No video stream — falling back to audio: " + cand.url, "ytdlp");
+        if (vid) {
+          traceDone(trace, "single video stream" + (vid.downloaded ? " (downloaded)" : ""));
+          return { url: vid.url, label: "yt-dlp (video)", sourceUrl: cand.url, video: true, headers: vid.headers || undefined };
+        }
+        traceLog(trace, "warn", "no video stream — falling back to audio");
       }
-      var playable = await resolvePlayable(api, cand.url, false, fresh);
-      if (!playable) return null;
+      var playable = await resolvePlayable(api, cand.url, false, fresh, trace);
+      if (!playable) { traceDone(trace, "no playable stream", "warn"); return null; }
+      traceDone(trace, "audio stream" + (playable.downloaded ? " (downloaded)" : ""));
       return { url: playable.url, label: "yt-dlp", sourceUrl: cand.url, headers: playable.headers || undefined };
     } catch (e) {
-      api.log("error", "Stream resolve failed: " + (e && e.message ? e.message : e), "ytdlp");
+      traceDone(trace, "stream resolve threw — " + errText(e), "error");
+      console.error("[ytdlp] stream resolve failed:", e, (e && e.stack) || "");
       return null;
     }
   });
@@ -2004,6 +2437,10 @@ async function activate(api) {
     if (!ytDlpVersion) { api.log("warn", "URI resolve skipped — yt-dlp not available", "ytdlp"); return null; }
     var ref = decodeRef(id);
     if (!ref) { api.log("warn", "URI resolve: bad ref " + id, "ytdlp"); return null; }
+    // No `preferVideo` here: the ref itself says which kind was asked for (it is
+    // in the subject line), and reporting it as a host hint would be a lie.
+    var trace = startTrace(api, "stream resolve by uri", ref.url + (ref.isVideo ? " (video)" : " (audio)"),
+      currentContext({ externalAudio: !!(opts && opts.externalAudio), fresh: !!(opts && opts.fresh) }));
     try {
       // The host can attach a separate audio track (native mpv engine + video):
       // return the full candidate menu so it can pick a hi-res video-only +
@@ -2011,17 +2448,21 @@ async function activate(api) {
       // fetches a full-res merged file below. On enumeration failure fall
       // through to the single muxed stream.
       if (ref.isVideo && opts && opts.externalAudio && playbackMode === "stream") {
-        var candidates = await enumerateFormats(api, ref.url, maxVideoHeight);
+        var candidates = await enumerateFormats(api, ref.url, maxVideoHeight, trace);
         if (candidates.length) {
-          api.log("info", "Resolved " + candidates.length + " stream candidate(s) for " + ref.url, "ytdlp");
-          return { candidates: candidates };
+          traceDone(trace, "candidate menu of " + candidates.length + " (host picks per its engine)");
+          return { candidates: candidates, sourceUrl: ref.url };
         }
-        api.log("warn", "No candidates enumerated — falling back to muxed stream", "ytdlp");
+        traceLog(trace, "warn", "no usable candidates — falling back to a single muxed stream");
       }
-      var playable = await resolvePlayable(api, ref.url, ref.isVideo, opts && opts.fresh);
-      return streamUriResult(playable, ref.isVideo);
+      var playable = await resolvePlayable(api, ref.url, ref.isVideo, opts && opts.fresh, trace);
+      var result = streamUriResult(playable, ref.isVideo, ref.url);
+      traceDone(trace, result ? "single stream" + (playable.downloaded ? " (downloaded)" : "") : "no playable stream",
+        result ? "info" : "warn");
+      return result;
     } catch (e) {
-      api.log("error", "URI resolve failed: " + (e && e.message ? e.message : e), "ytdlp");
+      traceDone(trace, "uri resolve threw — " + errText(e), "error");
+      console.error("[ytdlp] uri resolve failed:", e, (e && e.stack) || "");
       return null;
     }
   });
@@ -2051,11 +2492,16 @@ async function activate(api) {
     await ensureToolStatus(api);
     if (!ytDlpVersion) return null;
     if (!YT_ID_RE.test(id)) { api.log("warn", "Legacy youtube:// resolve: bad id " + id, "ytdlp"); return null; }
+    var trace = startTrace(api, "stream resolve by legacy uri", youtubeWatchUrl(id) + " (audio)",
+      currentContext({ externalAudio: !!(opts && opts.externalAudio), fresh: !!(opts && opts.fresh) }));
     try {
-      var playable = await resolvePlayable(api, youtubeWatchUrl(id), false, opts && opts.fresh);
-      return streamUriResult(playable, false);
+      var playable = await resolvePlayable(api, youtubeWatchUrl(id), false, opts && opts.fresh, trace);
+      var result = streamUriResult(playable, false, youtubeWatchUrl(id));
+      traceDone(trace, result ? "single stream" : "no playable stream", result ? "info" : "warn");
+      return result;
     } catch (e) {
-      api.log("error", "Legacy youtube:// resolve failed: " + (e && e.message ? e.message : e), "ytdlp");
+      traceDone(trace, "legacy uri resolve threw — " + errText(e), "error");
+      console.error("[ytdlp] legacy youtube:// resolve failed:", e, (e && e.stack) || "");
       return null;
     }
   });
@@ -2149,10 +2595,16 @@ async function activate(api) {
       // Downloads are audio unless a video format was requested — match the
       // scoring profile so a video download ranks toward the actual MV.
       var dlProfile = parseVideoFormat(format).isVideo ? "video" : "audio";
-      var cand = await searchByMetadata(api, title, artistName, durationSecs, dlProfile);
-      if (!cand) return null;
+      var mdTrace = startTrace(api, "download resolve by metadata",
+        title + (artistName ? " — " + artistName : "") + " as " + (format || "original"),
+        // A download's cap comes from the requested format, not the streaming
+        // setting — reporting the latter here would name a limit that isn't
+        // in force.
+        currentContext({ preferVideo: dlProfile === "video", maxHeight: parseVideoFormat(format).maxHeight }));
+      var cand = await searchByMetadata(api, title, artistName, durationSecs, dlProfile, mdTrace);
+      if (!cand) { traceDone(mdTrace, "no match", "warn"); return null; }
       // The host's metadata is authoritative here (a real library track).
-      return await resolveDownload(api, cand.url, format, { title: title, artist: artistName, album: albumName });
+      return await resolveDownload(api, cand.url, format, { title: title, artist: artistName, album: albumName }, mdTrace);
     } catch (e) { console.error("[ytdlp] download resolve failed:", e, e.stack || ""); return null; }
   });
 
@@ -2931,5 +3383,15 @@ return {
   _parseVideoFormat: parseVideoFormat,
   _videoFormatSelector: videoFormatSelector,
   _dropSoundcloudPreviews: dropSoundcloudPreviews,
-  _loadToolStatus: loadToolStatus
+  _loadToolStatus: loadToolStatus,
+  _engineLabel: engineLabel,
+  _describeContext: describeContext,
+  _fmtMs: fmtMs,
+  _stderrGist: stderrGist,
+  _summarizeFormats: summarizeFormats,
+  _summarizeCandidates: summarizeCandidates,
+  _describeCandidate: describeCandidate,
+  _parseChosenFormat: parseChosenFormat,
+  _describeChosenFormat: describeChosenFormat,
+  _CHOSEN_FMT_PRINT: CHOSEN_FMT_PRINT
 };

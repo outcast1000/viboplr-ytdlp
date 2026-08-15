@@ -135,17 +135,24 @@ test("parseDirectOutput: no url means no result, whatever else printed", () => {
 
 // --- streamUriResult ---------------------------------------------------------
 // onResolveStreamByUri may answer with a URL string or a candidate list. Only
-// the list can carry headers, so the shape is chosen by whether there are any.
+// the list can carry headers OR the source URL, so this always uses it — the
+// host treats a one-candidate list exactly like a bare URL.
 
-test("streamUriResult: a headerless stream stays a plain url", () => {
-  // Covers "download then play" (a local file) and the HLS-master fallback,
-  // both of which resolve without headers and must behave exactly as before.
-  assert.equal(plugin._streamUriResult({ url: "https://a/x.m4a" }, false), "https://a/x.m4a");
-  assert.equal(plugin._streamUriResult({ url: "file:///tmp/x.m4a", downloaded: true }, false), "file:///tmp/x.m4a");
-  assert.equal(plugin._streamUriResult({ url: "https://a/m.m3u8", headers: null }, true), "https://a/m.m3u8");
+test("streamUriResult: always the candidate-list shape, kind following the request", () => {
+  // Headerless covers "download then play" (a local file) and the HLS-master
+  // fallback; both must still resolve to exactly the same playable URL.
+  assert.deepEqual(plugin._streamUriResult({ url: "https://a/x.m4a" }, false), {
+    candidates: [{ url: "https://a/x.m4a", kind: "audio" }],
+  });
+  assert.deepEqual(plugin._streamUriResult({ url: "file:///tmp/x.m4a", downloaded: true }, false), {
+    candidates: [{ url: "file:///tmp/x.m4a", kind: "audio" }],
+  });
+  assert.deepEqual(plugin._streamUriResult({ url: "https://a/m.m3u8", headers: null }, true), {
+    candidates: [{ url: "https://a/m.m3u8", kind: "muxed" }],
+  });
 });
 
-test("streamUriResult: headers force the candidate-list shape, kind following the request", () => {
+test("streamUriResult: headers ride on the candidate", () => {
   const h = { "User-Agent": "ua" };
   assert.deepEqual(plugin._streamUriResult({ url: "https://a/x.m4a", headers: h }, false), {
     candidates: [{ url: "https://a/x.m4a", kind: "audio", headers: h }],
@@ -153,6 +160,18 @@ test("streamUriResult: headers force the candidate-list shape, kind following th
   assert.deepEqual(plugin._streamUriResult({ url: "https://a/x.mp4", headers: h }, true), {
     candidates: [{ url: "https://a/x.mp4", kind: "muxed", headers: h }],
   });
+});
+
+test("streamUriResult: the source webpage is reported separately from the stream", () => {
+  // The host shows this in the source panel and opens it from there. Without it
+  // a ytdlp:// track is attributed by its own URI — the same webpage URL, but
+  // percent-encoded behind a scheme, so unreadable and un-openable.
+  const page = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+  const r = plugin._streamUriResult({ url: "https://cdn/x.m4a" }, false, page);
+  assert.equal(r.sourceUrl, page);
+  assert.equal(r.candidates[0].url, "https://cdn/x.m4a", "the stream URL is untouched");
+  // Omitted rather than sent as undefined when there is nothing to report.
+  assert.ok(!("sourceUrl" in plugin._streamUriResult({ url: "https://cdn/x.m4a" }, false)));
 });
 
 test("streamUriResult: nothing resolved means null", () => {
