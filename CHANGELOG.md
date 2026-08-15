@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.19.0
+- **Video played through "prefer video" is no longer stuck at 360p.** Asked to
+  find a video for a track you were playing as audio, the plugin handed the app
+  a single stream that carried both picture and sound — and on YouTube the only
+  stream of that kind is 360p, so that is what you got however good the source
+  was. It now offers the app the full list of streams, the same list the yt-dlp
+  browse view already provides, and the app pairs a high-resolution picture with
+  a separate audio stream. Watching from the yt-dlp view was already unaffected.
+
+- **A stream that gets refused is retried properly.** YouTube turns down a
+  playable link outright a fair share of the time, for no reason to do with the
+  link. The app now asks again, and this plugin no longer answers with the link
+  it just handed over — a refused one stays refused, so repeating it turned a
+  moment's bad luck into a track that appeared broken.
+
+  Requires Viboplr 1.0.25 or newer for both of these; on earlier versions this
+  release behaves exactly like 1.18.0.
+
 ## v1.18.0
 - **Playing a track you've already played is now instant, and searches you
   repeat are too.** Resolving a track meant running yt-dlp twice — once to find
