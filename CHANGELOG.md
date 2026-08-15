@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.21.0
+- **Removed from the app's global search (Cmd+K).** Searching yt-dlp from the
+  caption bar is gone; the plugin's own sidebar view is now the one place it
+  searches. The dropdown could only hand you a blind top hit, while the sidebar
+  offers the source tabs, view counts and the choice of which result is actually
+  the song — two doors to the same room, and one of them was worse.
+
+  It also stops Cmd+K being a cheap second way to spend searches on YouTube.
+  Every one of them is a real request, and running out of them is what gets you
+  asked to prove you're not a bot. Nothing else changes: playback, downloads and
+  "Watch YouTube video" are untouched.
+
+
 ## v1.20.0
 - **The log now explains why a track played the way it did.** Until now it
   recorded the commands it ran and little else, so a report of "this played at

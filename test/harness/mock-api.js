@@ -144,10 +144,10 @@ function makeApi(config) {
       registerItem: (item) => { (calls.registerItem = calls.registerItem || []).push(item); return () => {}; },
       unregisterItem: () => {},
     },
-    // Host global search (Cmd+K). Omitted entirely when config.noSearchApi is
-    // set, so tests can pin the older-host path — the plugin has to degrade
-    // silently rather than throw on a host without api.search.
-    search: config.noSearchApi ? undefined : {
+    // Host global search (Cmd+K). Offered here even though the plugin no longer
+    // uses it — that is the point: the integration test asserts nothing
+    // registers even when the host would happily take it.
+    search: {
       onQuery: (id, fn) => { handlers["search:" + id] = fn; },
       registerProvider: (p) => { (calls.registerProvider = calls.registerProvider || []).push(p); return () => {}; },
       unregisterProvider: () => {},

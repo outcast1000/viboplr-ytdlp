@@ -2882,8 +2882,6 @@ async function activate(api) {
     lastResolve = null; renderSearchView(api);
   });
 
-  registerGlobalSearch(api);
-
   renderSettings(api);
   renderSearchView(api);
 
@@ -2892,70 +2890,16 @@ async function activate(api) {
     ensureToolStatus(api).then(function () {
       renderSettings(api);
       renderSearchView(api);
-      // Status is only known now, and it decides whether we can search at all.
-      registerGlobalSearch(api);
     });
   }, 0);
 }
 
-// ---------------------------------------------------------------------------
-// Global search (host Cmd+K)
-// ---------------------------------------------------------------------------
-// The host offers this catalog as a row in its search dropdown and queries it
-// only when the user picks that row — it never fires while they type, which is
-// what makes it acceptable to shell out to yt-dlp here (a search takes seconds).
-//
-// Registered at runtime rather than in the manifest, and only once yt-dlp is
-// known to be present: a provider that can't work should not be offered. Called
-// again after the dependency status loads, hence the idempotency guard.
-var globalSearchRegistered = false;
-function registerGlobalSearch(api) {
-  // Guard the whole namespace: older hosts have no api.search at all.
-  if (!api.search || typeof api.search.registerProvider !== "function") return;
-  if (globalSearchRegistered) return;
-  // Before the status load, ytDlpVersion is null and we simply wait — the
-  // post-load call re-runs this.
-  if (!statusLoaded || !ytDlpVersion) return;
-  globalSearchRegistered = true;
-
-  api.search.registerProvider({ id: "ytdlp-search", name: "yt-dlp" });
-  // Worth a line: whether this provider is offered depends on host version AND
-  // on yt-dlp being present, so "why is yt-dlp missing from Cmd+K" is otherwise
-  // unanswerable from a log.
-  api.log("info", "Global search provider registered (yt-dlp " + ytDlpVersion + ")", "ytdlp");
-
-  api.search.onQuery("ytdlp-search", async function (query, limit) {
-    await ensureToolStatus(api);
-    if (!ytDlpVersion) {
-      return { status: "error", message: "yt-dlp isn't installed" };
-    }
-    var q = (query || "").trim();
-    if (!q) return { status: "empty" };
-    // "Link" is a paste-a-URL tab with no search extractor, so free text has to
-    // go to a source that actually searches — same substitution the download
-    // modal's manual search makes.
-    var source = searchSource === "link" ? resolverSource : searchSource;
-    if (source === "link") source = "youtube";
-    try {
-      // runSearch absorbs exec failures and non-zero exits into an empty
-      // candidate list (and notifies on a bot gate), so "empty" here covers both
-      // a genuine miss and a blocked search — same as the sidebar view. The
-      // catch below is a backstop, not the normal failure path.
-      var candidates = await runSearch(api, source, q, limit || 6);
-      if (!candidates || candidates.length === 0) return { status: "empty" };
-      var tracks = [];
-      for (var i = 0; i < candidates.length; i++) {
-        // Audio identity — the global search plays songs. Watching a video is
-        // the context menu's "Watch YouTube video" job.
-        tracks.push(buildTrack(candidates[i], false));
-      }
-      return { status: "ok", tracks: tracks };
-    } catch (e) {
-      api.log("error", "Global search failed: " + (e && e.message ? e.message : e), "ytdlp");
-      return { status: "error", message: e && e.message ? e.message : "search failed" };
-    }
-  });
-}
+// Deliberately NOT a host global-search (Cmd+K) provider. It was one from
+// v1.15.0 to v1.20.0 and it is not coming back: the sidebar view already
+// searches, and does it better (source tabs, view counts, pick-your-own-result), while the
+// dropdown could only queue a blind top hit. Removing it also stops Cmd+K being
+// a second, cheap way to spend yt-dlp searches against YouTube's bot gate —
+// every one of those is a real extractor call.
 
 // ---------------------------------------------------------------------------
 // Views
@@ -3321,9 +3265,6 @@ function renderSettings(api) {
 
 function deactivate() {
   ytDlpVersion = null; ffmpegVersion = null; statusLoaded = false;
-  // The host drops our provider + handler on unload, so a disable/enable cycle
-  // has to register again — leaving this set would silently lose the provider.
-  globalSearchRegistered = false;
   inFlightFiles = {}; lastSourceFile = null;
   tabState = {}; searching = false; searchingSource = null; searchGen = 0;
   botGateNotified = false; deepDiagnosticsRun = false; lastResolve = null;

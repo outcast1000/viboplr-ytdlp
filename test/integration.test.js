@@ -72,6 +72,16 @@ test("registers all expected handlers", async () => {
   for (const h of expected) assert.ok(api._handlers[h], "missing handler: " + h);
 });
 
+test("does not register a host global-search (Cmd+K) provider", async () => {
+  // Shipped v1.15.0–v1.20.0, removed and meant to stay removed: the sidebar view searches
+  // better, and a second entry point only spends more yt-dlp searches against
+  // YouTube's bot gate. The mock still offers api.search, so this fails the
+  // moment a registration comes back rather than when the host changes.
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  assert.strictEqual(api.calls.registerProvider, undefined);
+  assert.ok(!api._handlers["search:ytdlp-search"]);
+});
+
 test("qualities: original always; transcodes + video only when ffmpeg present", async () => {
   const { api } = await activated({ exec: toolsPresent(BEHAVIOR) });
   const q = api._handlers["qual:ytdlp-download"]();
@@ -100,7 +110,7 @@ test("qualities: original always; transcodes + video only when ffmpeg present", 
   assert.deepEqual(q2.map((x) => x.value), ["original"]);
 });
 
-// A ytdlp:// audio track (sidebar search, Cmd+K, a saved playlist of either)
+// A ytdlp:// audio track (sidebar search, a saved playlist of one)
 // resolves here, not through the metadata fallback. A single URL string cannot
 // carry headers, so when the stream needs them the answer is a one-element
 // candidate list — the only shape in the host contract that can.
