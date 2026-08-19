@@ -1357,6 +1357,53 @@ async function watchVideoFor(api, title, artistName) {
   }
 }
 
+// Context-menu "Download with yt-dlp": search the configured fallback source by
+// the track's metadata (AUDIO profile — the modal's quality picker is where the
+// user chooses video) and open the host's download modal on the top hit. The
+// track sent to the modal keeps the TARGET's own title/artist/album — those are
+// the tags and filename the user wants, not the uploader's video title — while
+// the uri carries the found page. Feedback is a notification (context-menu
+// actions have no loading modal); errors surface the same way and never throw.
+// This replaces the host's old "Download from yt-dlp…" entry, which was removed
+// when per-provider menu generation left the host (plugin-first).
+async function downloadTrackFor(api, target) {
+  await ensureToolStatus(api);
+  if (!ytDlpVersion) {
+    api.ui.showNotification("yt-dlp isn't installed — see Settings → Dependencies.");
+    return;
+  }
+  var clean = stripRemasterSuffix((target.title || "").trim());
+  if (!clean) return;
+  var artistName = target.artistName || null;
+  api.ui.showNotification("Searching for “" + clean + "”…");
+  var trace = startTrace(api, "download track", clean + (artistName ? " — " + artistName : ""), currentContext({}));
+  try {
+    var query = artistName ? clean + " " + artistName : clean;
+    var cand = await resolvePick(api, resolverSource, query, null, "audio", "Download with yt-dlp", trace);
+    if (!cand) {
+      traceDone(trace, "no match found", "warn");
+      api.ui.showNotification("No match found for “" + clean + "”.");
+      return;
+    }
+    traceDone(trace, "opening download modal for " + cand.url);
+    api.ui.requestAction("download-tracks", {
+      providerId: "ytdlp:ytdlp-download",
+      providerName: "yt-dlp",
+      tracks: [{
+        title: target.title,
+        artist_name: artistName,
+        album_title: target.albumTitle || null,
+        uri: encodeRef(cand.url, false),
+        durationSecs: cand.durationSecs != null ? cand.durationSecs : null
+      }]
+    });
+  } catch (e) {
+    traceDone(trace, "threw — " + errText(e), "error");
+    api.log("error", "Download with yt-dlp failed: " + errText(e), "ytdlp");
+    api.ui.showNotification("Couldn't find a download for “" + clean + "”.");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Downloads — yt-dlp does the transcode AND embeds tags (metadata only)
 // ---------------------------------------------------------------------------
@@ -2512,6 +2559,14 @@ async function activate(api) {
   api.contextMenu.onAction("ytdlp-watch-video", function (target) {
     if (!target || !target.title) return;
     watchVideoFor(api, target.title, target.artistName || null);
+  });
+
+  // ---- Context menu: "Download with yt-dlp" (universal track action) ----
+  // Same universal-target shape as the watch item; opens the host's download
+  // modal (quality + destination) on the top search hit. See downloadTrackFor.
+  api.contextMenu.onAction("ytdlp-download-track", function (target) {
+    if (!target || !target.title) return;
+    downloadTrackFor(api, target);
   });
 
   // ---- Download provider: qualities ----

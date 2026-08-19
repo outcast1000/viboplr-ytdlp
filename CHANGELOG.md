@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.22.0
+- **New track action: "Download with yt-dlp…".** Right-click any track — library,
+  queue, playlist, a plugin view — and the plugin searches your configured
+  fallback source (YouTube by default) for it, then opens the app's download
+  dialog on the best hit: pick the quality (audio, or video when ffmpeg is
+  present) and where to save it. The file is tagged with the track's own
+  title/artist/album, not the uploader's video title. This restores what the
+  app's removed "Download from yt-dlp…" entry did, as the plugin's own menu
+  item — the app no longer generates download entries for providers.
+
 ## v1.21.1
 - Its own icon: YouTube’s play button, replacing a generic download arrow. The
   qBittorrent plugin had picked the same glyph, so the two were indistinguishable

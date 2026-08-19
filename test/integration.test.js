@@ -67,7 +67,7 @@ test("registers all expected handlers", async () => {
     "action:ytdlp-search-submit", "action:ytdlp-play", "action:ytdlp-watch",
     "action:ytdlp-queue-video", "action:ytdlp-download",
     "action:ytdlp-playback-mode", "action:ytdlp-cache-size",
-    "ctx:ytdlp-watch-video",
+    "ctx:ytdlp-watch-video", "ctx:ytdlp-download-track",
   ];
   for (const h of expected) assert.ok(api._handlers[h], "missing handler: " + h);
 });
@@ -420,6 +420,37 @@ test("context-menu 'Watch YouTube video' notifies and does not play when yt-dlp 
   api._handlers["ctx:ytdlp-watch-video"]({ kind: "track", title: "Creep", artistName: "Radiohead" });
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(api.calls.playTracks.length, 0);
+  assert.ok(api.calls.showNotification.some((m) => /yt-dlp isn't installed/.test(m)));
+});
+
+test("context-menu 'Download with yt-dlp' searches and opens the download modal with the track's own metadata", async () => {
+  const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  api._handlers["ctx:ytdlp-download-track"]({ kind: "track", title: "Creep", artistName: "Radiohead", albumTitle: "Pablo Honey" });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(api.calls.requestAction.length, 1);
+  const { action, payload } = api.calls.requestAction[0];
+  assert.equal(action, "download-tracks");
+  assert.equal(payload.providerId, "ytdlp:ytdlp-download");
+  assert.equal(payload.providerName, "yt-dlp");
+  assert.equal(payload.tracks.length, 1);
+  const t = payload.tracks[0];
+  // The modal's tags/filename come from the TARGET track, not the video title.
+  assert.equal(t.title, "Creep");
+  assert.equal(t.artist_name, "Radiohead");
+  assert.equal(t.album_title, "Pablo Honey");
+  // The uri is an AUDIO ref for the found page (video is a modal quality choice).
+  assert.ok(t.uri.startsWith("ytdlp://"), "must be a ytdlp:// ref");
+  assert.ok(!t.uri.endsWith(".mp4"), "download ref must be the audio ref");
+  assert.equal(t.uri, plugin._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", false));
+  // Nothing plays — the modal owns the flow from here.
+  assert.equal(api.calls.playTracks.length, 0);
+});
+
+test("context-menu 'Download with yt-dlp' notifies and opens nothing when yt-dlp is unavailable", async () => {
+  const { api } = await activated({ exec: [] }); // no tools
+  api._handlers["ctx:ytdlp-download-track"]({ kind: "track", title: "Creep", artistName: "Radiohead" });
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(api.calls.requestAction.length, 0);
   assert.ok(api.calls.showNotification.some((m) => /yt-dlp isn't installed/.test(m)));
 });
 
