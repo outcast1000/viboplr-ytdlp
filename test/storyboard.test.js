@@ -23,10 +23,10 @@ const SHORT = [
   sb("sb0", 320, 180, 3, 3, 12, 17.75),
 ];
 
-test("picks the largest readable tile within the sheet budget", () => {
+test("picks the cheapest readable tile within the sheet budget", () => {
   const b = plugin._storyboardFromFormats(SHORT);
-  // sb0 has bigger tiles but needs 12 sheets (over budget); sb2/sb3 tiles are too
-  // small to read in the hover bubble. sb1 at 5 sheets is the fit.
+  // sb0 has bigger tiles but costs 12 sheets against sb1's 5 for no visible gain
+  // in the 240px bubble; sb2/sb3 tiles are too small to read. sb1 is the fit.
   assert.equal(b.id, "sb1");
   assert.equal(b.tileW, 160);
   assert.equal(b.sheets.length, 5);
@@ -48,16 +48,41 @@ test("keeps remote urls for the caller to download", () => {
   assert.ok(b.sheets[0].includes("sqp="));
 });
 
-test("falls back to the cheapest level when none are both readable and cheap", () => {
-  // A 3-hour video: sb1 would be 45 sheets, sb0 124 — only the coarse level is cheap.
+test("an hour-long video still gets the readable sb1", () => {
+  // ~1h at the 10s ceiling interval: sb1 is 15 sheets — inside the raised budget.
+  // Under the old cap of 8 this fell all the way to sb3 (48x27, 36s/tile).
+  const HOUR = [
+    sb("sb3", 48, 27, 10, 10, 1, 3565.0),
+    sb("sb2", 80, 45, 10, 10, 4, 999.0),
+    sb("sb1", 160, 90, 5, 5, 15, 249.0),
+  ];
+  const b = plugin._storyboardFromFormats(HOUR);
+  assert.equal(b.id, "sb1");
+  assert.equal(b.sheets.length, 15);
+});
+
+test("falls back to the biggest in-budget tile when nothing readable fits", () => {
+  // A 3-hour video: sb1 would be 45 sheets (over budget), sb0 even more. sb2 at
+  // 12 sheets keeps the ~10s interval; sb3's interval is duration/100 (111s/tile
+  // here) — an overview strip, useless for seeking — so it must NOT win on being
+  // the single cheapest sheet.
   const LONG = [
     sb("sb3", 48, 27, 10, 10, 1, 11138.0),
     sb("sb2", 80, 45, 10, 10, 12, 999.0),
     sb("sb1", 160, 90, 5, 5, 45, 49.3),
   ];
   const b = plugin._storyboardFromFormats(LONG);
-  assert.equal(b.id, "sb3", "cheapest download wins when nothing qualifies");
-  assert.equal(b.sheets.length, 1);
+  assert.equal(b.id, "sb2", "biggest tile within the sheet budget wins");
+  assert.equal(b.sheets.length, 12);
+});
+
+test("only when no level fits the budget does fewest downloads win", () => {
+  const HUGE = [
+    sb("sb2", 80, 45, 10, 10, 40, 999.0),
+    sb("sb1", 160, 90, 5, 5, 120, 49.3),
+  ];
+  const b = plugin._storyboardFromFormats(HUGE);
+  assert.equal(b.id, "sb2");
 });
 
 test("returns null when the source publishes no storyboards", () => {

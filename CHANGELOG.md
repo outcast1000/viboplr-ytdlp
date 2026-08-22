@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.22.1
+- **Sharper seek-preview filmstrips on long videos.** The storyboard picker's
+  sheet budget doubles (8 → 16), so the readable 160×90 level (sb1) now covers
+  videos up to about an hour — previously anything past ~33 minutes fell all
+  the way to the 48×27 overview strip (sb3), whose tile interval is
+  duration/100 and useless for seeking. Even longer videos now fall back to
+  the biggest level that fits the budget (sb2, ~10s per tile) instead of sb3.
+  Among readable levels the cheapest wins, so short videos keep choosing sb1
+  over the 2-3× heavier sb0. Already-cached storyboards are reused as-is; the
+  sharper pick applies to videos resolved from now on.
+
+
 ## v1.22.0
 - **New track action: "Download with yt-dlp…".** Right-click any track — library,
   queue, playlist, a plugin view — and the plugin searches your configured

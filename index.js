@@ -1917,9 +1917,11 @@ function selfContainedUrl(candidates) {
 // Sheets to download for one track. YouTube publishes the same ~2-10s interval at
 // every level and grows the SHEET COUNT instead of the interval, so a 3-hour video
 // is 45 sheets at 160x90 but only 1 at 48x27. This caps the download; the picker
-// trades tile size for staying under it.
-var STORYBOARD_MAX_SHEETS = 8;
-// Below this a tile is too small to read in the host's hover bubble (~176px wide).
+// trades tile size for staying under it. 16 is sized so sb1 (160x90, 25 tiles per
+// sheet, ~35KB each) still qualifies for an hour-long video (~15 sheets at the 10s
+// ceiling interval) — under the old cap of 8 those videos fell all the way to sb3.
+var STORYBOARD_MAX_SHEETS = 16;
+// Below this a tile is too small to read in the host's hover bubble (240px wide).
 var STORYBOARD_MIN_TILE_W = 120;
 
 // Pure: choose a storyboard level from a yt-dlp formats array and describe it in the
@@ -1962,17 +1964,30 @@ function storyboardFromFormats(formats) {
   }
   if (!levels.length) return null;
 
-  // Prefer a readable tile size within the sheet budget; largest tile wins, fewest
-  // sheets breaks ties. If nothing qualifies, take whatever needs fewest downloads
-  // (a long video's only cheap level is the coarse one).
-  var eligible = levels.filter(function (l) {
-    return l.sheets.length <= STORYBOARD_MAX_SHEETS && l.tileW >= STORYBOARD_MIN_TILE_W;
-  });
-  var pool = eligible.length ? eligible : levels.slice();
-  pool.sort(function (a, b) {
-    if (eligible.length && b.tileW !== a.tileW) return b.tileW - a.tileW;
-    return a.sheets.length - b.sheets.length;
-  });
+  // Cheapest readable level within the sheet budget wins: fewest sheets among the
+  // levels whose tiles read in the hover bubble (sb1 over sb0 — 240px from 160 is
+  // fine, and sb0 costs 2-3x the bytes). When no readable level fits the budget
+  // (very long videos), take the biggest tile that DOES fit — sb2's ~10s interval
+  // still seeks, whereas sb3's duration/100 interval does not (111s/tile at 3h).
+  // Only when nothing fits the budget at all does fewest-downloads win outright.
+  var inBudget = levels.filter(function (l) { return l.sheets.length <= STORYBOARD_MAX_SHEETS; });
+  var readable = inBudget.filter(function (l) { return l.tileW >= STORYBOARD_MIN_TILE_W; });
+  if (readable.length) {
+    readable.sort(function (a, b) {
+      if (a.sheets.length !== b.sheets.length) return a.sheets.length - b.sheets.length;
+      return b.tileW - a.tileW;
+    });
+    return readable[0];
+  }
+  if (inBudget.length) {
+    inBudget.sort(function (a, b) {
+      if (b.tileW !== a.tileW) return b.tileW - a.tileW;
+      return a.sheets.length - b.sheets.length;
+    });
+    return inBudget[0];
+  }
+  var pool = levels.slice();
+  pool.sort(function (a, b) { return a.sheets.length - b.sheets.length; });
   return pool[0];
 }
 
@@ -1990,6 +2005,9 @@ var STORYBOARD_CACHE_KEY = "storyboardCache";
 var STORYBOARD_CACHE_MAX = 200;
 // Bump when the cached shape or the level picker changes, so entries written by an
 // older build are ignored rather than replayed against new expectations.
+// Deliberately NOT bumped for the sheet-budget raise / in-budget fallback: a v1
+// entry (possibly a coarser level than the picker would choose today) is still a
+// valid, working storyboard, and reusing it beats re-downloading every sheet.
 var STORYBOARD_CACHE_VERSION = 1;
 
 // Pure: insert `entry` under `stem`, dropping the oldest entries past `max`. Re-putting
