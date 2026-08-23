@@ -1,5 +1,41 @@
 # Changelog
 
+## v1.24.0
+- **New "Web" search tab: web indexers.** The sidebar gains a Web tab that
+  searches websites *directly* — no yt-dlp involved in the search itself —
+  and plays whatever you pick through yt-dlp like any other result. Three
+  sites are built in and on by default: **Dailymotion**, the **Internet
+  Archive** (audio items, ranked by downloads) and **PeerTube** (the whole
+  federation, via SepiaSearch). Results from all enabled sites are merged
+  round-robin so each site's best rows surface, every row names the site that
+  found it, and a summary line under the search box reports how each site
+  answered ("Dailymotion 25 · Internet Archive 3 · PeerTube: HTTP 403") — a
+  failing site never sinks the others.
+- **Indexers are definitions, not code** (the qBittorrent plugin's model,
+  Jackett's idea): a small JSON document says how to build the search URL and
+  how to read rows out of the response — a JSON path, RSS tags, or CSS
+  selectors over HTML. Settings → yt-dlp → **Web search** has a toggle and a
+  session health note per site, **View JSON** / **Export all** to copy
+  definitions out, and a paste box to import your own (one or a whole array;
+  bad definitions are rejected with plain-English errors and a bad one in a
+  batch aborts the whole import). Adding a site yt-dlp supports is pasting a
+  definition, never a plugin release. See the README for the format.
+- **One-click catalog: the easy way to add sites.** Settings → Web search →
+  **Browse catalog** fetches a curated list of ready-made definitions from the
+  plugin's repository and adds any of them with one click — no JSON in sight.
+  It opens with **Mixcloud** (DJ mixes and radio shows), **Niconico** and
+  **Internet Archive · Video**; new catalog sites reach every user the moment
+  they land in the repo, without a plugin update. An installed catalog site
+  behaves exactly like a pasted one (toggle / View JSON / Remove). Every
+  catalog entry is held to the bundled-def bar: validated, fixture-pinned in
+  tests, and verified playable through yt-dlp — which is why Audius is absent
+  (its search works, but yt-dlp's audius extractor is currently broken).
+- **Import by link.** The paste box also takes a URL — a gist or repo raw
+  link to a definition, an array of them, or a whole catalog-shaped file —
+  and imports what it fetches, so sharing an indexer is sharing a link.
+- Searching the Web tab works even while yt-dlp is missing — the sweep is
+  plain HTTP; only playing a result needs the binary (the banner explains).
+
 ## v1.23.0
 - **The fake `.mp4` ref suffix is retired.** Audio-vs-video now travels the
   documented way, both directions: every track the plugin hands the host

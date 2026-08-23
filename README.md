@@ -37,6 +37,105 @@ from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via
 - **Drop-in for the YouTube plugin.** Registers the `ytdlp://` scheme for its own
   tracks and also keeps legacy `youtube://` tracks (from the old plugin) playable
   and downloadable.
+- **Web search with web indexers.** The **Web** tab searches websites *directly*
+  (plain HTTP — yt-dlp is only used to play what you pick) via small JSON
+  definitions, and you can add your own. See below.
+
+## Web search (indexers)
+
+The **Web** tab sweeps every enabled indexer in parallel and merges the results
+round-robin, so each site's best rows surface first. Every row names the site
+that found it, and a summary line under the search box reports how each site
+answered (`Dailymotion 25 · Internet Archive 3 · PeerTube: HTTP 403`) — a site
+that is down, blocked or redesigned never sinks the others. Results are normal
+rows: Play / Queue / Watch / Download, right-click and drag-to-queue all work,
+because each row is a page URL yt-dlp can play.
+
+Three indexers are built in and on by default:
+
+- **Dailymotion** (its JSON API),
+- **Internet Archive** (audio items, title-matched, ranked by downloads),
+- **PeerTube** (the whole federation, via [SepiaSearch](https://sepiasearch.org)).
+
+Toggle each under **Settings → yt-dlp → Web search**, where a per-site health
+note shows how it's doing this session.
+
+### Adding more sites
+
+The easy way is the **catalog**: press **Browse catalog** in Settings → Web
+search and add any listed site with one click — no JSON involved. The catalog
+is a curated list ([`webindexers/catalog.json`](webindexers/catalog.json))
+fetched from this repository at runtime, so new sites reach every user the
+moment they land on `main`, without a plugin update. It currently offers
+**Mixcloud**, **Niconico** and **Internet Archive · Video**. An installed
+catalog site behaves exactly like one you pasted: toggle it, View JSON it,
+remove it.
+
+Every catalog entry is held to the same bar as the bundled definitions —
+validated, pinned against a saved real response in the test suite, and
+verified playable through yt-dlp. (Audius is deliberately absent for now: its
+search API works, but yt-dlp's `audius` extractor is currently broken, and a
+one-click site whose plays fail is worse than none. Want a site added? Open an
+issue or PR against `webindexers/catalog.json` with a definition.)
+
+Each indexer is a **definition, not code** — a small JSON document saying how to
+build the search URL and read the result rows (the same model as the
+qBittorrent plugin's web indexers, which borrowed it from Jackett). Under the
+indexer list you can **view, export and import** these:
+
+- **View JSON** (per site) drops that definition into the edit box — copy it, or
+  tweak it and re-add it under a new id.
+- **Export all** fills the box with every indexer as a single JSON array (a
+  copy-out backup).
+- The box **imports one definition, an array of them, or a link** — paste an
+  exported set straight back in, or paste a URL (a gist, a repo raw link) to a
+  definition file or a catalog-shaped `{ "indexers": [...] }` file and the box
+  fetches and imports it, so sharing an indexer is sharing a link. Re-importing
+  a custom id that already exists **updates** it. Bad definitions are rejected
+  with plain-English errors, and a bad one in a batch aborts the whole import
+  so nothing half-applies.
+
+The format, briefly:
+
+```json
+{
+  "id": "mysite",
+  "name": "My Site",
+  "siteUrl": "https://mysite.example",
+  "type": "html",
+  "search": { "url": "https://mysite.example/search?q={q}" },
+  "rows": { "selector": "ul.results > li" },
+  "fields": {
+    "title":        { "selector": "a.title" },
+    "url":          { "selector": "a.title", "attribute": "href",
+                      "filters": [["prepend", "https://mysite.example"]] },
+    "uploader":     { "selector": ".by" },
+    "durationSecs": { "selector": ".time", "filters": [["parseDuration"]] },
+    "thumbnail":    { "selector": "img", "attribute": "src" },
+    "views":        { "selector": ".plays", "filters": [["parseInt"]] }
+  }
+}
+```
+
+`type` is `"json"`, `"rss"` or `"html"`. `{q}` is the URL-encoded query.
+`title` and `url` are required — `url` must come out as the page's http(s) URL,
+which is what yt-dlp is handed to play or download; the site therefore has to
+be one yt-dlp supports. The other fields (`uploader`, `durationSecs`,
+`thumbnail`, `views`) are optional and simply enrich the row.
+
+- For a **JSON** site, fields use `path` — a dot path like `response.docs`
+  (a literal dotted key such as Dailymotion's `owner.screenname` also works).
+- For **RSS**, fields use `tag` (namespaced tags like `itunes:duration` work).
+- For **HTML**, fields use `selector` (+ optional `attribute`). Selectors
+  support tag / `.class` / `#id` / `[attr]` / `[attr=v]` / `[attr^=v]` /
+  `[attr*=v]` / compounds / descendant / `>` / `:nth-child(n)` — anything else
+  is rejected with a plain-English error at paste time.
+
+Filters (`trim`, `regex`, `parseInt`, `parseDuration`, `prepend`, `append`,
+`querystring`, `replace`) clean a value up; `parseDuration` turns `3:58` or
+`1:02:03` into seconds. Optional knobs: `limit` (rows per site, 1–50, default
+25), `search.timeoutMs` (2000–20000, default 10000), `search.minGapMs` (the
+per-host politeness gap, default 2500) and `search.headers`.
 
 ## Requirements
 

@@ -1,9 +1,35 @@
 {
   "id": "ytdlp",
   "name": "yt-dlp",
-  "version": "1.23.0",
+  "version": "1.24.0",
   "author": "Viboplr",
-  "description": "Play and download audio and video from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via yt-dlp. Replaces the YouTube plugin.",
+  "description": "Play and download audio and video from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via yt-dlp. Search the web directly with built-in and user-defined web indexers. Replaces the YouTube plugin.",
+  "apiUsage": [
+    {
+      "api": "system.exec",
+      "reason": "Run yt-dlp (search, resolve, download) and ffmpeg (merge and convert streams)"
+    },
+    {
+      "api": "network.fetch",
+      "reason": "Search websites directly (the Web tab's built-in and user-added web indexers)"
+    },
+    {
+      "api": "storage.set",
+      "reason": "Remember your settings, scoring profiles and web indexer definitions, and manage the audio/video cache"
+    },
+    {
+      "api": "playback.onStreamResolve",
+      "reason": "Play any track by finding it on YouTube or SoundCloud when it has no source of its own"
+    },
+    {
+      "api": "playback.onResolveStreamByUri",
+      "reason": "Play the exact video or track a ytdlp:// queue entry points at"
+    },
+    {
+      "api": "downloads.onResolveByMetadata",
+      "reason": "Download a track by finding it on your configured fallback source"
+    }
+  ],
   "minAppVersion": "1.0.34",
   "homepage": "https://github.com/outcast1000/viboplr-ytdlp",
   "updateUrl": "https://github.com/outcast1000/viboplr-ytdlp/releases/latest/download/update.json",

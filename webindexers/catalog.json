@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "_comment": "The web indexer catalog: ready-made definitions the plugin offers with one-click Add under Settings → yt-dlp → Web search. Fetched at runtime from this repository's main branch, so adding a site here reaches every user WITHOUT a plugin release. Every entry must pass validateWebIndexerDef and be pinned by a fixture test in test/webindexers.test.js — and its site must be one yt-dlp can actually play (Audius is deliberately absent: its search API works, but yt-dlp's audius extractor is currently broken, and a one-click site whose plays fail is worse than none). The optional top-level `description` is shown in the catalog UI and travels with the def on install.",
+  "indexers": [
+    {
+      "schemaVersion": 1,
+      "id": "mixcloud",
+      "name": "Mixcloud",
+      "description": "DJ mixes, radio shows and podcasts — searched by mix title.",
+      "siteUrl": "https://www.mixcloud.com",
+      "type": "json",
+      "search": { "url": "https://api.mixcloud.com/search/?q={q}&type=cloudcast&limit=25" },
+      "rows": { "path": "data" },
+      "fields": {
+        "title": { "path": "name" },
+        "url": { "path": "url" },
+        "uploader": { "path": "user.name" },
+        "durationSecs": { "path": "audio_length" },
+        "thumbnail": { "path": "pictures.large" },
+        "views": { "path": "play_count" }
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "niconico",
+      "name": "Niconico",
+      "description": "Japan's video community — title search, most-viewed first.",
+      "siteUrl": "https://www.nicovideo.jp",
+      "type": "json",
+      "search": { "url": "https://snapshot.search.nicovideo.jp/api/v2/snapshot/video/contents/search?q={q}&targets=title&fields=contentId,title,lengthSeconds,viewCounter,thumbnailUrl&_sort=-viewCounter&_limit=25" },
+      "rows": { "path": "data" },
+      "fields": {
+        "title": { "path": "title" },
+        "url": { "path": "contentId", "filters": [["prepend", "https://www.nicovideo.jp/watch/"]] },
+        "durationSecs": { "path": "lengthSeconds" },
+        "thumbnail": { "path": "thumbnailUrl" },
+        "views": { "path": "viewCounter" }
+      }
+    },
+    {
+      "schemaVersion": 1,
+      "id": "archive-video",
+      "name": "Internet Archive · Video",
+      "description": "Video items on archive.org — concerts, TV, film. Title-matched, ranked by downloads.",
+      "siteUrl": "https://archive.org",
+      "type": "json",
+      "search": { "url": "https://archive.org/advancedsearch.php?q=title%3A({q})%20AND%20mediatype%3A(movies)&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=creator&fl%5B%5D=downloads&rows=25&output=json" },
+      "rows": { "path": "response.docs" },
+      "fields": {
+        "title": { "path": "title" },
+        "url": { "path": "identifier", "filters": [["prepend", "https://archive.org/details/"]] },
+        "uploader": { "path": "creator" },
+        "thumbnail": { "path": "identifier", "filters": [["prepend", "https://archive.org/services/img/"]] },
+        "views": { "path": "downloads" }
+      }
+    }
+  ]
+}

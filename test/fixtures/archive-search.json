@@ -1,0 +1,1 @@
+{"responseHeader":{"status":0,"QTime":16,"params":{"query":"title:(bjork hyperballad) AND mediatype:audio","qin":"title:(bjork hyperballad) AND mediatype:(audio)","fields":"identifier,title,creator,downloads","wt":"json","rows":5,"start":0}},"response":{"numFound":1,"start":0,"docs":[{"downloads":44,"identifier":"bjork-hyperballad","title":"Bj\u00f6rk Hyperballad"}]}}

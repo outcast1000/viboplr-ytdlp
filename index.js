@@ -86,7 +86,9 @@ var VIDEO_RESOLUTIONS = [
 // search) and `meta` is a link fetch's playlist info ({ title, count }) or null.
 var tabState = {};
 function stateFor(source) {
-  if (!tabState[source]) tabState[source] = { query: "", results: null, meta: null };
+  // `webEngines` is only ever set on the Web tab: the per-indexer outcome of
+  // the sweep that produced `results` (see webSearchAll), for the summary line.
+  if (!tabState[source]) tabState[source] = { query: "", results: null, meta: null, webEngines: null };
   return tabState[source];
 }
 // One search runs at a time; searchingSource marks the tab that owns the
@@ -110,12 +112,17 @@ var convSeq = 0; // monotonic counter for unique temp filenames
 var SOURCES = {
   youtube:    { label: "YouTube",    prefix: "ytsearch" },
   soundcloud: { label: "SoundCloud", prefix: "scsearch" },
+  // The "Web" tab has no yt-dlp search extractor either — it sweeps the web
+  // indexer definitions (see "Web indexers" below) with plain HTTP and the
+  // result rows are page URLs yt-dlp can play. A pasted URL still goes
+  // through yt-dlp exactly like the other tabs.
+  web:        { label: "Web",        prefix: null },
   // The "Link" tab has no search extractor — it only takes a pasted URL, and a
   // playlist / album / set URL fans out into its entries (capped by LINK_MAX).
   link:       { label: "Link",       prefix: null }
 };
 // Ordered list for the source tabs.
-var SOURCE_ORDER = ["youtube", "soundcloud", "link"];
+var SOURCE_ORDER = ["youtube", "soundcloud", "web", "link"];
 // Cap on entries pulled from a pasted playlist/album/set, so an enormous list
 // can't flood the view or the queue. A single video returns one row, untouched.
 var LINK_MAX = 100;
@@ -2434,7 +2441,9 @@ async function activate(api) {
     api.storage.get("maxVideoHeight"),
     api.storage.get("debugScoring"),
     api.storage.get("scoringAudio"),
-    api.storage.get("scoringVideo")
+    api.storage.get("scoringVideo"),
+    api.storage.get("webIndexersDisabled"),
+    api.storage.get("customWebIndexers")
   ]);
   if (stored[0] != null && typeof stored[0] === "number") cacheMaxMb = stored[0];
   if (stored[1] === "download" || stored[1] === "stream") playbackMode = stored[1];
@@ -2446,6 +2455,10 @@ async function activate(api) {
   // keep their default), so tuning survives restarts and future param additions.
   scoringAudio = normalizeProfile("audio", stored[6]);
   scoringVideo = normalizeProfile("video", stored[7]);
+  // Web indexers: the user's disables and pasted definitions. Customs were
+  // validated at paste time; trusted as stored (same contract as qBittorrent's).
+  if (stored[8] && typeof stored[8] === "object") webIndexersDisabled = stored[8];
+  if (Object.prototype.toString.call(stored[9]) === "[object Array]") customWebIndexers = stored[9];
 
   // Startup cleanup: wipe transcoded temp files; keep cached source downloads.
   scheduleCleanup(api, true).catch(function (e) { api.log("warn", "Startup cache cleanup failed: " + (e && e.message ? e.message : e), "ytdlp"); });
@@ -2701,9 +2714,10 @@ async function activate(api) {
   api.downloads.onInteractiveSearch("ytdlp-download", async function (query, limit) {
     await ensureToolStatus(api);
     if (!ytDlpVersion) return [];
-    // The modal's manual search is free text; the prefix-less "Link" tab can't
-    // serve that, so fall back to the (always real) fallback search source.
-    var isearchSource = searchSource === "link" ? resolverSource : searchSource;
+    // The modal's manual search is free text; the prefix-less "Link" and "Web"
+    // tabs can't serve that (no yt-dlp search extractor), so fall back to the
+    // (always real) fallback search source.
+    var isearchSource = (searchSource === "link" || searchSource === "web") ? resolverSource : searchSource;
     var candidates = await runSearch(api, isearchSource, query, limit || 10);
     var out = [];
     for (var i = 0; i < candidates.length; i++) {
@@ -2817,20 +2831,33 @@ async function activate(api) {
     var source = searchSource;
     var st = stateFor(source);
     st.query = data && typeof data.query === "string" ? data.query : "";
-    if (!st.query.trim()) { st.results = null; st.meta = null; renderSearchView(api); return; }
+    if (!st.query.trim()) { st.results = null; st.meta = null; st.webEngines = null; renderSearchView(api); return; }
     await ensureToolStatus(api);
-    if (!ytDlpVersion) { renderSearchView(api); return; }
+    // The Web tab's sweep is plain HTTP — it can search without yt-dlp (only
+    // PLAYING a result needs it, and the banner already explains that). A
+    // pasted URL is a yt-dlp fetch on every tab, so it keeps the gate.
+    var webSweep = source === "web" && !isHttpUrl(st.query.trim());
+    if (!ytDlpVersion && !webSweep) { renderSearchView(api); return; }
     var gen = ++searchGen;
     searching = true; searchingSource = source; renderSearchView(api);
     try {
-      var full = await runSearchFull(api, source, st.query, 25);
-      if (gen !== searchGen) return; // cancelled/superseded
-      st.results = full.candidates;
-      st.meta = full.meta;
+      if (webSweep) {
+        var sweep = await runWebSearch(api, st.query);
+        if (gen !== searchGen) return; // cancelled/superseded
+        st.results = sweep.candidates;
+        st.meta = null;
+        st.webEngines = sweep.engines;
+      } else {
+        var full = await runSearchFull(api, source, st.query, 25);
+        if (gen !== searchGen) return; // cancelled/superseded
+        st.results = full.candidates;
+        st.meta = full.meta;
+        st.webEngines = null;
+      }
     } catch (e) {
       if (gen !== searchGen) return;
       api.log("error", "Search failed: " + (e && e.message ? e.message : e), "ytdlp");
-      st.results = []; st.meta = null;
+      st.results = []; st.meta = null; st.webEngines = null;
     }
     searching = false; searchingSource = null; renderSearchView(api);
   });
@@ -2971,6 +2998,189 @@ async function activate(api) {
     lastResolve = null; renderSearchView(api);
   });
 
+  // ---- Settings: web indexers ----
+  function persistWebIndexers() {
+    api.storage.set("webIndexersDisabled", webIndexersDisabled)
+      .catch(function (e) { console.error("[ytdlp] persist webIndexersDisabled failed:", e); });
+    api.storage.set("customWebIndexers", customWebIndexers)
+      .catch(function (e) { console.error("[ytdlp] persist customWebIndexers failed:", e); });
+  }
+  var registerWebIndexerActions = function (def) {
+    api.ui.onAction("ytdlp-webidx-" + def.id, function (data) {
+      var on = !!(data && (data.checked === undefined ? data.value : data.checked));
+      if (on) delete webIndexersDisabled[def.id];
+      else webIndexersDisabled[def.id] = true;
+      persistWebIndexers();
+      renderSettings(api);
+      renderSearchView(api);
+    });
+    api.ui.onAction("ytdlp-webdel-" + def.id, function () {
+      for (var i = 0; i < customWebIndexers.length; i++) {
+        if (customWebIndexers[i].id === def.id) {
+          customWebIndexers.splice(i, 1);
+          break;
+        }
+      }
+      delete webIndexersDisabled[def.id];
+      persistWebIndexers();
+      renderSettings(api);
+      renderSearchView(api);
+    });
+    api.ui.onAction("ytdlp-webview-" + def.id, function () {
+      // The live definition (bundled or custom) into the box, to read, copy,
+      // or tweak-and-re-Add under a new id.
+      webIndexerDraft = JSON.stringify(webDefById(def.id) || def, null, 2);
+      renderSettings(api);
+    });
+  };
+  for (var wd = 0; wd < WEB_DEFS.length; wd++) registerWebIndexerActions(WEB_DEFS[wd]);
+  for (var cwd = 0; cwd < customWebIndexers.length; cwd++) registerWebIndexerActions(customWebIndexers[cwd]);
+
+  api.ui.onAction("ytdlp-web-draft", function (data) {
+    webIndexerDraft = (data && data.value) || "";
+  });
+  api.ui.onAction("ytdlp-web-add", async function () {
+    var text = webIndexerDraft.trim();
+    if (!text) {
+      api.ui.showNotification("Paste an indexer definition first");
+      return;
+    }
+    // A pasted LINK is fetched and its body takes the pasted JSON's place —
+    // sharing a definition becomes sharing a URL.
+    if (isHttpUrl(text)) {
+      try {
+        var resp = await api.network.fetch(text, { method: "GET", timeoutMs: WEB_TIMEOUT_MS });
+        var status = Number(resp && resp.status) || 0;
+        if (status < 200 || status >= 300) throw new Error("HTTP " + status);
+        text = (await resp.text()).trim();
+      } catch (fe) {
+        console.error("[ytdlp] indexer import fetch failed:", fe);
+        api.ui.showNotification("Couldn't fetch that link: " + errText(fe));
+        return;
+      }
+    }
+    var parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      api.ui.showNotification("That isn't valid JSON: " + errText(e));
+      return;
+    }
+    // A fetched catalog-shaped file ({ indexers: [...] }) imports as its
+    // definition list — pointing the box at someone's whole catalog works.
+    if (parsed && !parsed.id && Object.prototype.toString.call(parsed.indexers) === "[object Array]") {
+      parsed = parsed.indexers;
+    }
+    // One definition or an array of them — importing several at once is the
+    // same path, so a box filled by "Export all" round-trips straight back in.
+    var incoming = Object.prototype.toString.call(parsed) === "[object Array]" ? parsed : [parsed];
+    if (!incoming.length) {
+      api.ui.showNotification("Nothing to add");
+      return;
+    }
+    var taken = {};
+    var all = WEB_DEFS.concat(customWebIndexers);
+    for (var i = 0; i < all.length; i++) taken[all[i].id] = true;
+    // Re-importing an EXISTING custom id replaces that definition rather than
+    // being rejected as a duplicate — that is how you edit one via View JSON.
+    var accepted = [];
+    for (var d = 0; d < incoming.length; d++) {
+      var def = incoming[d];
+      var replacing = def && customWebIndexers.some(function (c) { return c.id === def.id; });
+      var checkAgainst = {};
+      for (var k in taken) if (!(replacing && k === def.id)) checkAgainst[k] = true;
+      var problems = validateWebIndexerDef(def, checkAgainst);
+      if (problems.length) {
+        api.ui.showNotification("“" + ((def && def.name) || (def && def.id) || "definition " + (d + 1)) + "”: " + problems.slice(0, 2).join(" · "));
+        return; // all-or-nothing: a bad one in the batch aborts, box kept
+      }
+      accepted.push({ def: def, replacing: replacing });
+      taken[def.id] = true;
+    }
+    for (var a = 0; a < accepted.length; a++) {
+      var it = accepted[a];
+      if (it.replacing) {
+        for (var r = 0; r < customWebIndexers.length; r++) {
+          if (customWebIndexers[r].id === it.def.id) {
+            customWebIndexers[r] = it.def;
+            break;
+          }
+        }
+      } else {
+        customWebIndexers.push(it.def);
+        registerWebIndexerActions(it.def);
+      }
+    }
+    webIndexerDraft = "";
+    persistWebIndexers();
+    api.ui.showNotification(
+      accepted.length === 1
+        ? (accepted[0].replacing ? "Updated “" : "Added “") + accepted[0].def.name + "” — it joins every Web search from now on"
+        : "Imported " + accepted.length + " indexers"
+    );
+    renderSettings(api);
+    renderSearchView(api);
+  });
+  api.ui.onAction("ytdlp-web-export", function () {
+    // Every indexer — bundled and custom — as an array, ready to copy out or
+    // paste back in. The full set is what makes it a backup.
+    webIndexerDraft = JSON.stringify(WEB_DEFS.concat(customWebIndexers), null, 2);
+    renderSettings(api);
+  });
+  api.ui.onAction("ytdlp-web-clear", function () {
+    webIndexerDraft = "";
+    renderSettings(api);
+  });
+
+  // ---- Settings: the indexer catalog ----
+  api.ui.onAction("ytdlp-web-catalog", async function () {
+    if (webCatalogBusy) return;
+    webCatalogBusy = true;
+    webCatalogError = null;
+    renderSettings(api);
+    try {
+      var resp = await api.network.fetch(WEB_CATALOG_URL, { method: "GET", timeoutMs: WEB_TIMEOUT_MS });
+      var status = Number(resp && resp.status) || 0;
+      if (status < 200 || status >= 300) throw new Error("HTTP " + status);
+      var parsed = parseWebCatalog(await resp.text());
+      // A bad entry is the catalog author's bug, not the user's — name it in
+      // the console and show the rest.
+      for (var p = 0; p < parsed.problems.length; p++) console.error("[ytdlp] catalog entry skipped:", parsed.problems[p]);
+      webCatalog = { entries: parsed.entries };
+    } catch (e) {
+      console.error("[ytdlp] catalog fetch failed:", e);
+      webCatalogError = errText(e);
+    }
+    webCatalogBusy = false;
+    renderSettings(api);
+  });
+  api.ui.onAction("ytdlp-webcat-add", function (data) {
+    var id = data && data.id;
+    if (!id || !webCatalog) return;
+    var entry = null;
+    for (var i = 0; i < webCatalog.entries.length; i++) {
+      if (webCatalog.entries[i].id === id) entry = webCatalog.entries[i];
+    }
+    if (!entry) return;
+    var taken = {};
+    var all = WEB_DEFS.concat(customWebIndexers);
+    for (var t = 0; t < all.length; t++) taken[all[t].id] = true;
+    // Entries validated at parse time; this re-check is for the id clash —
+    // "already added" (the button should be disabled, but a stale render
+    // could still deliver the click).
+    var problems = validateWebIndexerDef(entry, taken);
+    if (problems.length) {
+      api.ui.showNotification("“" + entry.name + "”: " + problems.slice(0, 2).join(" · "));
+      return;
+    }
+    customWebIndexers.push(entry);
+    registerWebIndexerActions(entry);
+    persistWebIndexers();
+    api.ui.showNotification("Added “" + entry.name + "” — it joins every Web search from now on");
+    renderSettings(api);
+    renderSearchView(api);
+  });
+
   renderSettings(api);
   renderSearchView(api);
 
@@ -2989,6 +3199,1061 @@ async function activate(api) {
 // dropdown could only queue a blind top hit. Removing it also stops Cmd+K being
 // a second, cheap way to spend yt-dlp searches against YouTube's bot gate —
 // every one of those is a real extractor call.
+
+// ---------------------------------------------------------------------------
+// Web indexers — search WEBSITES directly, play the results through yt-dlp
+// ---------------------------------------------------------------------------
+//
+// The idea (borrowed from the qBittorrent plugin, which borrowed it from
+// Jackett) is indexers as DATA, not code: a JSON definition per site says how
+// to build the search URL and how to read rows out of the response (JSON
+// path, RSS tags, or CSS selectors over HTML). Each row is a page URL — and
+// yt-dlp plays page URLs from 1000+ sites, so a definition is all it takes to
+// make a site searchable from the sidebar. Adding a site is pasting a
+// definition in settings, never a plugin release.
+//
+// The sandbox has no DOM — `document` is shadowed and DOMParser is off the
+// sandbox contract — so HTML is parsed by the small tolerant parser below.
+// It is NOT a browser parser and says so: no adoption agency (misnested
+// <b><i></b></i>), no table foster-parenting, no <template>, no SVG/MathML
+// foreign-content rules, no encodings beyond what the host already decoded.
+// Search-result markup doesn't need any of that; the auto-close rules cover
+// the tag soup real sites actually serve.
+
+// Which definitions are switched off (bundled ones stay in the list, just
+// disabled), and the user's own pasted definitions. Both persisted.
+var webIndexersDisabled = {};
+var customWebIndexers = [];
+// The settings paste box for a new indexer definition. Session-only draft.
+var webIndexerDraft = "";
+// In-memory health per def id — { ok, fail, lastError } — for the settings
+// note. Session-only.
+var webIndexerStats = {};
+
+// --- Markup parser ------------------------------------------------------------
+
+var VOID_ELEMENTS = {
+  area: 1, base: 1, br: 1, col: 1, embed: 1, hr: 1, img: 1, input: 1,
+  link: 1, meta: 1, param: 1, source: 1, track: 1, wbr: 1
+};
+// Content is text until the matching close tag — a script containing the
+// string "</table>" must not close the table.
+var RAW_TEXT_ELEMENTS = { script: 1, style: 1, textarea: 1, title: 1 };
+// Opening the KEY implicitly closes an open VALUE at the top of the stack,
+// repeatedly. This is the whole tag-soup story for result lists: sites
+// routinely omit </td>, </tr> and </li>.
+var AUTO_CLOSE = {
+  li: { li: 1, p: 1 },
+  p: { p: 1 },
+  div: { p: 1 },
+  table: { p: 1 },
+  ul: { p: 1 },
+  ol: { p: 1 },
+  tr: { td: 1, th: 1, tr: 1 },
+  td: { td: 1, th: 1 },
+  th: { td: 1, th: 1 },
+  thead: { td: 1, th: 1, tr: 1, tbody: 1, tfoot: 1, thead: 1 },
+  tbody: { td: 1, th: 1, tr: 1, thead: 1, tfoot: 1, tbody: 1 },
+  tfoot: { td: 1, th: 1, tr: 1, thead: 1, tbody: 1, tfoot: 1 },
+  option: { option: 1 }
+};
+
+var NAMED_ENTITIES = { amp: "&", lt: "<", gt: ">", quot: "\"", apos: "'", nbsp: " " };
+
+// Full entity decode for markup attribute/text nodes. Distinct from
+// decodeHtmlEntities above, which handles the fixed few yt-dlp --print emits;
+// this one also takes hex/decimal references in one pass over parser output.
+function decodeMarkupEntities(s) {
+  var str = String(s == null ? "" : s);
+  if (str.indexOf("&") === -1) return str;
+  return str.replace(/&(#[xX]?[0-9a-fA-F]+|[a-zA-Z]+);/g, function (whole, body) {
+    if (body.charAt(0) === "#") {
+      var hex = body.charAt(1) === "x" || body.charAt(1) === "X";
+      var code = parseInt(body.substring(hex ? 2 : 1), hex ? 16 : 10);
+      // No surrogate pairs — an astral emoji entity in a title degrades to
+      // the raw entity text, which is fine.
+      return isFinite(code) && code > 0 && code < 0xffff ? String.fromCharCode(code) : whole;
+    }
+    var lower = body.toLowerCase();
+    return Object.prototype.hasOwnProperty.call(NAMED_ENTITIES, lower) ? NAMED_ENTITIES[lower] : whole;
+  });
+}
+
+// Parse HTML (htmlMode) or XML/RSS (!htmlMode) into a tree of
+// { tag, attrs, children, parent } elements and { text, parent } text nodes.
+// `parent` pointers exist for the selector combinators — a node is NOT
+// JSON-serializable.
+function parseMarkup(text, htmlMode) {
+  var src = String(text == null ? "" : text);
+  var root = { tag: "#root", attrs: {}, children: [], parent: null };
+  var stack = [root];
+  var i = 0;
+  var n = src.length;
+
+  var top = function () {
+    return stack[stack.length - 1];
+  };
+  var addText = function (raw, skipDecode) {
+    if (!raw) return;
+    top().children.push({ text: skipDecode ? raw : decodeMarkupEntities(raw), parent: top() });
+  };
+
+  while (i < n) {
+    var lt = src.indexOf("<", i);
+    if (lt === -1) {
+      addText(src.substring(i));
+      break;
+    }
+    if (lt > i) addText(src.substring(i, lt));
+
+    if (src.substr(lt, 4) === "<!--") {
+      var endComment = src.indexOf("-->", lt + 4);
+      i = endComment === -1 ? n : endComment + 3;
+      continue;
+    }
+    if (src.substr(lt, 9) === "<![CDATA[") {
+      var endCdata = src.indexOf("]]>", lt + 9);
+      addText(src.substring(lt + 9, endCdata === -1 ? n : endCdata), true);
+      i = endCdata === -1 ? n : endCdata + 3;
+      continue;
+    }
+    var next = src.charAt(lt + 1);
+    if (next === "!" || next === "?") {
+      var endDecl = src.indexOf(">", lt + 1);
+      i = endDecl === -1 ? n : endDecl + 1;
+      continue;
+    }
+    if (next === "/") {
+      var endClose = src.indexOf(">", lt + 2);
+      var closeName = src
+        .substring(lt + 2, endClose === -1 ? n : endClose)
+        .replace(/[\s/].*$/, "")
+        .toLowerCase();
+      if (closeName) {
+        // Pop to the nearest matching open tag anywhere in the stack (closing
+        // everything in between); a close nothing opened is ignored.
+        for (var s = stack.length - 1; s >= 1; s--) {
+          if (stack[s].tag === closeName) {
+            stack.length = s;
+            break;
+          }
+        }
+      }
+      i = endClose === -1 ? n : endClose + 1;
+      continue;
+    }
+    if (!/[a-zA-Z]/.test(next)) {
+      // A bare "<" in text ("<3 plays") is text, not markup.
+      addText("<");
+      i = lt + 1;
+      continue;
+    }
+
+    // Opening tag: name, then attributes in their quoting variants.
+    var j = lt + 1;
+    while (j < n && /[^\s/>]/.test(src.charAt(j))) j++;
+    var tag = src.substring(lt + 1, j).toLowerCase();
+    var attrs = {};
+    var selfClosed = false;
+    while (j < n) {
+      while (j < n && /\s/.test(src.charAt(j))) j++;
+      var ch = src.charAt(j);
+      if (ch === ">") {
+        j++;
+        break;
+      }
+      if (ch === "/") {
+        if (src.charAt(j + 1) === ">") {
+          selfClosed = true;
+          j += 2;
+          break;
+        }
+        j++;
+        continue;
+      }
+      if (j >= n) break;
+      var nameStart = j;
+      while (j < n && /[^\s=/>]/.test(src.charAt(j))) j++;
+      var attrName = src.substring(nameStart, j).toLowerCase();
+      while (j < n && /\s/.test(src.charAt(j))) j++;
+      var attrValue = "";
+      if (src.charAt(j) === "=") {
+        j++;
+        while (j < n && /\s/.test(src.charAt(j))) j++;
+        var quote = src.charAt(j);
+        if (quote === "\"" || quote === "'") {
+          var endQuote = src.indexOf(quote, j + 1);
+          attrValue = src.substring(j + 1, endQuote === -1 ? n : endQuote);
+          j = endQuote === -1 ? n : endQuote + 1;
+        } else {
+          var valueStart = j;
+          while (j < n && /[^\s>]/.test(src.charAt(j))) j++;
+          attrValue = src.substring(valueStart, j);
+        }
+      }
+      if (attrName) attrs[attrName] = decodeMarkupEntities(attrValue);
+    }
+    i = j;
+
+    if (htmlMode) {
+      var closes = AUTO_CLOSE[tag];
+      while (closes && stack.length > 1 && closes[top().tag]) stack.pop();
+    }
+    var el = { tag: tag, attrs: attrs, children: [], parent: top() };
+    top().children.push(el);
+    var isVoid = htmlMode && VOID_ELEMENTS[tag];
+    if (!selfClosed && !isVoid) stack.push(el);
+
+    if (htmlMode && RAW_TEXT_ELEMENTS[tag] && !selfClosed) {
+      var closeRe = new RegExp("</" + tag + "[\\s>]", "i");
+      var match = closeRe.exec(src.substring(i));
+      var rawEnd = match ? i + match.index : n;
+      if (rawEnd > i) el.children.push({ text: src.substring(i, rawEnd), parent: el });
+      if (match) {
+        var gt = src.indexOf(">", rawEnd);
+        i = gt === -1 ? n : gt + 1;
+      } else {
+        i = n;
+      }
+      stack.pop();
+    }
+  }
+  return root;
+}
+
+// Concatenated descendant text, whitespace collapsed. What "the cell says".
+function nodeText(node) {
+  if (!node) return "";
+  if (node.text !== undefined) return String(node.text).replace(/\s+/g, " ").trim();
+  var out = [];
+  var walk = function (nd) {
+    var kids = nd.children || [];
+    for (var i = 0; i < kids.length; i++) {
+      if (kids[i].text !== undefined) out.push(kids[i].text);
+      else walk(kids[i]);
+    }
+  };
+  walk(node);
+  return out.join("").replace(/\s+/g, " ").trim();
+}
+
+// --- Selector engine ------------------------------------------------------------
+//
+// The supported subset: tag, .class, #id, [attr], [attr=v], [attr^=v],
+// [attr*=v], compounds, descendant (space), child (>), :nth-child(n).
+// Anything else is an ERROR, not a silent mismatch — the parser doubles as
+// the definition validator, so a user pasting ":not(...)" is told exactly
+// what isn't supported.
+
+function parseSelector(sel) {
+  var s = String(sel == null ? "" : sel).trim();
+  if (!s) return { error: "empty selector" };
+  var steps = [];
+  var i = 0;
+  var n = s.length;
+  var pendingComb = " ";
+  while (i < n) {
+    var step = { combinator: pendingComb, tag: "", id: "", classes: [], attrs: [], nth: 0 };
+    var compoundStart = i;
+    var tagStart = i;
+    // No ":" in tag names — a namespaced RSS tag (media:title) is reached via
+    // childByTag(), never a selector, and letting ":" into the name here would
+    // silently swallow ":nth-child" and every unsupported pseudo.
+    while (i < n && /[a-zA-Z0-9_*-]/.test(s.charAt(i))) i++;
+    if (i > tagStart) {
+      var tagName = s.substring(tagStart, i);
+      if (tagName !== "*") step.tag = tagName.toLowerCase();
+    }
+    var simpleLoop = true;
+    while (simpleLoop && i < n) {
+      var ch = s.charAt(i);
+      if (ch === ".") {
+        i++;
+        var classStart = i;
+        while (i < n && /[a-zA-Z0-9_-]/.test(s.charAt(i))) i++;
+        if (i === classStart) return { error: "empty class name in “" + sel + "”" };
+        step.classes.push(s.substring(classStart, i));
+      } else if (ch === "#") {
+        i++;
+        var idStart = i;
+        while (i < n && /[a-zA-Z0-9_-]/.test(s.charAt(i))) i++;
+        if (i === idStart) return { error: "empty id in “" + sel + "”" };
+        step.id = s.substring(idStart, i);
+      } else if (ch === "[") {
+        var closeBracket = s.indexOf("]", i);
+        if (closeBracket === -1) return { error: "unclosed [ in “" + sel + "”" };
+        var body = s.substring(i + 1, closeBracket);
+        i = closeBracket + 1;
+        var attrMatch = /^([a-zA-Z0-9_:-]+)\s*(?:([\^*]?=)\s*(.*))?$/.exec(body);
+        if (!attrMatch) return { error: "unsupported attribute selector “[" + body + "]” in “" + sel + "”" };
+        var rawValue = attrMatch[3] === undefined ? null : attrMatch[3].replace(/^["']/, "").replace(/["']$/, "");
+        step.attrs.push({ name: attrMatch[1].toLowerCase(), op: attrMatch[2] || "", value: rawValue });
+      } else if (ch === ":") {
+        var nthMatch = /^:nth-child\((\d+)\)/.exec(s.substring(i));
+        if (!nthMatch) return { error: "unsupported selector feature “" + s.substring(i, i + 12) + "…” in “" + sel + "”" };
+        step.nth = parseInt(nthMatch[1], 10);
+        i += nthMatch[0].length;
+      } else if (ch === "," || ch === "+" || ch === "~") {
+        return { error: "unsupported selector feature “" + ch + "” in “" + sel + "”" };
+      } else {
+        simpleLoop = false;
+      }
+    }
+    if (i === compoundStart) return { error: "could not parse “" + sel + "”" };
+    steps.push(step);
+    // Between compounds: whitespace = descendant, ">" = child.
+    var sawWs = false;
+    while (i < n && /\s/.test(s.charAt(i))) {
+      i++;
+      sawWs = true;
+    }
+    if (i < n && s.charAt(i) === ">") {
+      pendingComb = ">";
+      i++;
+      while (i < n && /\s/.test(s.charAt(i))) i++;
+    } else if (sawWs) {
+      pendingComb = " ";
+    } else if (i < n) {
+      return { error: "could not parse “" + sel + "” near “" + s.substring(i, i + 8) + "”" };
+    }
+  }
+  if (!steps.length) return { error: "empty selector" };
+  return { steps: steps };
+}
+
+function matchesStep(el, step) {
+  if (!el || el.text !== undefined || el.tag === "#root") return false;
+  if (step.tag && el.tag !== step.tag) return false;
+  if (step.id && el.attrs.id !== step.id) return false;
+  for (var c = 0; c < step.classes.length; c++) {
+    var classes = " " + (el.attrs["class"] || "") + " ";
+    if (classes.indexOf(" " + step.classes[c] + " ") === -1) return false;
+  }
+  for (var a = 0; a < step.attrs.length; a++) {
+    var spec = step.attrs[a];
+    var val = el.attrs[spec.name];
+    if (val === undefined) return false;
+    if (spec.value !== null) {
+      if (spec.op === "=" && val !== spec.value) return false;
+      if (spec.op === "^=" && val.indexOf(spec.value) !== 0) return false;
+      if (spec.op === "*=" && val.indexOf(spec.value) === -1) return false;
+    }
+  }
+  if (step.nth) {
+    var parent = el.parent;
+    if (!parent) return false;
+    var position = 0;
+    var kids = parent.children;
+    for (var k = 0; k < kids.length; k++) {
+      if (kids[k].text !== undefined) continue;
+      position++;
+      if (kids[k] === el) break;
+    }
+    if (position !== step.nth) return false;
+  }
+  return true;
+}
+
+// Verify the left part of the chain for an element that matched the rightmost
+// compound. Descendant combinators backtrack up the ancestor list.
+function matchesChain(el, steps, stepIdx) {
+  if (stepIdx === 0) return true;
+  var prev = steps[stepIdx - 1];
+  if (steps[stepIdx].combinator === ">") {
+    var parent = el.parent;
+    return !!(parent && matchesStep(parent, prev) && matchesChain(parent, steps, stepIdx - 1));
+  }
+  var anc = el.parent;
+  while (anc) {
+    if (matchesStep(anc, prev) && matchesChain(anc, steps, stepIdx - 1)) return true;
+    anc = anc.parent;
+  }
+  return false;
+}
+
+function selectAll(root, selector) {
+  var parsed = typeof selector === "string" ? parseSelector(selector) : selector;
+  if (!parsed || parsed.error || !root) return [];
+  var steps = parsed.steps;
+  var last = steps.length - 1;
+  var out = [];
+  var walk = function (node) {
+    var kids = node.children || [];
+    for (var i = 0; i < kids.length; i++) {
+      var el = kids[i];
+      if (el.text !== undefined) continue;
+      if (matchesStep(el, steps[last]) && matchesChain(el, steps, last)) out.push(el);
+      walk(el);
+    }
+  };
+  walk(root);
+  return out;
+}
+
+function selectFirst(root, selector) {
+  var all = selectAll(root, selector);
+  return all.length ? all[0] : null;
+}
+
+// First DIRECT child element with this tag name — the RSS field accessor
+// (handles namespaced names like "media:title", which selectors refuse).
+function childByTag(el, tagName) {
+  var name = String(tagName || "").toLowerCase();
+  var kids = (el && el.children) || [];
+  for (var i = 0; i < kids.length; i++) {
+    if (kids[i].text === undefined && kids[i].tag === name) return kids[i];
+  }
+  return null;
+}
+
+// --- Value filters ------------------------------------------------------------
+
+var KNOWN_WEB_FILTERS = { trim: 1, regex: 2, parseInt: 1, parseDuration: 1, prepend: 2, append: 2, querystring: 2, replace: 3 };
+
+function applyWebFilters(value, filters) {
+  var v = value == null ? "" : value;
+  var list = filters || [];
+  for (var i = 0; i < list.length; i++) {
+    var f = list[i];
+    var name = f && f[0];
+    if (name === "trim") v = String(v).trim();
+    else if (name === "regex") {
+      var rm = new RegExp(f[1]).exec(String(v));
+      v = rm ? (rm[1] !== undefined ? rm[1] : rm[0]) : "";
+    } else if (name === "parseDuration") {
+      // "3:58" / "1:02:03" / plain seconds → seconds. Same parser the Tuning
+      // tab's target-duration input uses.
+      v = parseDurationInput(String(v));
+    } else if (name === "parseInt") {
+      var cleaned = String(v)
+        .replace(/[\s ]/g, "")
+        .replace(/[.,](?=\d{3}(\D|$))/g, "");
+      var parsed = parseInt(cleaned, 10);
+      v = isNaN(parsed) ? null : parsed;
+    } else if (name === "prepend") v = String(f[1]) + String(v);
+    else if (name === "append") v = String(v) + String(f[1]);
+    else if (name === "querystring") {
+      var escaped = String(f[1]).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      var qm = new RegExp("[?&]" + escaped + "=([^&#]*)").exec(String(v));
+      v = qm ? decodeURIComponent(qm[1].replace(/\+/g, " ")) : "";
+    } else if (name === "replace") v = String(v).split(String(f[1])).join(String(f[2]));
+    // Unknown names are rejected by validateWebIndexerDef; at runtime they are
+    // skipped so one bad custom def degrades instead of throwing mid-sweep.
+  }
+  return v;
+}
+
+// --- Indexer definitions & engine ----------------------------------------------
+
+var WEB_TIMEOUT_MS = 10000;
+var WEB_MIN_GAP_MS = 2500;
+var WEB_GAP_JITTER_MS = 500;
+var WEB_DEF_ROW_CAP = 25;
+var WEB_TOTAL_ROW_CAP = 75;
+
+// Dot-path into a JSON value; "" is the value itself. Deliberately tiny — no
+// wildcards, no arrays-in-the-middle; nothing the bundled defs need. One
+// twist the qBittorrent original doesn't have: some APIs use LITERAL dotted
+// keys — Dailymotion's rows carry "owner.screenname" as one flat key — so
+// when a segment doesn't exist, the whole remaining path is tried as a
+// single key before giving up.
+function jsonPath(value, path) {
+  var p = String(path == null ? "" : path);
+  if (!p) return value;
+  var parts = p.split(".");
+  var v = value;
+  for (var i = 0; i < parts.length; i++) {
+    if (v == null || typeof v !== "object") return undefined;
+    if (!Object.prototype.hasOwnProperty.call(v, parts[i])) {
+      var rest = parts.slice(i).join(".");
+      return Object.prototype.hasOwnProperty.call(v, rest) ? v[rest] : undefined;
+    }
+    v = v[parts[i]];
+  }
+  return v;
+}
+
+function buildWebSearchUrl(def, query) {
+  return String(def.search.url).replace("{q}", encodeURIComponent(String(query == null ? "" : query)));
+}
+
+// Extract one field from one row per the def type. Returns the raw string
+// (before filters); "" when the source finds nothing.
+function extractWebField(spec, row, defType) {
+  if (defType === "json") {
+    var v = jsonPath(row, spec.path);
+    return v == null ? "" : String(v);
+  }
+  if (defType === "rss") {
+    var child = childByTag(row, spec.tag);
+    return child ? nodeText(child) : "";
+  }
+  var el = spec.selector ? selectFirst(row, spec.selector) : row;
+  if (!el) return "";
+  if (spec.attribute) {
+    var attr = el.attrs && el.attrs[String(spec.attribute).toLowerCase()];
+    return attr == null ? "" : attr;
+  }
+  return nodeText(el);
+}
+
+// Run one definition against a RESPONSE BODY — pure, no network, which is what
+// makes every bundled def testable against a saved fixture. Returns rows in
+// the plugin's standard CANDIDATE shape (what runSearch returns), each
+// stamped with `site` so the list can say where a row came from.
+function runWebDefOnBody(def, bodyText) {
+  var rows;
+  if (def.type === "json") {
+    var parsed = JSON.parse(bodyText);
+    var arr = jsonPath(parsed, (def.rows && def.rows.path) || "");
+    rows = Object.prototype.toString.call(arr) === "[object Array]" ? arr : [];
+  } else if (def.type === "rss") {
+    rows = selectAll(parseMarkup(bodyText, false), (def.rows && def.rows.tag) || "item");
+  } else {
+    rows = selectAll(parseMarkup(bodyText, true), def.rows.selector);
+  }
+  var cap = Math.min(rows.length, def.limit || WEB_DEF_ROW_CAP);
+  var out = [];
+  for (var i = 0; i < cap; i++) {
+    var mapped = mapWebDefRow(def, rows[i]);
+    if (mapped) out.push(mapped);
+  }
+  return out;
+}
+
+function mapWebDefRow(def, row) {
+  var fields = def.fields || {};
+  var raw = {};
+  var names = ["title", "url", "uploader", "durationSecs", "thumbnail", "views"];
+  for (var i = 0; i < names.length; i++) {
+    var spec = fields[names[i]];
+    if (!spec) continue;
+    raw[names[i]] = applyWebFilters(extractWebField(spec, row, def.type), spec.filters);
+  }
+  // A row without a title or a playable page URL is junk, not a result.
+  var url = typeof raw.url === "string" ? raw.url.trim() : "";
+  var title = raw.title == null ? "" : String(raw.title).replace(/\s+/g, " ").trim();
+  if (!title || !isHttpUrl(url)) return null;
+  // Unknown numbers stay null (the candidate shape's "not reported"), never
+  // 0 or -1 — formatDuration/formatViews render null as nothing.
+  var dur = raw.durationSecs;
+  if (typeof dur === "string" && dur !== "") dur = parseDurationInput(dur);
+  dur = typeof dur === "number" && isFinite(dur) && dur >= 0 ? dur : null;
+  var views = raw.views;
+  if (typeof views === "string" && views !== "") views = parseInt(views.replace(/[\s, ]/g, ""), 10);
+  views = typeof views === "number" && isFinite(views) && views >= 0 ? views : null;
+  return {
+    url: url,
+    title: title,
+    uploader: raw.uploader ? String(raw.uploader).replace(/\s+/g, " ").trim() : "",
+    durationSecs: dur,
+    thumbnail: isHttpUrl(raw.thumbnail) ? raw.thumbnail : null,
+    views: views,
+    site: def.name
+  };
+}
+
+// --- Bundled definitions --------------------------------------------------------
+//
+// Data, not code. Every one is pinned by a fixture test against a REAL
+// captured response; when a site redesigns, the fix is a new definition, not
+// a new parser. All three answer plain HTTP (no JS challenge — Bandcamp, for
+// one, is behind a client challenge and can't be a definition).
+
+var WEB_DEFS = [
+  {
+    schemaVersion: 1,
+    id: "dailymotion",
+    name: "Dailymotion",
+    siteUrl: "https://www.dailymotion.com",
+    type: "json",
+    // NOTE: "owner.screenname" is a literal flat key in the response — see
+    // jsonPath.
+    search: { url: "https://api.dailymotion.com/videos?search={q}&fields=title,url,duration,owner.screenname,thumbnail_240_url,views_total&limit=25" },
+    rows: { path: "list" },
+    fields: {
+      title: { path: "title" },
+      url: { path: "url" },
+      uploader: { path: "owner.screenname" },
+      durationSecs: { path: "duration" },
+      thumbnail: { path: "thumbnail_240_url" },
+      views: { path: "views_total" }
+    }
+  },
+  {
+    schemaVersion: 1,
+    id: "archive",
+    name: "Internet Archive",
+    siteUrl: "https://archive.org",
+    type: "json",
+    // Title-scoped on purpose: full-text matching ranks podcast transcripts
+    // that merely MENTION the artist above the recordings themselves.
+    // Download count stands in for views; there is no duration in the search
+    // API (only the item page knows), and the services/img endpoint serves
+    // every item's thumbnail by identifier.
+    search: { url: "https://archive.org/advancedsearch.php?q=title%3A({q})%20AND%20mediatype%3A(audio)&fl%5B%5D=identifier&fl%5B%5D=title&fl%5B%5D=creator&fl%5B%5D=downloads&rows=25&output=json" },
+    rows: { path: "response.docs" },
+    fields: {
+      title: { path: "title" },
+      url: { path: "identifier", filters: [["prepend", "https://archive.org/details/"]] },
+      uploader: { path: "creator" },
+      thumbnail: { path: "identifier", filters: [["prepend", "https://archive.org/services/img/"]] },
+      views: { path: "downloads" }
+    }
+  },
+  {
+    schemaVersion: 1,
+    id: "peertube",
+    name: "PeerTube",
+    siteUrl: "https://sepiasearch.org",
+    type: "json",
+    // SepiaSearch indexes the PeerTube federation, so one definition searches
+    // hundreds of instances; each row's `url` points at the video's own
+    // instance, which yt-dlp's PeerTube extractor handles.
+    search: { url: "https://sepiasearch.org/api/v1/search/videos?search={q}&count=25" },
+    rows: { path: "data" },
+    fields: {
+      title: { path: "name" },
+      url: { path: "url" },
+      uploader: { path: "account.displayName" },
+      durationSecs: { path: "duration" },
+      thumbnail: { path: "thumbnailUrl" },
+      views: { path: "views" }
+    }
+  }
+];
+
+// --- Validation -----------------------------------------------------------------
+
+// Human-readable problems for a definition — what the settings paste box
+// shows, and the tripwire proving every bundled def stays valid.
+function validateWebIndexerDef(def, existingIds) {
+  var problems = [];
+  var d = def || {};
+  var push = function (msg) {
+    problems.push(msg);
+  };
+  if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(String(d.id || ""))) push("“id” must be 1–32 chars of a-z, 0-9, - or _");
+  else if (existingIds && existingIds[d.id]) push("“id” “" + d.id + "” is already taken");
+  if (!String(d.name || "").trim()) push("“name” is required");
+  if (!/^https?:\/\//.test(String(d.siteUrl || ""))) push("“siteUrl” must be an http(s) URL");
+  var type = String(d.type || "");
+  if (type !== "json" && type !== "rss" && type !== "html") push("“type” must be json, rss or html");
+  var searchUrl = d.search && d.search.url;
+  if (!/^https?:\/\//.test(String(searchUrl || ""))) push("“search.url” must be an http(s) URL");
+  else if (String(searchUrl).indexOf("{q}") === -1) push("“search.url” must contain {q}");
+  if (type === "html") {
+    var rowsSel = d.rows && d.rows.selector;
+    if (!rowsSel) push("an html definition needs “rows.selector”");
+    else {
+      var parsedRows = parseSelector(rowsSel);
+      if (parsedRows.error) push("“rows.selector”: " + parsedRows.error);
+    }
+  } else if (type === "json") {
+    if (!d.rows || typeof d.rows.path !== "string") push("a json definition needs “rows.path” (\"\" for the response root)");
+  }
+  var fields = d.fields || {};
+  var allowedFields = { title: 1, url: 1, uploader: 1, durationSecs: 1, thumbnail: 1, views: 1 };
+  for (var key in fields) {
+    if (!Object.prototype.hasOwnProperty.call(fields, key)) continue;
+    if (!allowedFields[key]) {
+      push("unknown field “" + key + "”");
+      continue;
+    }
+    var spec = fields[key] || {};
+    var sources = 0;
+    if (typeof spec.path === "string") sources++;
+    if (spec.tag) sources++;
+    if (spec.selector) sources++;
+    if (sources !== 1 && !(type === "html" && spec.attribute && sources === 0)) push("field “" + key + "” needs exactly one source (path / tag / selector)");
+    else if (type === "json" && typeof spec.path !== "string") push("field “" + key + "” must use “path” in a json definition");
+    else if (type === "rss" && !spec.tag) push("field “" + key + "” must use “tag” in an rss definition");
+    else if (type === "html" && spec.selector) {
+      var parsedField = parseSelector(spec.selector);
+      if (parsedField.error) push("field “" + key + "”: " + parsedField.error);
+    }
+    var filters = spec.filters || [];
+    for (var f = 0; f < filters.length; f++) {
+      var fname = filters[f] && filters[f][0];
+      if (!KNOWN_WEB_FILTERS[fname]) push("field “" + key + "”: unknown filter “" + fname + "”");
+      else if (filters[f].length !== KNOWN_WEB_FILTERS[fname]) push("field “" + key + "”: filter “" + fname + "” takes " + (KNOWN_WEB_FILTERS[fname] - 1) + " argument(s)");
+      else if (fname === "regex") {
+        try {
+          new RegExp(filters[f][1]);
+        } catch (e) {
+          push("field “" + key + "”: regex “" + filters[f][1] + "” doesn't compile");
+        }
+      }
+    }
+  }
+  if (!fields.title) push("“fields.title” is required");
+  if (!fields.url) push("“fields.url” is required (the page URL yt-dlp will play)");
+  if (d.limit !== undefined && !(d.limit >= 1 && d.limit <= 50)) push("“limit” must be 1–50");
+  if (d.search && d.search.timeoutMs !== undefined && !(d.search.timeoutMs >= 2000 && d.search.timeoutMs <= 20000)) push("“search.timeoutMs” must be 2000–20000");
+  if (d.search && d.search.minGapMs !== undefined && !(d.search.minGapMs >= 0 && d.search.minGapMs <= 60000)) push("“search.minGapMs” must be 0–60000");
+  return problems;
+}
+
+// --- The sweep --------------------------------------------------------------------
+
+function delay(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
+
+// Per-HOST politeness: consecutive hits on one host are spaced by minGap +
+// jitter, while different indexers run in parallel — a second same-host hit
+// inside a second is the bot-wall signature; hits on different sites are
+// unrelated.
+var webHostChains = {};
+
+function hostOf(url) {
+  var m = /^https?:\/\/([^/]+)/i.exec(String(url || ""));
+  return m ? m[1].toLowerCase() : "";
+}
+
+function throttledWebFetch(url, def, fetchFn, opts) {
+  var host = hostOf(url);
+  var minGap = (opts && opts.minGapMs !== undefined) ? opts.minGapMs : (def.search && def.search.minGapMs) || WEB_MIN_GAP_MS;
+  var chain = webHostChains[host] || { tail: Promise.resolve(), lastAt: 0 };
+  webHostChains[host] = chain;
+  var run = chain.tail.then(function () {
+    var wait = Math.max(0, chain.lastAt + minGap + Math.random() * WEB_GAP_JITTER_MS - Date.now());
+    return delay(wait).then(function () {
+      chain.lastAt = Date.now();
+      return fetchFn(url, {
+        method: "GET",
+        headers: (def.search && def.search.headers) || undefined,
+        timeoutMs: (def.search && def.search.timeoutMs) || WEB_TIMEOUT_MS
+      });
+    });
+  });
+  // The chain survives a failed request; the caller still sees the rejection.
+  chain.tail = run.then(
+    function () {
+      return null;
+    },
+    function () {
+      return null;
+    }
+  );
+  // Resolves `{ status, body, url }` rather than the body alone, and a non-2xx
+  // error carries `.status` too — the code is the most useful thing an indexer
+  // ever tells us (403 is a bot wall, 404 a moved search path, 503 the site
+  // being down). `url` is the final URL after redirects (absent on hosts older
+  // than the field) — see redirectHijack for why it matters.
+  return run.then(function (resp) {
+    var status = Number(resp && resp.status) || 0;
+    if (status < 200 || status >= 300) {
+      var err = new Error("HTTP " + status);
+      err.status = status;
+      throw err;
+    }
+    return resp.text().then(function (body) {
+      return { status: status, body: body, url: resp.url };
+    });
+  });
+}
+
+// The host a response REALLY came from, when it isn't the one asked — or null
+// when the answer is honest (or the host is too old to say, `resp.url` absent).
+// This is how national ISP blocking looks from inside a fetch: the request is
+// 302'd to the regulator's notice page, which answers HTTP 200 with a page
+// that naturally contains no result rows. Without this check that reads as
+// "HTTP 200 · no results" — the stale-selectors diagnosis — sending whoever
+// debugs it to exactly the wrong place. `www.` is stripped before comparing so
+// a site canonicalising to/from its www form doesn't read as a hijack.
+function redirectHijack(requestUrl, finalUrl) {
+  var asked = hostOf(requestUrl);
+  var got = hostOf(finalUrl);
+  if (!asked || !got) return null;
+  var strip = function (h) { return h.replace(/^www\./, ""); };
+  return strip(asked) === strip(got) ? null : got;
+}
+
+function recordWebStat(id, ok, err) {
+  var s = webIndexerStats[id] || { ok: 0, fail: 0, lastError: null };
+  webIndexerStats[id] = s;
+  if (ok) s.ok++;
+  else {
+    s.fail++;
+    s.lastError = err || null;
+  }
+}
+
+// Round-robin the per-site lists together so every site's best results reach
+// the top of the merged list — plain concatenation would bury the second and
+// third site under the first's 25 rows. Capped in total. Pure; exported for
+// tests.
+function interleaveBySite(lists, cap) {
+  var out = [];
+  var max = 0;
+  for (var i = 0; i < lists.length; i++) max = Math.max(max, lists[i].length);
+  for (var r = 0; r < max; r++) {
+    for (var l = 0; l < lists.length; l++) {
+      if (r < lists[l].length && out.length < cap) out.push(lists[l][r]);
+    }
+  }
+  return out;
+}
+
+// Search every enabled definition, in parallel across hosts, failures
+// isolated: a dead site records a stat and reports its error in `engines`
+// while the others' rows go on unbothered — the sweep itself never rejects.
+// Resolves { candidates, engines } where engines is one entry per def:
+// { id, name, status, count, error } (error null when it answered).
+function webSearchAll(defs, query, fetchFn, opts) {
+  var list = defs || [];
+  var q = String(query == null ? "" : query).trim();
+  if (!q || !list.length) return Promise.resolve({ candidates: [], engines: [] });
+  var jobs = [];
+  for (var i = 0; i < list.length; i++) {
+    (function (def) {
+      var url = buildWebSearchUrl(def, q);
+      jobs.push(
+        throttledWebFetch(url, def, fetchFn, opts)
+          .then(function (res) {
+            var rows = runWebDefOnBody(def, res.body);
+            // Zero rows from a host we never asked is a block page wearing a
+            // 200, not an empty answer — say so, as a failure. Only when zero:
+            // a mirror redirect that still parses fine is results, not a fault.
+            var hijack = rows.length ? null : redirectHijack(url, res.url);
+            if (hijack) {
+              var msg = "redirected to " + hijack + " — the site looks blocked on your network";
+              recordWebStat(def.id, false, msg);
+              return { id: def.id, name: def.name, status: res.status, count: 0, error: msg, rows: [] };
+            }
+            recordWebStat(def.id, true);
+            return { id: def.id, name: def.name, status: res.status, count: rows.length, error: null, rows: rows };
+          })
+          .catch(function (e) {
+            recordWebStat(def.id, false, errText(e));
+            console.error("[ytdlp] web indexer " + def.id + " failed:", e);
+            // status 0 = "never got a response at all" — a timeout or a DNS
+            // failure, a different diagnosis from a site that answered 403.
+            return { id: def.id, name: def.name, status: (e && e.status) || 0, count: 0, error: errText(e), rows: [] };
+          })
+      );
+    })(list[i]);
+  }
+  return Promise.all(jobs).then(function (results) {
+    var lists = [];
+    var engines = [];
+    for (var r = 0; r < results.length; r++) {
+      lists.push(results[r].rows);
+      engines.push({
+        id: results[r].id, name: results[r].name, status: results[r].status,
+        count: results[r].count, error: results[r].error
+      });
+    }
+    return { candidates: interleaveBySite(lists, WEB_TOTAL_ROW_CAP), engines: engines };
+  });
+}
+
+// The definitions currently in force: bundled ones minus the user's disables,
+// plus their custom ones (validated at paste time).
+function enabledWebDefs() {
+  var out = [];
+  for (var i = 0; i < WEB_DEFS.length; i++) {
+    if (!webIndexersDisabled[WEB_DEFS[i].id]) out.push(WEB_DEFS[i]);
+  }
+  for (var c = 0; c < customWebIndexers.length; c++) {
+    if (!webIndexersDisabled[customWebIndexers[c].id]) out.push(customWebIndexers[c]);
+  }
+  return out;
+}
+
+function webDefById(id) {
+  var all = WEB_DEFS.concat(customWebIndexers);
+  for (var i = 0; i < all.length; i++) {
+    if (all[i].id === id) return all[i];
+  }
+  return null;
+}
+
+// Cached sweep for the sidebar (same TTL and non-empty-only rule as the
+// yt-dlp searches — see runSearchFull). The enabled def ids are part of the
+// key so toggling a site in settings never serves the old mix.
+async function runWebSearch(api, query) {
+  var q = String(query == null ? "" : query).trim();
+  var defs = enabledWebDefs();
+  if (!q || !defs.length) return { candidates: [], engines: [] };
+  var ids = [];
+  for (var i = 0; i < defs.length; i++) ids.push(defs[i].id);
+  var cacheKey = JSON.stringify(["web", q, ids]);
+  var cached = cacheGet(searchCache, cacheKey, Date.now());
+  if (!cached) {
+    cached = await webSearchAll(defs, q, function (url, init) { return api.network.fetch(url, init); });
+    if (cached.candidates.length) cachePut(searchCache, cacheKey, cached, Date.now() + SEARCH_CACHE_TTL_MS, CACHE_MAX_ENTRIES);
+  }
+  // Hand every caller its own candidate objects — same reason as
+  // cloneSearchResult: the view keeps results in state and must not share
+  // objects with the cache.
+  return {
+    candidates: cached.candidates.map(function (c) { return Object.assign({}, c); }),
+    engines: cached.engines.map(function (e) { return Object.assign({}, e); })
+  };
+}
+
+// One line saying how the sweep went, for under the Web tab's results:
+// "Dailymotion 25 · Internet Archive 3 · PeerTube: HTTP 403". The error TEXT
+// is shown, not the status code — a redirect hijack fails with a healthy
+// status 200 and the whole diagnosis lives in the message. Pure; exported
+// for tests.
+function webEngineSummary(engines) {
+  var bits = [];
+  var list = engines || [];
+  for (var i = 0; i < list.length; i++) {
+    var e = list[i];
+    if (e.error) bits.push(e.name + ": " + e.error);
+    else bits.push(e.name + " " + e.count);
+  }
+  return bits.join("  ·  ");
+}
+
+// --- Catalog ----------------------------------------------------------------------
+//
+// The easy path for adding a site: a curated list of ready-made definitions,
+// hosted in the plugin's own repository and fetched at runtime — so a new
+// site reaches every user the moment it lands on main, never waiting for a
+// plugin release. One click installs an entry as a custom indexer: same
+// storage, same toggle / View JSON / Remove as a pasted one.
+var WEB_CATALOG_URL = "https://raw.githubusercontent.com/outcast1000/viboplr-ytdlp/main/webindexers/catalog.json";
+var webCatalog = null;      // null until fetched; then { entries: [...] }
+var webCatalogError = null; // errText of the last failed fetch
+var webCatalogBusy = false;
+
+// Parse a catalog body into { entries, problems }. Every entry must be a
+// VALID definition on its own (empty existingIds — installed-ness is the
+// UI's question, not the catalog's); invalid ones are dropped and named in
+// `problems` rather than sinking the rest. Pure; exported for tests.
+function parseWebCatalog(bodyText) {
+  var entries = [];
+  var problems = [];
+  var parsed;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch (e) {
+    return { entries: entries, problems: ["catalog isn't valid JSON: " + errText(e)] };
+  }
+  var list = parsed && Object.prototype.toString.call(parsed.indexers) === "[object Array]" ? parsed.indexers : null;
+  if (!list) return { entries: entries, problems: ["catalog has no “indexers” array"] };
+  for (var i = 0; i < list.length; i++) {
+    var def = list[i];
+    var defProblems = validateWebIndexerDef(def, {});
+    if (defProblems.length) {
+      problems.push("“" + ((def && def.name) || (def && def.id) || "entry " + (i + 1)) + "”: " + defProblems.join(" · "));
+    } else {
+      entries.push(def);
+    }
+  }
+  return { entries: entries, problems: problems };
+}
+
+// --- Settings surface -----------------------------------------------------------
+
+function webSiteLabel(u) {
+  var m = /^https?:\/\/(?:www\.)?([^/]+)/i.exec(String(u || ""));
+  return m ? m[1] : String(u || "");
+}
+
+// The Web indexers block: one toggle per definition (bundled + pasted), with a
+// session health note, and the paste box for adding definitions. Rendered as
+// data because the def list is data — a pasted def gets its row on the next
+// render with no code involved.
+function webIndexerSettingsRows() {
+  var rows = [];
+  rows.push({
+    type: "text", className: "ds-empty",
+    content: "The sidebar's Web tab searches these sites directly (plain HTTP — yt-dlp is only used to play what you pick). Each site is a JSON definition; paste your own below to search any site yt-dlp supports."
+  });
+  var all = WEB_DEFS.concat(customWebIndexers);
+  for (var i = 0; i < all.length; i++) {
+    var def = all[i];
+    var stat = webIndexerStats[def.id];
+    var health = stat
+      ? stat.ok + " ok · " + stat.fail + " failed" + (stat.lastError ? " (" + stat.lastError + ")" : "")
+      : "not asked yet this session";
+    var custom = i >= WEB_DEFS.length;
+    rows.push({
+      type: "settings-row",
+      label: "Search " + def.name,
+      description: webSiteLabel(def.siteUrl) + " · " + health + (custom ? " · added by you" : ""),
+      control: { type: "toggle", label: "", action: "ytdlp-webidx-" + def.id, checked: !webIndexersDisabled[def.id] }
+    });
+    rows.push({
+      type: "settings-row",
+      label: "",
+      description: custom ? "Show this definition's JSON below, or remove it." : "Show this definition's JSON below (copy it as a starting point for your own).",
+      control: {
+        type: "layout",
+        direction: "horizontal",
+        children: [{ type: "button", label: "View JSON", action: "ytdlp-webview-" + def.id, variant: "secondary" }].concat(
+          custom ? [{ type: "button", label: "Remove", action: "ytdlp-webdel-" + def.id, variant: "secondary" }] : []
+        )
+      }
+    });
+  }
+  // The catalog: the one-click way in. Listed before the paste box because
+  // it's the path most users should take.
+  rows.push({
+    type: "settings-row",
+    label: "More sites — the indexer catalog",
+    description:
+      "A curated list of ready-made definitions, fetched from the plugin's repository — new sites arrive there without waiting for a plugin update. " +
+      "One click adds a site; it joins the list above where you can toggle, inspect or remove it like any other.",
+    control: {
+      type: "button",
+      label: webCatalogBusy ? "Fetching…" : (webCatalog ? "Refresh catalog" : "Browse catalog"),
+      action: "ytdlp-web-catalog",
+      variant: webCatalog ? "secondary" : "accent",
+      disabled: webCatalogBusy
+    }
+  });
+  if (webCatalogError) {
+    rows.push({ type: "text", className: "ds-banner ds-banner--error", content: "Couldn't fetch the catalog: " + webCatalogError });
+  }
+  if (webCatalog) {
+    if (!webCatalog.entries.length) {
+      rows.push({ type: "text", className: "ds-empty", content: "The catalog has nothing new right now." });
+    }
+    for (var ce = 0; ce < webCatalog.entries.length; ce++) {
+      var entry = webCatalog.entries[ce];
+      var installed = !!webDefById(entry.id);
+      rows.push({
+        type: "settings-row",
+        label: entry.name,
+        description: webSiteLabel(entry.siteUrl) + (entry.description ? " · " + entry.description : ""),
+        control: installed
+          ? { type: "button", label: "Added ✓", action: "ytdlp-webcat-add", data: { id: entry.id }, variant: "secondary", disabled: true }
+          : { type: "button", label: "Add", action: "ytdlp-webcat-add", data: { id: entry.id }, variant: "accent" }
+      });
+    }
+  }
+  rows.push({
+    type: "settings-row",
+    label: "Add or import web indexers",
+    description:
+      "Paste one indexer definition, a JSON array of them, or a LINK to a definition file (a gist, a repo raw URL) and press Add — importing several at once works. " +
+      "“View JSON” above fills this box with an existing definition to copy or tweak, and “Export all” fills it with every " +
+      "indexer as an array. A definition says how to search one site; see the plugin's README for the format.",
+    control: { type: "text-input", placeholder: "{ \"id\": \"mysite\", … }  ·  [ {…}, {…} ]  ·  https://…/mysite.json", action: "ytdlp-web-draft", value: webIndexerDraft, multiline: true, rows: 6 }
+  });
+  rows.push({
+    type: "settings-row",
+    label: "",
+    description: "",
+    control: {
+      type: "layout",
+      direction: "horizontal",
+      children: [
+        { type: "button", label: "Add / import", action: "ytdlp-web-add", variant: "accent" },
+        { type: "button", label: "Export all", action: "ytdlp-web-export", variant: "secondary" },
+        { type: "button", label: "Clear box", action: "ytdlp-web-clear", variant: "secondary" }
+      ]
+    }
+  });
+  return rows;
+}
 
 // ---------------------------------------------------------------------------
 // Views
@@ -3014,6 +4279,9 @@ function buildResultRow(c, pos, opts) {
   // user wants to see to spot the real music video.
   var viewsLabel = formatViews(c.views);
   var subtitle = artist && viewsLabel ? artist + " · " + viewsLabel : (artist || viewsLabel);
+  // Web-indexer rows carry the site that found them — a merged sweep is
+  // unreadable without knowing which row came from where.
+  if (c.site) subtitle = subtitle ? subtitle + " · " + c.site : c.site;
   // Fold the ranking score breakdown into the subtitle so you can see why this
   // result placed where it did — the profile breakdown in the Tuning tab, else
   // (when debug scoring is on) the view-rerank one.
@@ -3202,12 +4470,17 @@ function renderSearchView(api) {
 
   var st = stateFor(searchSource);
   var isLink = searchSource === "link";
+  var isWeb = searchSource === "web";
   var busy = searching && searchingSource === searchSource;
+  var webDefs = isWeb ? enabledWebDefs() : [];
+  var webNames = webDefs.map(function (d) { return d.name; }).join(", ");
   children.push({
     type: "search-input",
     placeholder: isLink
       ? "Paste a link — a video, playlist, album or set…"
-      : "Search " + (SOURCES[searchSource] ? SOURCES[searchSource].label : "") + ", or paste a URL…",
+      : isWeb
+        ? (webDefs.length ? "Search " + webNames + ", or paste a URL…" : "All web indexers are off — enable them in Settings → yt-dlp")
+        : "Search " + (SOURCES[searchSource] ? SOURCES[searchSource].label : "") + ", or paste a URL…",
     action: "ytdlp-search-submit",
     value: st.query,
     // Newer hosts keep each tab's typed text separate (stateKey) and offer a
@@ -3216,6 +4489,14 @@ function renderSearchView(api) {
     pasteButton: isLink,
     buttonLabel: busy ? "Cancel" : (isLink ? "Fetch" : "Search")
   });
+
+  // How the last web sweep went, per site — successes with their row counts,
+  // failures with the most diagnostic thing available (usually the HTTP code).
+  // Rendered above the list so a half-failed sweep is visible next to the
+  // rows the working sites still delivered.
+  if (isWeb && !busy && st.webEngines && st.webEngines.length) {
+    children.push({ type: "text", content: webEngineSummary(st.webEngines), className: "ds-empty" });
+  }
 
   var results = st.results;
   var isPlaylist = !busy && isLink && results != null && results.length > 1;
@@ -3264,13 +4545,19 @@ function renderSearchView(api) {
     children.push({ type: "text",
       content: (isLink && st.query && !isHttpUrl(st.query))
         ? "That doesn't look like a link — paste a full URL starting with http(s)://."
-        : "No results.",
+        : (isWeb && !webDefs.length)
+          ? "All web indexers are turned off. Enable them under Settings → yt-dlp → Web search."
+          : "No results.",
       className: "ds-empty" });
   } else {
     children.push({ type: "text",
       content: isLink
         ? "Paste a link to a video, playlist, album or set. The tracks appear here to play, queue or download."
-        : "Search or paste a link. Play/Queue listen as audio; Watch opens the video; Download lets you pick the format (incl. MP4).",
+        : isWeb
+          ? (webDefs.length
+            ? "Search " + webNames + " directly — the results play through yt-dlp like any other tab. Add or edit sites under Settings → yt-dlp → Web search."
+            : "All web indexers are turned off. Enable them under Settings → yt-dlp → Web search.")
+          : "Search or paste a link. Play/Queue listen as audio; Watch opens the video; Download lets you pick the format (incl. MP4).",
       className: "ds-empty" });
   }
 
@@ -3321,6 +4608,9 @@ function renderSettings(api) {
         }]
       },
       {
+        type: "section", title: "Web search", children: webIndexerSettingsRows()
+      },
+      {
         type: "section", title: "Cache", children: [{
           type: "settings-row",
           label: "Cache size limit",
@@ -3364,6 +4654,11 @@ function deactivate() {
   resolveOpen = false;
   tuneOpen = false; tuneProfile = "audio"; tuneQuery = ""; tuneTarget = null;
   tuneResults = null; tuneBusy = false; tuneParamText = {}; tuneTargetRaw = null;
+  // Web indexers: in-memory state only — disables and custom defs reload from
+  // storage on the next activate.
+  webIndexersDisabled = {}; customWebIndexers = [];
+  webIndexerDraft = ""; webIndexerStats = {}; webHostChains = {};
+  webCatalog = null; webCatalogError = null; webCatalogBusy = false;
 }
 
 return {
@@ -3424,5 +4719,27 @@ return {
   _describeCandidate: describeCandidate,
   _parseChosenFormat: parseChosenFormat,
   _describeChosenFormat: describeChosenFormat,
-  _CHOSEN_FMT_PRINT: CHOSEN_FMT_PRINT
+  _CHOSEN_FMT_PRINT: CHOSEN_FMT_PRINT,
+  // Web indexers.
+  _decodeMarkupEntities: decodeMarkupEntities,
+  _parseMarkup: parseMarkup,
+  _nodeText: nodeText,
+  _parseSelector: parseSelector,
+  _selectAll: selectAll,
+  _selectFirst: selectFirst,
+  _childByTag: childByTag,
+  _applyWebFilters: applyWebFilters,
+  _jsonPath: jsonPath,
+  _buildWebSearchUrl: buildWebSearchUrl,
+  _runWebDefOnBody: runWebDefOnBody,
+  _mapWebDefRow: mapWebDefRow,
+  _validateWebIndexerDef: validateWebIndexerDef,
+  _WEB_DEFS: WEB_DEFS,
+  _webSearchAll: webSearchAll,
+  _redirectHijack: redirectHijack,
+  _interleaveBySite: interleaveBySite,
+  _webEngineSummary: webEngineSummary,
+  _webSiteLabel: webSiteLabel,
+  _parseWebCatalog: parseWebCatalog,
+  _WEB_CATALOG_URL: WEB_CATALOG_URL
 };
