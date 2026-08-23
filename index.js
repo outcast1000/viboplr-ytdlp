@@ -202,13 +202,19 @@ function formatCmd(program, args) {
 // A track's identity is the source webpage URL, encoded into a ytdlp:// path so
 // it survives queue persistence and is re-resolved to a fresh stream at play
 // time. Dots are percent-escaped so the host's path-extension video detection
-// never trips on the encoded URL; a literal ".mp4" suffix is appended for video
-// tracks so isVideoTrack() routes them to the theater view.
-function encodeRef(url, isVideo) {
-  var enc = encodeURIComponent(url).replace(/\./g, "%2E");
-  return "ytdlp://" + enc + (isVideo ? ".mp4" : "");
+// never trips on the encoded URL — a page URL that itself ends in ".mp4" must
+// not classify an audio ref as video.
+//
+// Audio-vs-video no longer rides the URI: the fake ".mp4" suffix is retired.
+// The claim travels as PluginTrack.kind (buildTrack), and the resolve intent
+// arrives as opts.video on onResolveStreamByUri. decodeRef still parses
+// suffixed refs forever — they live in persisted queues.
+function encodeRef(url) {
+  return "ytdlp://" + encodeURIComponent(url).replace(/\./g, "%2E");
 }
 // Decode the id portion (everything after "ytdlp://") back to { url, isVideo }.
+// isVideo is true only for LEGACY suffixed refs (pre-1.23.0 persisted queues);
+// new refs carry no kind and rely on opts.video at resolve time.
 // Returns null when the decoded value isn't an http(s) URL (guards exec).
 var VIDEO_EXT_RE = /\.(mp4|m4v|mov|webm|mkv|avi|wmv)$/i;
 function decodeRef(id) {
@@ -296,8 +302,12 @@ function buildTrack(c, isVideo) {
     title: parsed.title || c.title || c.url,
     artist_name: parsed.artist || c.uploader || null,
     duration_secs: c.durationSecs != null ? c.durationSecs : null,
-    path: encodeRef(c.url, isVideo),
-    image_url: thumbFor(c.url, c.thumbnail)
+    path: encodeRef(c.url),
+    image_url: thumbFor(c.url, c.thumbnail),
+    // The one channel for audio-vs-video (PluginTrack.kind). The legacy ".mp4"
+    // URI suffix is retired — minAppVersion gates this plugin to hosts that
+    // read `kind` and send `opts.video` back at resolve time.
+    kind: isVideo ? "video" : "audio"
   };
 }
 
@@ -1393,7 +1403,7 @@ async function downloadTrackFor(api, target) {
         title: target.title,
         artist_name: artistName,
         album_title: target.albumTitle || null,
-        uri: encodeRef(cand.url, false),
+        uri: encodeRef(cand.url),
         durationSecs: cand.durationSecs != null ? cand.durationSecs : null
       }]
     });
@@ -2502,9 +2512,12 @@ async function activate(api) {
     if (!ytDlpVersion) { api.log("warn", "URI resolve skipped — yt-dlp not available", "ytdlp"); return null; }
     var ref = decodeRef(id);
     if (!ref) { api.log("warn", "URI resolve: bad ref " + id, "ytdlp"); return null; }
-    // No `preferVideo` here: the ref itself says which kind was asked for (it is
-    // in the subject line), and reporting it as a host hint would be a lie.
-    var trace = startTrace(api, "stream resolve by uri", ref.url + (ref.isVideo ? " (video)" : " (audio)"),
+    // Which kind was asked for: the host's opts.video (the track's declared
+    // kind / persisted format), or the legacy ".mp4" suffix still carried by
+    // refs from pre-1.23.0 persisted queues. No `preferVideo` here — this is
+    // the request itself, not a hint.
+    var wantVideo = ref.isVideo || !!(opts && opts.video);
+    var trace = startTrace(api, "stream resolve by uri", ref.url + (wantVideo ? " (video)" : " (audio)"),
       currentContext({ externalAudio: !!(opts && opts.externalAudio), fresh: !!(opts && opts.fresh) }));
     try {
       // The host can attach a separate audio track (native mpv engine + video):
@@ -2512,7 +2525,7 @@ async function activate(api) {
       // audio-only pair. Only in "stream" mode — "download then play" already
       // fetches a full-res merged file below. On enumeration failure fall
       // through to the single muxed stream.
-      if (ref.isVideo && opts && opts.externalAudio && playbackMode === "stream") {
+      if (wantVideo && opts && opts.externalAudio && playbackMode === "stream") {
         var candidates = await enumerateFormats(api, ref.url, maxVideoHeight, trace);
         if (candidates.length) {
           traceDone(trace, "candidate menu of " + candidates.length + " (host picks per its engine)");
@@ -2520,8 +2533,8 @@ async function activate(api) {
         }
         traceLog(trace, "warn", "no usable candidates — falling back to a single muxed stream");
       }
-      var playable = await resolvePlayable(api, ref.url, ref.isVideo, opts && opts.fresh, trace);
-      var result = streamUriResult(playable, ref.isVideo, ref.url);
+      var playable = await resolvePlayable(api, ref.url, wantVideo, opts && opts.fresh, trace);
+      var result = streamUriResult(playable, wantVideo, ref.url);
       traceDone(trace, result ? "single stream" + (playable.downloaded ? " (downloaded)" : "") : "no playable stream",
         result ? "info" : "warn");
       return result;
@@ -2645,6 +2658,9 @@ async function activate(api) {
     var url = null;
     if (uri && uri.indexOf("ytdlp://") === 0) {
       var ref = decodeRef(uri.substring("ytdlp://".length));
+      // ref.isVideo only fires for legacy suffixed refs; a new ref's video
+      // intent reaches this as the `format` the host's modal picked (it
+      // defaults to a video quality when the track is classified video).
       if (ref) { url = ref.url; if (ref.isVideo && !format) format = "video"; }
     } else if (uri && uri.indexOf("youtube://") === 0) {
       var yid = uri.substring("youtube://".length);
@@ -2693,7 +2709,7 @@ async function activate(api) {
     for (var i = 0; i < candidates.length; i++) {
       var c = candidates[i], parsed = parseTrackTitle(c.title, c.uploader);
       out.push({
-        id: encodeRef(c.url, false), // audio identity; video handled via the sidebar
+        id: encodeRef(c.url), // kind-less identity; the caller declares video via kind/format
         title: parsed.title || c.title || c.url,
         artistName: parsed.artist || c.uploader || undefined,
         durationSecs: c.durationSecs != null ? c.durationSecs : undefined,
@@ -2823,7 +2839,7 @@ async function activate(api) {
     var results = stateFor(searchSource).results;
     if (results) {
       for (var i = 0; i < results.length; i++) {
-        if (encodeRef(results[i].url, false) === refId || results[i].url === refId) return results[i];
+        if (encodeRef(results[i].url) === refId || results[i].url === refId) return results[i];
       }
     }
     // Fall back to the "Last resolve" debug panel candidates so its Play / Watch
@@ -2831,7 +2847,7 @@ async function activate(api) {
     if (lastResolve && lastResolve.candidates) {
       for (var k = 0; k < lastResolve.candidates.length; k++) {
         var rc = lastResolve.candidates[k];
-        if (encodeRef(rc.url, false) === refId || rc.url === refId) return rc;
+        if (encodeRef(rc.url) === refId || rc.url === refId) return rc;
       }
     }
     // ...and the Tuning tab's ranked candidates, so Play / Watch / Download work
@@ -2839,7 +2855,7 @@ async function activate(api) {
     if (tuneResults) {
       for (var t = 0; t < tuneResults.length; t++) {
         var tc = tuneResults[t];
-        if (encodeRef(tc.url, false) === refId || tc.url === refId) return tc;
+        if (encodeRef(tc.url) === refId || tc.url === refId) return tc;
       }
     }
     return null;
@@ -3004,7 +3020,7 @@ function buildResultRow(c, pos, opts) {
   var dbg = opts.profile ? formatProfileScore(c) : (debugScoring ? formatScoreDebug(c, pos) : "");
   if (dbg) subtitle = subtitle ? subtitle + "  ·  " + dbg : dbg;
   return {
-    id: encodeRef(c.url, false),
+    id: encodeRef(c.url),
     title: (opts.chosen ? "✓ " : "") + (parsed.title || c.title || c.url),
     subtitle: subtitle,
     duration: formatDuration(c.durationSecs),
@@ -3013,7 +3029,7 @@ function buildResultRow(c, pos, opts) {
     // Carry the audio ref + metadata so the host builds a native right-click
     // menu (Play / Enqueue / Play Next), resolves artwork by name, and allows
     // drag-to-queue — all without a DB id.
-    path: encodeRef(c.url, false),
+    path: encodeRef(c.url),
     artistName: artist || null,
     durationSecs: c.durationSecs != null ? c.durationSecs : null
   };
@@ -3370,6 +3386,7 @@ return {
   _rankByProfile: rankByProfile,
   _formatProfileScore: formatProfileScore,
   _buildResultRow: buildResultRow,
+  _buildTrack: buildTrack,
   _encodeRef: encodeRef,
   _decodeRef: decodeRef,
   _cacheStem: cacheStem,

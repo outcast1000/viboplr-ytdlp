@@ -4,33 +4,28 @@ const { loadPlugin } = require("./harness/sandbox.js");
 
 const plugin = loadPlugin();
 
-test("encodeRef/decodeRef round-trips an audio URL", () => {
+test("encodeRef/decodeRef round-trips a URL", () => {
   const url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
-  const ref = plugin._encodeRef(url, false);
+  const ref = plugin._encodeRef(url);
   assert.ok(ref.startsWith("ytdlp://"));
   const decoded = plugin._decodeRef(ref.slice("ytdlp://".length));
   assert.deepEqual(decoded, { url, isVideo: false });
 });
 
-test("encodeRef/decodeRef round-trips a video URL with .mp4 suffix", () => {
+test("decodeRef still reads the legacy .mp4 suffix — persisted queues carry it forever", () => {
   const url = "https://vimeo.com/12345678";
-  const ref = plugin._encodeRef(url, true);
-  assert.ok(ref.endsWith(".mp4"));
-  const decoded = plugin._decodeRef(ref.slice("ytdlp://".length));
-  assert.deepEqual(decoded, { url, isVideo: true });
+  // Pre-1.23.0 refs: encoded URL + a literal ".mp4" marking video intent.
+  const legacy = encodeURIComponent(url).replace(/\./g, "%2E") + ".mp4";
+  assert.deepEqual(plugin._decodeRef(legacy), { url, isVideo: true });
 });
 
-test("encoded audio id has no literal dot (so host video-detection can't false-trip)", () => {
-  // youtu.be contains a dot that must be escaped in the encoded form.
-  const ref = plugin._encodeRef("https://youtu.be/abcDEF", false);
-  const id = ref.slice("ytdlp://".length);
-  assert.equal(id.indexOf("."), -1, "audio id should contain no literal '.'");
-});
-
-test("encoded video id has exactly one literal dot (the .mp4 suffix)", () => {
-  const ref = plugin._encodeRef("https://youtu.be/abcDEF", true);
-  const id = ref.slice("ytdlp://".length);
-  assert.equal((id.match(/\./g) || []).length, 1);
+test("no ref carries a literal dot — kind no longer rides the URI", () => {
+  // youtu.be contains a dot that must be escaped in the encoded form, and the
+  // fake ".mp4" video suffix is retired (PluginTrack.kind + opts.video carry
+  // the claim now), so no ref of either kind can trip the host's
+  // path-extension video detection.
+  const id = plugin._encodeRef("https://youtu.be/abcDEF").slice("ytdlp://".length);
+  assert.equal(id.indexOf("."), -1, "no literal '.' in any ref");
 });
 
 test("decodeRef detects non-mp4 video containers", () => {
@@ -94,4 +89,15 @@ test("cacheStem separates audio and video of the same URL", () => {
   const url = "https://example.com/track";
   assert.notEqual(plugin._cacheStem(url, false), plugin._cacheStem(url, true));
   assert.match(plugin._cacheStem(url, false), /^[a-z0-9]+$/);
+});
+
+test("buildTrack declares its kind, and the path carries no suffix", () => {
+  // `kind` (PluginTrack.kind) is the one channel for audio-vs-video; audio and
+  // video of the same page share one ref.
+  const video = plugin._buildTrack({ url: "https://youtu.be/abc", title: "Clip" }, true);
+  const audio = plugin._buildTrack({ url: "https://youtu.be/abc", title: "Song" }, false);
+  assert.equal(video.kind, "video");
+  assert.equal(audio.kind, "audio");
+  assert.equal(video.path, audio.path, "one identity per page URL");
+  assert.ok(!/\.mp4$/.test(video.path));
 });

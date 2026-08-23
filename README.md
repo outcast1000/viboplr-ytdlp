@@ -54,8 +54,10 @@ the host's cached status (`api.system.getDependency`).
 - `manifest.json` contributes a sidebar view (`ytdlp-search`), a stream resolver
   (`ytdlp-fallback`), a download provider (`ytdlp-download`) and a settings panel.
 - A track's identity is its source webpage URL, encoded into a `ytdlp://<url>`
-  path (dots percent-escaped; a `.mp4` suffix marks video). The scheme resolver
-  re-resolves it to a fresh stream at play time.
+  path (dots percent-escaped). The scheme resolver re-resolves it to a fresh
+  stream at play time. Audio-vs-video travels as `PluginTrack.kind` on the way
+  in and `opts.video` on the way back; legacy refs from pre-1.23.0 queues carry
+  a `.mp4` suffix instead, which `decodeRef` honours forever.
 - Playback: `onStreamResolve` (metadata → search → resolve) and
   `onResolveStreamByUri("ytdlp" | "youtube")`.
 - Downloads: `onResolveByUri` / `onResolveByMetadata` / `onInteractiveSearch` /

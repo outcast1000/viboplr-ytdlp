@@ -147,8 +147,10 @@ test("audio and video of one source are cached separately", async () => {
   // served a video URL just because the source page matches.
   const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
   const url = "https://www.youtube.com/watch?v=aaaaaaaaaaa";
-  await api._handlers["streamuri:ytdlp"](plugin._encodeRef(url, false).slice("ytdlp://".length));
-  await api._handlers["streamuri:ytdlp"](plugin._encodeRef(url, true).slice("ytdlp://".length));
+  // One ref for both kinds now — the intent is opts.video, and the plugin's
+  // stream cache must key on it or an audio play would be served a video URL.
+  await api._handlers["streamuri:ytdlp"](plugin._encodeRef(url).slice("ytdlp://".length));
+  await api._handlers["streamuri:ytdlp"](plugin._encodeRef(url).slice("ytdlp://".length), null, { video: true });
   assert.equal(api.calls.exec.filter((c) => c.args.includes("%(urls)s")).length, 2);
 });
 
@@ -383,24 +385,25 @@ test("stream resolve skips cleanly when yt-dlp is unavailable", async () => {
   assert.equal(r, null);
 });
 
-test("sidebar Play produces an AUDIO track; Watch produces a VIDEO (.mp4) track", async () => {
+test("sidebar Play produces an AUDIO track; Watch produces a VIDEO track", async () => {
   const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
   await api._handlers["action:ytdlp-search-submit"]({ query: "radiohead" });
   const url = "https://www.youtube.com/watch?v=aaaaaaaaaaa";
-  const rowId = plugin._encodeRef(url, false); // rows are keyed by the audio ref
+  const rowId = plugin._encodeRef(url); // rows are keyed by the ref
 
   api._handlers["action:ytdlp-play"]({ selectedIds: [rowId] });
   assert.equal(api.calls.playTracks.length, 1);
-  assert.equal(api.calls.playTracks[0].tracks[0].path, plugin._encodeRef(url, false));
-  assert.ok(!api.calls.playTracks[0].tracks[0].path.endsWith(".mp4"));
+  assert.equal(api.calls.playTracks[0].tracks[0].path, plugin._encodeRef(url));
+  assert.equal(api.calls.playTracks[0].tracks[0].kind, "audio");
 
+  // Same ref, different declared kind — the URI no longer encodes it.
   api._handlers["action:ytdlp-watch"]({ selectedIds: [rowId] });
   assert.equal(api.calls.playTracks.length, 2);
-  assert.equal(api.calls.playTracks[1].tracks[0].path, plugin._encodeRef(url, true));
-  assert.ok(api.calls.playTracks[1].tracks[0].path.endsWith(".mp4"));
+  assert.equal(api.calls.playTracks[1].tracks[0].path, plugin._encodeRef(url));
+  assert.equal(api.calls.playTracks[1].tracks[0].kind, "video");
 });
 
-test("context-menu 'Watch YouTube video' searches YouTube and plays a VIDEO (.mp4) track", async () => {
+test("context-menu 'Watch YouTube video' searches YouTube and plays a VIDEO track", async () => {
   const { api } = await activated({ exec: toolsPresent(BEHAVIOR) });
   // Universal track target — title/artist only, no DB id. Handler is sync but
   // kicks off an async YouTube search, so let it settle before asserting.
@@ -409,7 +412,7 @@ test("context-menu 'Watch YouTube video' searches YouTube and plays a VIDEO (.mp
   assert.equal(api.calls.playTracks.length, 1);
   const path = api.calls.playTracks[0].tracks[0].path;
   assert.ok(path.startsWith("ytdlp://"), "must be a ytdlp:// ref");
-  assert.ok(path.endsWith(".mp4"), "watched track must be a video ref");
+  assert.equal(api.calls.playTracks[0].tracks[0].kind, "video", "watched track must declare video");
   // Always searches YouTube (ytsearch:), regardless of the Fallback source setting.
   const searched = api.calls.exec.find((c) => c.args.some((a) => typeof a === "string" && a.indexOf("ytsearch") === 0));
   assert.ok(searched, "context watch should use ytsearch:");
@@ -551,13 +554,13 @@ test("a plain text query does NOT get the -I playlist cap (search, not a URL)", 
   assert.ok(!call.args.includes("-I"), "a search query must not be capped with -I");
 });
 
-test("sidebar Queue video enqueues a VIDEO (.mp4) track", async () => {
+test("sidebar Queue video enqueues a VIDEO track", async () => {
   const { api, plugin } = await activated({ exec: toolsPresent(BEHAVIOR) });
   await api._handlers["action:ytdlp-search-submit"]({ query: "radiohead" });
   const url = "https://www.youtube.com/watch?v=aaaaaaaaaaa";
-  const rowId = plugin._encodeRef(url, false);
+  const rowId = plugin._encodeRef(url);
   api._handlers["action:ytdlp-queue-video"]({ selectedIds: [rowId] });
   assert.equal(api.calls.insertTracks.length, 1);
-  assert.equal(api.calls.insertTracks[0].tracks[0].path, plugin._encodeRef(url, true));
-  assert.ok(api.calls.insertTracks[0].tracks[0].path.endsWith(".mp4"));
+  assert.equal(api.calls.insertTracks[0].tracks[0].path, plugin._encodeRef(url));
+  assert.equal(api.calls.insertTracks[0].tracks[0].kind, "video");
 });

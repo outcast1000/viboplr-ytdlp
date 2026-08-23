@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.23.0
+- **The fake `.mp4` ref suffix is retired.** Audio-vs-video now travels the
+  documented way, both directions: every track the plugin hands the host
+  carries `kind: "audio" | "video"` (the new `PluginTrack.kind` channel), and
+  the host hands the intent back at resolve time as `opts.video` on
+  `onResolveStreamByUri`. New refs are pure encoded page URLs — audio and
+  video of one page share one identity — and `decodeRef` keeps parsing legacy
+  suffixed refs forever, since they live in persisted queues. **Requires the
+  host release that ships both halves** (`minAppVersion` 1.0.34): on an older
+  host a suffix-less video ref would resolve as audio, so older hosts simply
+  keep v1.22.x.
+
 ## v1.22.1
 - **Sharper seek-preview filmstrips on long videos.** The storyboard picker's
   sheet budget doubles (8 → 16), so the readable 160×90 level (sb1) now covers

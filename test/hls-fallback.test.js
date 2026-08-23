@@ -78,8 +78,9 @@ test("video resolve: no muxed stream -> direct-url extraction fails -> HLS maste
     ]),
     fetch: { "v.redd.it": { status: 200 } },
   });
-  const id = p._encodeRef(REDDIT_URL, true).slice("ytdlp://".length);
-  const res = await api._handlers["streamuri:ytdlp"](id);
+  const id = p._encodeRef(REDDIT_URL).slice("ytdlp://".length);
+  // Video intent arrives as opts.video now, not as a ref suffix.
+  const res = await api._handlers["streamuri:ytdlp"](id, null, { video: true });
   assert.equal(res.candidates[0].url, MASTER);
   assert.equal(res.sourceUrl, REDDIT_URL, "attributed to the post, not to the ytdlp:// uri");
 });
@@ -91,8 +92,8 @@ test("video resolve still prefers a muxed direct URL when one exists (no formats
     ]),
     fetch: { "direct.example": { status: 200 } },
   });
-  const id = p._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa", true).slice("ytdlp://".length);
-  const res = await api._handlers["streamuri:ytdlp"](id);
+  const id = p._encodeRef("https://www.youtube.com/watch?v=aaaaaaaaaaa").slice("ytdlp://".length);
+  const res = await api._handlers["streamuri:ytdlp"](id, null, { video: true });
   assert.equal(res.candidates[0].url, "https://direct.example/muxed.mp4");
   assert.ok(!api.calls.exec.some((c) => c.args.includes("%(formats)j")), "no fallback lookup when the direct-url extraction succeeds");
 });

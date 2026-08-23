@@ -182,8 +182,8 @@ test("a video resolve logs the engine, the formats offered and the menu returned
   const { api, plugin: p } = await activated({
     exec: rules([{ match: { cmd: "yt-dlp", argsInclude: ["-j"] }, result: { exitCode: 0, stdout: INFO_JSON } }]),
   });
-  const id = p._encodeRef(VIDEO_URL, true).slice("ytdlp://".length);
-  const out = await api._handlers["streamuri:ytdlp"](id, null, { externalAudio: true });
+  const id = p._encodeRef(VIDEO_URL).slice("ytdlp://".length);
+  const out = await api._handlers["streamuri:ytdlp"](id, null, { externalAudio: true, video: true });
   assert.ok(out && out.candidates.length, "the resolve succeeded");
 
   const log = logText(api);
@@ -202,9 +202,9 @@ test("every line of one resolve shares a trace id, and steps are numbered in ord
   const { api, plugin: p } = await activated({
     exec: rules([{ match: { cmd: "yt-dlp", argsInclude: ["-j"] }, result: { exitCode: 0, stdout: INFO_JSON } }]),
   });
-  const id = p._encodeRef(VIDEO_URL, true).slice("ytdlp://".length);
-  await api._handlers["streamuri:ytdlp"](id, null, { externalAudio: true });
-  await api._handlers["streamuri:ytdlp"](id, null, { externalAudio: true });
+  const id = p._encodeRef(VIDEO_URL).slice("ytdlp://".length);
+  await api._handlers["streamuri:ytdlp"](id, null, { externalAudio: true, video: true });
+  await api._handlers["streamuri:ytdlp"](id, null, { externalAudio: true, video: true });
 
   const ids = api.calls.log.map((l) => (l.msg.match(/^\[(r\d+)\]/) || [])[1]).filter(Boolean);
   const unique = [...new Set(ids)];
@@ -220,8 +220,8 @@ test("a failed extraction logs the exit code, the reason and the fallback that f
       { match: { cmd: "yt-dlp", argsInclude: ["%(formats)j"] }, result: { exitCode: 0, stdout: JSON.stringify(FORMATS) } },
     ]),
   });
-  const id = p._encodeRef(VIDEO_URL, true).slice("ytdlp://".length);
-  await api._handlers["streamuri:ytdlp"](id);
+  const id = p._encodeRef(VIDEO_URL).slice("ytdlp://".length);
+  await api._handlers["streamuri:ytdlp"](id, null, { video: true });
 
   const log = logText(api);
   assert.match(log, /direct-url: exit 1 in .* — ERROR: \[youtube\] x: Requested format is not available/);
@@ -238,8 +238,8 @@ test("the direct-URL extraction reports which format it handed over", async () =
       result: { exitCode: 0, stdout: "https://cdn.example/muxed.mp4\n" + FMT_LINE },
     }]),
   });
-  const id = p._encodeRef(VIDEO_URL, true).slice("ytdlp://".length);
-  const out = await api._handlers["streamuri:ytdlp"](id);
+  const id = p._encodeRef(VIDEO_URL).slice("ytdlp://".length);
+  const out = await api._handlers["streamuri:ytdlp"](id, null, { video: true });
   assert.equal(out.candidates[0].url, "https://cdn.example/muxed.mp4", "the extra --print does not disturb the parse");
 
   const run = api.calls.exec.find((c) => c.args.includes("%(urls)s"));
@@ -274,8 +274,8 @@ test("download-then-play mode still finds the file path past the format line", a
       result: { exitCode: 0, stdout: "ytdlp-fmt\t137\tmp4\tavc1.640028\tnone\t1080\t4500\thttps\t137+140\n/tmp/cache/abc.mp4" },
     }]),
   });
-  const id = p._encodeRef(VIDEO_URL, true).slice("ytdlp://".length);
-  const out = await api._handlers["streamuri:ytdlp"](id);
+  const id = p._encodeRef(VIDEO_URL).slice("ytdlp://".length);
+  const out = await api._handlers["streamuri:ytdlp"](id, null, { video: true });
   assert.equal(out.candidates[0].url, "file:///tmp/cache/abc.mp4");
   assert.match(logText(api), /saved \/tmp\/cache\/abc\.mp4 — id 137 · 1080p · mp4/);
 });
