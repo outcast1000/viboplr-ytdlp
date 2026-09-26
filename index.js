@@ -2613,6 +2613,66 @@ async function activate(api) {
     downloadTrackFor(api, target);
   });
 
+  // ---- Assistant tools (api.assistant) ----
+  // The AI-facing surface (host control API / MCP). Deliberately NOT a global
+  // search provider — that was removed (v1.21) because per-keystroke offers
+  // spent yt-dlp searches against YouTube's bot gate; an assistant makes one
+  // deliberate call per request, which is exactly the budget a search here
+  // costs. Guarded: older hosts have no api.assistant namespace.
+  if (api.assistant) {
+    api.assistant.onTool("search", async function (args) {
+      var query = typeof args.query === "string" ? args.query.trim() : "";
+      if (!query) throw new Error('"query" (string) is required');
+      var source = args.source || "youtube";
+      if (!SOURCES[source] || (!SOURCES[source].prefix && !isHttpUrl(query))) {
+        throw new Error('"source" must be "youtube" or "soundcloud" (or pass a URL as the query)');
+      }
+      var limit = Math.min(25, Math.max(1, parseInt(args.limit, 10) || 10));
+      await ensureToolStatus(api);
+      if (!ytDlpVersion) throw new Error("yt-dlp is not installed — the user can install it in Settings → Dependencies");
+      var cands = await runSearch(api, isHttpUrl(query) ? "link" : source, query, limit);
+      return {
+        results: cands.slice(0, limit).map(function (c) {
+          var parsed = parseTrackTitle(c.title, c.uploader);
+          return {
+            title: parsed.title || c.title,
+            artist: parsed.artist || c.uploader || null,
+            uploader: c.uploader || null,
+            durationSecs: c.durationSecs != null ? c.durationSecs : null,
+            url: c.url,
+          };
+        }),
+      };
+    });
+
+    api.assistant.onTool("play_url", async function (args) {
+      var url = typeof args.url === "string" ? args.url.trim() : "";
+      if (!isHttpUrl(url)) throw new Error('"url" (http/https) is required — get one from the search tool or the user');
+      await ensureToolStatus(api);
+      if (!ytDlpVersion) throw new Error("yt-dlp is not installed — the user can install it in Settings → Dependencies");
+      // A single video becomes one row; a playlist/album/set URL fans out into
+      // its entries (capped at LINK_MAX) — same path as the sidebar Link tab.
+      var full = await runSearchFull(api, "link", url, LINK_MAX);
+      var cands = full.candidates;
+      if (cands.length === 0) throw new Error("yt-dlp found nothing playable at that URL");
+      var isVideo = args.video === true;
+      var tracks = cands.map(function (c) { return buildTrack(c, isVideo); });
+      if (args.enqueue === true) {
+        api.playback.insertTracks(tracks, -1);
+      } else {
+        var ctx = cands.length > 1
+          ? { name: (full.meta && full.meta.title) || "Fetched link", source: "playlist", coverUrl: tracks[0].image_url || undefined }
+          : undefined;
+        api.playback.playTracks(tracks, 0, ctx);
+      }
+      return {
+        queued: tracks.length,
+        mode: args.enqueue === true ? "enqueued" : "playing",
+        first: { title: tracks[0].title, artist: tracks[0].artist_name },
+      };
+    });
+  }
+
   // ---- Download provider: qualities ----
   api.downloads.onGetQualities("ytdlp-download", function () {
     // "Original" keeps the source stream verbatim — the best quality and the

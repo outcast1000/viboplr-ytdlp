@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.25.0
+- **AI assistants can search and play.** Two tools on the host's new assistant
+  surface (`api.assistant`, Viboplr's AI control API): `search` (YouTube /
+  SoundCloud candidates with title, artist, duration and the source url) and
+  `play_url` (play or enqueue any URL yt-dlp handles — a playlist/album URL
+  fans out into its entries, same path as the sidebar's Link tab; `video: true`
+  routes to the theater).
+- This deliberately does **not** restore the removed global search provider
+  (v1.21): that spent a yt-dlp search per keystroke-offer against YouTube's
+  bot gate. An assistant makes one deliberate call per request, which is
+  exactly the budget a search costs — so the same capability returns through
+  a channel that can't burn it.
+- Guarded on `api.assistant` existing — on hosts older than the surface this
+  release changes nothing.
+- **The Download menu item no longer names the plugin itself** (`Download…`).
+  Apps that prefix plugin menu items with the plugin name show it as
+  "yt-dlp: Download…"; older apps show a bare "Download…".
+
 ## v1.24.0
 - **New "Web" search tab: web indexers.** The sidebar gains a Web tab that
   searches websites *directly* — no yt-dlp involved in the search itself —

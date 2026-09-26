@@ -1,7 +1,7 @@
 {
   "id": "ytdlp",
   "name": "yt-dlp",
-  "version": "1.24.0",
+  "version": "1.25.0",
   "author": "Viboplr",
   "description": "Play and download audio and video from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via yt-dlp. Search the web directly with built-in and user-defined web indexers. Replaces the YouTube plugin.",
   "apiUsage": [
@@ -47,6 +47,61 @@
     }
   ],
   "contributes": {
+    "assistant": {
+      "instructions": "Play music/video from YouTube, SoundCloud, Bandcamp and 1000+ sites via yt-dlp (requires the yt-dlp binary — Settings → Dependencies). Flow: search (deliberate calls only — each one costs a yt-dlp run against the site) → pick a result → play_url with its url. play_url also takes a user-pasted link directly, and a playlist/album URL fans out into its tracks. For 'find this track's video' there is also the fire-and-forget context-menu action ytdlp-watch-video (POST /v1/actions/invoke), which searches by title+artist and plays the top hit in one step.",
+      "tools": [
+        {
+          "name": "search",
+          "description": "Search YouTube or SoundCloud via yt-dlp — returns candidates (title/artist/duration/url). Slow (a yt-dlp run, ~3-10s). A URL as the query lists what's playable there instead",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string",
+                "enum": [
+                  "youtube",
+                  "soundcloud"
+                ],
+                "description": "default youtube"
+              },
+              "limit": {
+                "type": "number",
+                "description": "1-25, default 10"
+              }
+            },
+            "required": [
+              "query"
+            ]
+          }
+        },
+        {
+          "name": "play_url",
+          "description": "Play (or enqueue) a URL yt-dlp can handle — a video/track URL plays it, a playlist/album/set URL plays all its entries. Streams resolve at play time",
+          "inputSchema": {
+            "type": "object",
+            "properties": {
+              "url": {
+                "type": "string"
+              },
+              "video": {
+                "type": "boolean",
+                "description": "Play as video in the theater (default audio)"
+              },
+              "enqueue": {
+                "type": "boolean",
+                "description": "Append to the queue instead of replacing it"
+              }
+            },
+            "required": [
+              "url"
+            ]
+          }
+        }
+      ]
+    },
     "sidebarItems": [
       {
         "id": "ytdlp-search",
@@ -76,7 +131,7 @@
       },
       {
         "id": "ytdlp-download-track",
-        "label": "Download with yt-dlp…",
+        "label": "Download…",
         "targets": [
           "track"
         ]
