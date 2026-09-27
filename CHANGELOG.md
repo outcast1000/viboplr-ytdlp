@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.25.1
+- **`play_url` with `enqueue: true` skips what's already queued.** Tracks
+  whose source is already in the queue are left out, and the tool reports
+  them as `skippedDuplicates` beside `queued` (now the count actually
+  inserted; `first` is `null` when nothing was new). Newer Viboplr versions
+  answer a duplicate insert with a banner for the user to decide. That's
+  right for a button press, but for a tool call the assistant was told
+  "enqueued" while the tracks waited on a prompt nobody asked for. The
+  match uses `path`, the same key the app's own duplicate check compares,
+  so the app never sees a duplicate from this tool.
+- The sidebar's own Queue buttons are unchanged: a user gesture still gets
+  the banner, like the rest of the app. On apps without `getQueue`, which
+  have no banner either, everything is inserted as before.
+
 ## v1.25.0
 - **AI assistants can search and play.** Two tools on the host's new assistant
   surface (`api.assistant`, Viboplr's AI control API): `search` (YouTube /

@@ -318,6 +318,27 @@ function buildTrack(c, isVideo) {
   };
 }
 
+// Split tracks into those not yet in the queue and the ones that are, by
+// `path` — exactly the key the host's own duplicate check compares. Used by the
+// play_url assistant tool: newer hosts answer a duplicate insertTracks with a
+// banner for the user to decide, which is right for a button press but wrong
+// for a tool call (the assistant would be told "enqueued" while the tracks
+// wait on a prompt nobody asked for). Skipping them here means the host never
+// sees a duplicate and the tool can report what really landed.
+function splitAlreadyQueued(tracks, queueTracks) {
+  var queued = {};
+  for (var i = 0; i < queueTracks.length; i++) {
+    var p = queueTracks[i] && queueTracks[i].path;
+    if (p) queued[p] = true;
+  }
+  var fresh = [], skipped = [];
+  for (var j = 0; j < tracks.length; j++) {
+    if (tracks[j].path && queued[tracks[j].path]) skipped.push(tracks[j]);
+    else fresh.push(tracks[j]);
+  }
+  return { fresh: fresh, skipped: skipped };
+}
+
 // ---------------------------------------------------------------------------
 // Tool status (read-only, from the host — never probed here)
 // ---------------------------------------------------------------------------
@@ -2658,16 +2679,28 @@ async function activate(api) {
       var isVideo = args.video === true;
       var tracks = cands.map(function (c) { return buildTrack(c, isVideo); });
       if (args.enqueue === true) {
-        api.playback.insertTracks(tracks, -1);
-      } else {
-        var ctx = cands.length > 1
-          ? { name: (full.meta && full.meta.title) || "Fetched link", source: "playlist", coverUrl: tracks[0].image_url || undefined }
-          : undefined;
-        api.playback.playTracks(tracks, 0, ctx);
+        // A tool call skips what's already queued instead of raising the
+        // host's duplicate banner (see splitAlreadyQueued). Older hosts have
+        // no getQueue and no banner, so everything is inserted as before.
+        var q = typeof api.playback.getQueue === "function" ? api.playback.getQueue() : null;
+        var split = splitAlreadyQueued(tracks, (q && q.tracks) || []);
+        if (split.fresh.length > 0) api.playback.insertTracks(split.fresh, -1);
+        return {
+          queued: split.fresh.length,
+          skippedDuplicates: split.skipped.length,
+          mode: "enqueued",
+          first: split.fresh.length > 0
+            ? { title: split.fresh[0].title, artist: split.fresh[0].artist_name }
+            : null,
+        };
       }
+      var ctx = cands.length > 1
+        ? { name: (full.meta && full.meta.title) || "Fetched link", source: "playlist", coverUrl: tracks[0].image_url || undefined }
+        : undefined;
+      api.playback.playTracks(tracks, 0, ctx);
       return {
         queued: tracks.length,
-        mode: args.enqueue === true ? "enqueued" : "playing",
+        mode: "playing",
         first: { title: tracks[0].title, artist: tracks[0].artist_name },
       };
     });
@@ -4751,6 +4784,7 @@ return {
   _isProgressLine: isProgressLine,
   _thumbFor: thumbFor,
   _parseSearchOutput: parseSearchOutput,
+  _splitAlreadyQueued: splitAlreadyQueued,
   _decodeHtmlEntities: decodeHtmlEntities,
   _classifyYtdlpError: classifyYtdlpError,
   _warrantsDeepDiagnostics: warrantsDeepDiagnostics,

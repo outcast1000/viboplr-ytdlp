@@ -1,7 +1,7 @@
 {
   "id": "ytdlp",
   "name": "yt-dlp",
-  "version": "1.25.0",
+  "version": "1.25.1",
   "author": "Viboplr",
   "description": "Play and download audio and video from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via yt-dlp. Search the web directly with built-in and user-defined web indexers. Replaces the YouTube plugin.",
   "apiUsage": [
@@ -92,7 +92,7 @@
               },
               "enqueue": {
                 "type": "boolean",
-                "description": "Append to the queue instead of replacing it"
+                "description": "Append to the queue instead of replacing it. Entries already in the queue are skipped and counted in skippedDuplicates"
               }
             },
             "required": [
