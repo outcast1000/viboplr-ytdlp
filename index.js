@@ -19,6 +19,7 @@
 // ---------------------------------------------------------------------------
 var ytDlpVersion = null;
 var ffmpegVersion = null;
+var ytDlpLatest = null; // newest yt-dlp per the host's cached release check (never fetched here)
 var statusLoaded = false;
 
 // Settings (persisted).
@@ -351,6 +352,7 @@ async function loadToolStatus(api) {
     var y = results[0], f = results[1];
     ytDlpVersion = y && y.installed ? (y.version || "unknown") : null;
     ffmpegVersion = f && f.installed ? (f.version || "unknown") : null;
+    ytDlpLatest = y && y.latest ? String(y.latest) : null;
   } else {
     ytDlpVersion = "unknown";
     ffmpegVersion = "unknown";
@@ -2454,6 +2456,7 @@ async function resolveDownload(api, url, format, caller, trace) {
 // Activation
 // ---------------------------------------------------------------------------
 async function activate(api) {
+  lastViewHeader = null; // the host drops runtime header state on reload
   var stored = await Promise.all([
     api.storage.get("cacheMaxMb"),
     api.storage.get("playbackMode"),
@@ -4351,6 +4354,39 @@ function webIndexerSettingsRows() {
 // ---------------------------------------------------------------------------
 // Views
 // ---------------------------------------------------------------------------
+// Pure: the host-drawn header over the sidebar view (api.ui.setViewHeader).
+// It says whether yt-dlp works, in one word, plus which tools it found; the fix
+// for a missing yt-dlp stays in makeMissingDepNote's banner. `null` = nothing
+// known yet (the manifest's subtitle stands).
+var VIEW_HEADER_SUBTITLE = "YouTube, SoundCloud, Bandcamp and 1000+ other sites";
+function viewHeaderFor(t) {
+  if (!t || !t.loaded) return null;
+  if (!t.ytdlp) {
+    return { subtitle: VIEW_HEADER_SUBTITLE, status: { variant: "error", label: "yt-dlp missing" }, actions: [] };
+  }
+  var sub = (t.ytdlp === "unknown" ? "yt-dlp installed" : "yt-dlp " + t.ytdlp) +
+    " · " + (t.ffmpeg ? "ffmpeg found" : "no ffmpeg (no merging or conversion)");
+  var outdated = t.ytdlp !== "unknown" && t.latest && isOlderVersion(t.ytdlp, t.latest);
+  return {
+    subtitle: sub,
+    status: outdated ? { variant: "warning", label: "Update available" } : { variant: "success", label: "Ready" },
+    actions: []
+  };
+}
+
+// Sends the header only when it changed: renderSearchView runs on every
+// keystroke-level state change, and each setViewHeader re-renders the host.
+var lastViewHeader = null;
+function pushViewHeader(api) {
+  if (!api || !api.ui || typeof api.ui.setViewHeader !== "function") return; // hosts < 1.0.77
+  var header = viewHeaderFor({ loaded: statusLoaded, ytdlp: ytDlpVersion, ffmpeg: ffmpegVersion, latest: ytDlpLatest });
+  if (!header) return;
+  var key = JSON.stringify(header);
+  if (key === lastViewHeader) return;
+  lastViewHeader = key;
+  api.ui.setViewHeader("ytdlp-search", header);
+}
+
 function makeMissingDepNote() {
   if (!statusLoaded || ytDlpVersion) return null;
   return { type: "text", className: "ds-banner ds-banner--error",
@@ -4530,6 +4566,7 @@ function appendTuningView(children) {
 }
 
 function renderSearchView(api) {
+  pushViewHeader(api);
   var children = [];
   var note = makeMissingDepNote();
   if (note) children.push(note);
@@ -4804,6 +4841,7 @@ return {
   _videoFormatSelector: videoFormatSelector,
   _dropSoundcloudPreviews: dropSoundcloudPreviews,
   _loadToolStatus: loadToolStatus,
+  _viewHeaderFor: viewHeaderFor,
   _engineLabel: engineLabel,
   _describeContext: describeContext,
   _fmtMs: fmtMs,

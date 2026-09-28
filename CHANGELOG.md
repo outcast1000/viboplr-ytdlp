@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.26.0
+- **The view's header says whether yt-dlp works.** Viboplr 1.0.77 draws a
+  header over every plugin view; this plugin now fills it in. It reads
+  "yt-dlp 2026.09.01 · ffmpeg found" (or "no ffmpeg (no merging or
+  conversion)") with a **Ready** status, **Update available** when the app's
+  own dependency check knows of a newer yt-dlp, and **yt-dlp missing** when it
+  isn't installed. The missing-binary banner inside the view is unchanged and
+  still carries the fix. Nothing is probed or fetched for this: it is the same
+  host-cached dependency status the view already used.
+- On older app versions nothing changes.
+
 ## v1.25.1
 - **`play_url` with `enqueue: true` skips what's already queued.** Tracks
   whose source is already in the queue are left out, and the tool reports
