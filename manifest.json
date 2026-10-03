@@ -1,7 +1,7 @@
 {
   "id": "ytdlp",
   "name": "yt-dlp",
-  "version": "1.26.0",
+  "version": "1.27.0",
   "author": "Viboplr",
   "description": "Play and download audio and video from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via yt-dlp. Search the web directly with built-in and user-defined web indexers. Replaces the YouTube plugin.",
   "apiUsage": [
@@ -30,7 +30,9 @@
       "reason": "Download a track by finding it on your configured fallback source"
     }
   ],
-  "minAppVersion": "1.0.34",
+  "minAppVersion": "1.0.85",
+  "runtime": "worker",
+  "permissions": ["exec:yt-dlp", "network:*", "playback:read", "playback:control"],
   "homepage": "https://github.com/outcast1000/viboplr-ytdlp",
   "updateUrl": "https://github.com/outcast1000/viboplr-ytdlp/releases/latest/download/update.json",
   "viewHeader": {

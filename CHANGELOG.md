@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.27.0
+- **Runs in the plugin worker runtime.** It now gets only what it asks for
+  — `exec:yt-dlp`, `network:*`, `playback:read`, `playback:control` — and can't reach anything else in the app. Viboplr asks
+  you to allow these once when you update. Requires Viboplr 1.0.85.
+- `network:*` because web indexers you add (or install from the catalog) can
+  live on any host.
+
 ## v1.26.0
 - **The view's header says whether yt-dlp works.** Viboplr 1.0.77 draws a
   header over every plugin view; this plugin now fills it in. It reads
