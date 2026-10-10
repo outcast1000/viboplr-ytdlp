@@ -62,6 +62,11 @@ jobs:
           fi
 
       - name: Build artifacts (ytdlp.zip + update.json)
+        env:
+          # The Viboplr PLUGIN-signing key (minisign id 15B3CD58A11504F3) — never the app updater key.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          REQUIRE_SIGNATURE: "1"
         run: |
           chmod +x scripts/package.sh
           scripts/package.sh

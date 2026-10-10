@@ -14,8 +14,28 @@ if [ -f CHANGELOG.md ]; then
   CHANGELOG=$(awk '/^## /{if(seen)exit; seen=1; next} seen{print}' CHANGELOG.md | sed '/^$/d' | head -50)
 fi
 
+# Signature. Signed with the Viboplr PLUGIN-signing key (never the app updater
+# key) whenever it is in the environment, and REQUIRED in CI (REQUIRE_SIGNATURE=1).
+# A plugin signed by that key is pre-approved by the app: no permission prompt on
+# install or update. Verified before zipping, because a signature that doesn't
+# match is refused outright. A local build without the key ships unsigned.
+rm -f signature.sig
+if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}${TAURI_SIGNING_PRIVATE_KEY_PATH:-}" ]; then
+  node scripts/plugin-signing.mjs sign .
+  node scripts/plugin-signing.mjs verify .
+elif [ "${REQUIRE_SIGNATURE:-}" = "1" ]; then
+  echo "error: REQUIRE_SIGNATURE=1 but no TAURI_SIGNING_PRIVATE_KEY is set." >&2
+  exit 1
+else
+  echo "note: no plugin-signing key in the environment — building UNSIGNED (local use only)."
+fi
+
 rm -f ytdlp.zip
-zip -q ytdlp.zip manifest.json index.js
+if [ -f signature.sig ]; then
+  zip -q ytdlp.zip manifest.json index.js signature.sig
+else
+  zip -q ytdlp.zip manifest.json index.js
+fi
 echo "--- zip contents (manifest.json must have no dir prefix) ---"
 unzip -l ytdlp.zip
 
