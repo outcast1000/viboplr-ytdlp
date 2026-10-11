@@ -1,35 +1,9 @@
 {
   "id": "ytdlp",
   "name": "yt-dlp",
-  "version": "1.27.1",
+  "version": "1.27.2",
   "author": "Viboplr",
   "description": "Play and download audio and video from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via yt-dlp. Search the web directly with built-in and user-defined web indexers. Replaces the YouTube plugin.",
-  "apiUsage": [
-    {
-      "api": "system.exec",
-      "reason": "Run yt-dlp (search, resolve, download) and ffmpeg (merge and convert streams)"
-    },
-    {
-      "api": "network.fetch",
-      "reason": "Search websites directly (the Web tab's built-in and user-added web indexers)"
-    },
-    {
-      "api": "storage.set",
-      "reason": "Remember your settings, scoring profiles and web indexer definitions, and manage the audio/video cache"
-    },
-    {
-      "api": "playback.onStreamResolve",
-      "reason": "Play any track by finding it on YouTube or SoundCloud when it has no source of its own"
-    },
-    {
-      "api": "playback.onResolveStreamByUri",
-      "reason": "Play the exact video or track a ytdlp:// queue entry points at"
-    },
-    {
-      "api": "downloads.onResolveByMetadata",
-      "reason": "Download a track by finding it on your configured fallback source"
-    }
-  ],
   "minAppVersion": "1.0.85",
   "runtime": "worker",
   "permissions": [
@@ -38,6 +12,12 @@
     "playback:read",
     "playback:control"
   ],
+  "permissionReasons": {
+    "exec:yt-dlp": "Search, play and download from YouTube, SoundCloud and the 1000+ other sites yt-dlp supports",
+    "network:*": "Web indexers you add can point at any site, and seek-preview images come from whichever site hosts the video",
+    "playback:read": "Check what's already queued, so an assistant's enqueue request skips songs that are already there",
+    "playback:control": "Play or enqueue what you pick from yt-dlp searches, or what an assistant asks for"
+  },
   "homepage": "https://github.com/outcast1000/viboplr-ytdlp",
   "updateUrl": "https://github.com/outcast1000/viboplr-ytdlp/releases/latest/download/update.json",
   "viewHeader": {

@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.27.2
+- Each permission now says why the plugin needs it, shown under it when Viboplr asks. No functional changes.
+
 ## v1.27.1
 - Releases are now signed with the Viboplr plugin-signing key, so Viboplr allows the permissions this plugin asks for without prompting. No functional changes.
 
