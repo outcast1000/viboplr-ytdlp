@@ -2175,7 +2175,8 @@ async function resolveStoryboard(api, url, refId) {
     var segs = ["storyboards", name];
     try {
       if (!(await api.storage.files.exists(segs))) {
-        await api.storage.files.download(segs, board.sheets[i]);
+        // Hosts before the `init` argument ignore it and send their default.
+        await api.storage.files.download(segs, board.sheets[i], withClientUserAgent());
       }
       local.push(await api.storage.files.getPath(segs));
       names.push(name);
@@ -3145,7 +3146,7 @@ async function activate(api) {
     // sharing a definition becomes sharing a URL.
     if (isHttpUrl(text)) {
       try {
-        var resp = await api.network.fetch(text, { method: "GET", timeoutMs: WEB_TIMEOUT_MS });
+        var resp = await api.network.fetch(text, withClientUserAgent({ method: "GET", timeoutMs: WEB_TIMEOUT_MS }));
         var status = Number(resp && resp.status) || 0;
         if (status < 200 || status >= 300) throw new Error("HTTP " + status);
         text = (await resp.text()).trim();
@@ -3235,7 +3236,7 @@ async function activate(api) {
     webCatalogError = null;
     renderSettings(api);
     try {
-      var resp = await api.network.fetch(WEB_CATALOG_URL, { method: "GET", timeoutMs: WEB_TIMEOUT_MS });
+      var resp = await api.network.fetch(WEB_CATALOG_URL, withClientUserAgent({ method: "GET", timeoutMs: WEB_TIMEOUT_MS }));
       var status = Number(resp && resp.status) || 0;
       if (status < 200 || status >= 300) throw new Error("HTTP " + status);
       var parsed = parseWebCatalog(await resp.text());
@@ -3741,6 +3742,19 @@ function applyWebFilters(value, filters) {
 
 // --- Indexer definitions & engine ----------------------------------------------
 
+// The host's default User-Agent is browser-style, which some filtering proxies
+// block from a non-browser client, so our own requests name us. A User-Agent
+// an indexer definition sets for itself wins.
+var CLIENT_USER_AGENT = "Vibo";
+function withClientUserAgent(init) {
+  var out = Object.assign({}, init || {});
+  var headers = Object.assign({}, out.headers || {});
+  var hasUa = Object.keys(headers).some(function (k) { return k.toLowerCase() === "user-agent"; });
+  if (!hasUa) headers["User-Agent"] = CLIENT_USER_AGENT;
+  out.headers = headers;
+  return out;
+}
+
 var WEB_TIMEOUT_MS = 10000;
 var WEB_MIN_GAP_MS = 2500;
 var WEB_GAP_JITTER_MS = 500;
@@ -4178,7 +4192,7 @@ async function runWebSearch(api, query) {
   var cacheKey = JSON.stringify(["web", q, ids]);
   var cached = cacheGet(searchCache, cacheKey, Date.now());
   if (!cached) {
-    cached = await webSearchAll(defs, q, function (url, init) { return api.network.fetch(url, init); });
+    cached = await webSearchAll(defs, q, function (url, init) { return api.network.fetch(url, withClientUserAgent(init)); });
     if (cached.candidates.length) cachePut(searchCache, cacheKey, cached, Date.now() + SEARCH_CACHE_TTL_MS, CACHE_MAX_ENTRIES);
   }
   // Hand every caller its own candidate objects — same reason as
