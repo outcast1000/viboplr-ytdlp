@@ -19,8 +19,9 @@ test("engineLabel names the only engine signal the host sends", () => {
   // externalAudio is set exactly when native mpv will render this as video, and
   // it is the difference between "menu of split streams" and "one muxed stream"
   // — i.e. between 1080p and YouTube's 360p muxed itag.
-  assert.match(plugin._engineLabel(true), /native mpv/);
-  assert.match(plugin._engineLabel(false), /self-contained/);
+  assert.match(plugin._engineLabel(true), /mpv\/split/);
+  assert.match(plugin._engineLabel(false), /mpv\/single.*self-contained/);
+  assert.ok(!/browser/.test(plugin._engineLabel(false)), "the browser engine is gone");
 });
 
 test("describeContext carries every decision input the argv doesn't show", () => {
@@ -28,7 +29,7 @@ test("describeContext carries every decision input the argv doesn't show", () =>
     externalAudio: true, mode: "stream", preferVideo: true, fresh: true,
     maxHeight: 1080, ytDlp: "2026.07.04", ffmpeg: "7.0",
   });
-  assert.match(line, /engine=native mpv/);
+  assert.match(line, /engine=mpv\/split/);
   assert.match(line, /playback=stream/);
   assert.match(line, /preferVideo=yes/);
   assert.match(line, /fresh=yes/);
@@ -49,7 +50,7 @@ test("describeContext omits the engine when there was no such hint to report", (
   // invented fact, which is worse in a diagnostic than a missing one.
   const line = plugin._describeContext({ mode: "stream", maxHeight: 0 });
   assert.ok(!/engine=/.test(line), line);
-  assert.match(plugin._describeContext({ externalAudio: false }), /engine=browser/);
+  assert.match(plugin._describeContext({ externalAudio: false }), /engine=mpv\/single/);
 });
 
 test("fmtMs keeps millisecond resolution below a second", () => {
@@ -131,6 +132,7 @@ test("parseChosenFormat reads back the tagged --print line", () => {
   assert.deepEqual(f, {
     id: "18", ext: "mp4", vcodec: "avc1.42001E", acodec: "mp4a.40.2",
     height: 360, tbr: 600.5, protocol: "https", format: "18 - 640x360 (360p)",
+    availableAt: null,
   });
   assert.match(plugin._describeChosenFormat(f), /id 18 · 360p · mp4 · v:avc1\.42001E · a:mp4a\.40\.2 · 601k · https/);
 });
@@ -188,7 +190,7 @@ test("a video resolve logs the engine, the formats offered and the menu returned
 
   const log = logText(api);
   assert.match(log, /stream resolve by uri — https:\/\/www\.youtube\.com/);
-  assert.match(log, /engine=native mpv/, "which engine shaped the answer");
+  assert.match(log, /engine=mpv\/split/, "which engine shaped the answer");
   assert.match(log, /cap=1080p/, "the resolution cap in force");
   assert.match(log, /6 format\(s\): 2 video-only/, "the full format table");
   assert.match(log, /cap 1080p hides 1 video format\(s\): 2160p/);

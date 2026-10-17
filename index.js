@@ -525,18 +525,19 @@ function fmtMs(ms) {
   return ms < 1000 ? Math.round(ms) + "ms" : (ms / 1000).toFixed(1) + "s";
 }
 
-// Pure: the only thing the host ever tells us about which engine will render
-// what we return. `externalAudio` is set exactly when the native mpv engine is
-// about to play this as video — mpv merges a video-only stream with a separate
-// audio-only one, so that one flag decides whether we may hand back a candidate
-// menu or have to find a single self-contained stream. It is also the answer to
-// "why did I only get 360p": YouTube's sole muxed format is itag 18 at 360p, so
-// a browser-engine resolve is capped there no matter how good the source is.
-// Exported for tests.
+// Pure: the only thing the host ever tells us about how it will play what we
+// return. The host plays everything through mpv (its browser engine is gone);
+// `externalAudio` is set exactly when mpv is about to play this as VIDEO and can
+// merge a video-only stream with a separate audio-only one, so that one flag
+// decides whether we may hand back a candidate menu or have to find a single
+// self-contained stream. Unset means an audio play (or a host that can't merge):
+// one stream. It is also the answer to "why did I only get 360p": YouTube's sole
+// muxed format is itag 18 at 360p, so a single-stream VIDEO resolve is capped
+// there no matter how good the source is. Exported for tests.
 function engineLabel(externalAudio) {
   return externalAudio
-    ? "native mpv (merges separate video+audio streams)"
-    : "browser/audio-only (needs one self-contained stream)";
+    ? "mpv/split (merges separate video+audio streams)"
+    : "mpv/single (one self-contained stream)";
 }
 
 // Pure: a resolve's decision inputs on one line. All of it is context the
@@ -585,9 +586,12 @@ function logLine(api, trace, level, msg) {
 }
 
 // Open a trace: one header line naming what is being resolved, one context line.
-function startTrace(api, kind, subject, ctx) {
+// `signal` (optional): the host's resolve signal (opts.signal on
+// onStreamResolve / onResolveStreamByUri). Every exec of this trace honours it —
+// see execLogged.
+function startTrace(api, kind, subject, ctx, signal) {
   traceSeq++;
-  var trace = { api: api, id: "r" + traceSeq, n: 0, startedAt: Date.now() };
+  var trace = { api: api, id: "r" + traceSeq, n: 0, startedAt: Date.now(), signal: signal || null };
   traceLog(trace, "info", kind + " — " + subject);
   traceLog(trace, "info", "  " + describeContext(ctx));
   return trace;
@@ -635,8 +639,36 @@ function stderrGist(stderr, max) {
 // `opts` is passed to the host VERBATIM, including when it is undefined: an
 // absent `cwd` means the app data dir while `{ cwd: null }` means none, so
 // defaulting one to the other here would quietly change where a child runs.
+//
+// A trace carrying the host's resolve `signal` (see traceSignal) makes the run
+// cancellable: when the host stops waiting — its per-resolver timeout, or the
+// play was superseded — the process is killed through exec's `onStart` handle,
+// and any later step of the same resolve is refused before it spawns. Without
+// this a yt-dlp search on a bad network ran on for minutes (once ~42) after
+// the host had moved on. Older hosts send no signal; nothing changes there.
 async function execLogged(api, trace, label, args, opts) {
   var t0 = Date.now();
+  var signal = trace && trace.signal;
+  if (signal && signal.aborted) {
+    traceLog(trace, "info", label + " skipped — the host stopped waiting for this resolve");
+    throw new Error("Cancelled");
+  }
+  var onAbort = null;
+  if (signal) {
+    var withStart = {};
+    if (opts) for (var k in opts) if (Object.prototype.hasOwnProperty.call(opts, k)) withStart[k] = opts[k];
+    withStart.onStart = function (handle) {
+      onAbort = function () {
+        traceLog(trace, "info", "host stopped waiting — killing " + label);
+        Promise.resolve(handle.cancel()).catch(function (e) {
+          api.log("warn", "Failed to cancel " + label + ": " + errText(e), "ytdlp");
+        });
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort);
+    };
+    opts = withStart;
+  }
   logLine(api, trace, "info", "run " + label + ": " + formatCmd("yt-dlp", args));
   var res;
   try {
@@ -650,6 +682,8 @@ async function execLogged(api, trace, label, args, opts) {
     traceLog(trace, cancelled ? "info" : "warn",
       label + (cancelled ? " cancelled" : " could not be run") + " after " + fmtMs(Date.now() - t0) + (cancelled ? "" : " — " + msg));
     throw e;
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
   }
   var outcome = "exit " + res.exitCode + " in " + fmtMs(Date.now() - t0);
   if (res.exitCode !== 0) {
@@ -780,8 +814,53 @@ function summarizeCandidates(candidates) {
 // for the URL and the header JSON, and a bare tab-separated line would be one
 // more thing for it to guess about.
 var CHOSEN_FMT_TAG = "ytdlp-fmt";
+// `available_at` rides last so a line from an older yt-dlp (no such field)
+// still parses every column before it.
 var CHOSEN_FMT_PRINT = CHOSEN_FMT_TAG +
-  "\t%(format_id)s\t%(ext)s\t%(vcodec)s\t%(acodec)s\t%(height)s\t%(tbr)s\t%(protocol)s\t%(format)s";
+  "\t%(format_id)s\t%(ext)s\t%(vcodec)s\t%(acodec)s\t%(height)s\t%(tbr)s\t%(protocol)s\t%(format)s\t%(available_at)s";
+
+// YouTube releases some clients' stream URLs only after the pre-roll ad the
+// client is expected to sit through ("Detected a 6s ad for tv_samsung"):
+// before `available_at` (epoch seconds, set per format by yt-dlp) the CDN
+// answers 403. yt-dlp honours it for its own downloads ("Sleeping 5.00 seconds
+// as required by the site") — but a URL we print is fetched by mpv ~100ms
+// later, so every stream failed with mpv's "loading failed (-13)", and each
+// host retry minted a new URL with a new wait and failed the same way. So we
+// wait it out before handing the URL over. Measured on 2026-10-18: URLs
+// printed ~2.5–3s before their `available_at`, 403 until about then.
+var STREAM_RELEASE_MARGIN_MS = 250;
+// A wait longer than this is not an ad gate we understand — hand the URL over
+// and let the host's retry path deal with it rather than hold playback hostage.
+var STREAM_RELEASE_MAX_WAIT_MS = 15000;
+
+// Pure: how long to wait before a stream with this `available_at` (epoch
+// seconds, or anything non-numeric for "none") can be fetched. Exported for tests.
+function streamReleaseWaitMs(availableAt, nowMs) {
+  var at = typeof availableAt === "string" ? parseFloat(availableAt) : availableAt;
+  if (typeof at !== "number" || !isFinite(at) || at <= 0) return 0;
+  var ms = at * 1000 + STREAM_RELEASE_MARGIN_MS - nowMs;
+  if (ms <= 0) return 0;
+  return Math.min(ms, STREAM_RELEASE_MAX_WAIT_MS);
+}
+
+// Pure: the latest `available_at` across a format list (one extraction, so in
+// practice they share one), or null. Exported for tests.
+function latestAvailableAt(formats) {
+  var max = null;
+  for (var i = 0; formats && i < formats.length; i++) {
+    var at = formats[i] && formats[i].available_at;
+    if (typeof at === "number" && isFinite(at) && (max === null || at > max)) max = at;
+  }
+  return max;
+}
+
+async function waitForStreamRelease(availableAt, trace) {
+  var ms = streamReleaseWaitMs(availableAt, Date.now());
+  if (!ms) return;
+  var settle = traceStep(trace, "wait for YouTube to release the stream");
+  await delay(ms);
+  settle("waited " + (ms / 1000).toFixed(1) + "s (available_at " + availableAt + ")");
+}
 
 // Pure: parse that line back out of a direct-URL extraction's stdout, or null
 // when yt-dlp printed none (an older build, or an extraction that failed before
@@ -796,7 +875,8 @@ function parseChosenFormat(stdout) {
     var str = function (v) { return v && v !== "NA" ? v : null; };
     return {
       id: str(c[1]), ext: str(c[2]), vcodec: str(c[3]), acodec: str(c[4]),
-      height: num(c[5]), tbr: num(c[6]), protocol: str(c[7]), format: str(c[8])
+      height: num(c[5]), tbr: num(c[6]), protocol: str(c[7]), format: str(c[8]),
+      availableAt: num(c[9])
     };
   }
   return null;
@@ -817,6 +897,53 @@ function describeChosenFormat(f) {
   if (f.protocol) bits.push(f.protocol);
   if (!bits.length) return "format not reported by yt-dlp";
   return bits.join(" · ") + (f.format ? "  [" + f.format + "]" : "");
+}
+
+// yt-dlp codec ids → the names people know. Unknown ids keep their family
+// prefix ("hev1.1.6.L93" → "hev1") rather than the whole profile string.
+var CODEC_NAMES = [
+  [/^(avc1|h264)/i, "H.264"], [/^(hev1|hvc1|h265|hevc)/i, "H.265"],
+  [/^vp0?9/i, "VP9"], [/^av01/i, "AV1"],
+  [/^(mp4a|aac)/i, "AAC"], [/^opus/i, "Opus"], [/^vorbis/i, "Vorbis"],
+  [/^mp3/i, "MP3"], [/^flac/i, "FLAC"]
+];
+function codecName(c) {
+  if (!c || c === "none") return null;
+  for (var i = 0; i < CODEC_NAMES.length; i++) if (CODEC_NAMES[i][0].test(c)) return CODEC_NAMES[i][1];
+  return c.split(".")[0];
+}
+
+// Pure: what a download actually fetched, as the one line the host's download
+// modal shows under "Quality" — e.g. "480p · H.264 + AAC · 714 kbps". This is
+// the answer to "did I get the 1080p I picked?": a quality option is a CAP, and
+// the selector's fallback chain can land well below it, so when it did, the line
+// says the source had nothing better rather than leaving the label's claim
+// standing. `opts`: { video, maxHeight, audioFormat } as passed to
+// buildDownloadArgs. Null when yt-dlp reported no format. Exported for tests.
+function describeDownloadQuality(f, opts) {
+  if (!f) return null;
+  opts = opts || {};
+  var v = codecName(f.vcodec), a = codecName(f.acodec);
+  var kbps = f.tbr ? Math.round(f.tbr) + " kbps" : null;
+  if (opts.video) {
+    var bits = [];
+    if (f.height) bits.push(Math.round(f.height) + "p");
+    var codecs = [v, a].filter(Boolean).join(" + ");
+    if (codecs) bits.push(codecs);
+    if (kbps) bits.push(kbps);
+    if (!bits.length) return null;
+    var line = bits.join(" · ");
+    // The selector's first tiers rank H.264 only, so "best this source offers"
+    // is only true of H.264 when that is what won — say so.
+    if (opts.maxHeight > 0 && f.height && f.height < opts.maxHeight) {
+      line += " — the best " + (v === "H.264" ? "H.264 " : "") + "this source offers up to " + opts.maxHeight + "p";
+    }
+    return line;
+  }
+  var src = [a, kbps].filter(Boolean).join(" · ");
+  if (!src) return null;
+  // A re-encode's bitrate is the encoder's, not the source's: name the source.
+  return opts.audioFormat ? opts.audioFormat.toUpperCase() + " re-encoded from " + src : src;
 }
 
 // ---------------------------------------------------------------------------
@@ -1472,14 +1599,137 @@ function parseVideoFormat(fmt) {
 // when the source offers no such pair. `avc1`/`mp4a` is YouTube's naming,
 // `h264`/`aac` is what most other extractors report.
 // Pure; exported for tests.
+//
+// The H.264 tiers say `bestvideo`, not `bestvideo*`: the starred form also
+// admits muxed formats (YouTube's itag 18, 360p video WITH audio), which then
+// get a second audio track merged on top. Only the open tier keeps the star,
+// for sources that publish nothing but muxed streams.
 function videoFormatSelector(maxHeight) {
   var cap = maxHeight > 0 ? "[height<=" + maxHeight + "]" : "";
   return [
-    "bestvideo*[vcodec^=avc1]" + cap + "+bestaudio[acodec^=mp4a]",
-    "bestvideo*[vcodec^=h264]" + cap + "+bestaudio[acodec^=aac]",
+    "bestvideo[vcodec^=avc1]" + cap + "+bestaudio[acodec^=mp4a]",
+    "bestvideo[vcodec^=h264]" + cap + "+bestaudio[acodec^=aac]",
     "bestvideo*" + cap + "+bestaudio",
     "best" + cap
   ].join("/");
+}
+
+// Ranking inside the selector's tiers: resolution, then frame rate, then total
+// bitrate. yt-dlp's default order puts an extractor's own preference before
+// bitrate, which for HLS sources (several renditions at one height) could
+// land on the leanest rendition of the right size.
+var VIDEO_FORMAT_SORT = "res,fps,tbr";
+
+// The download quality options with no particular video in mind — the list
+// `onGetQualities` gives and older hosts show. Labels are "Type · Format — note"
+// (all an old host shows); `description` renders under the picker on newer
+// hosts. Pure; exported for tests.
+//
+// "Original" keeps the source stream verbatim — the best quality and the right
+// default. Lossy sources (YouTube tops out at Opus ~160k / AAC ~128k) have no
+// lossless master to recover, so the re-encode options are only for users who
+// want a uniform library format. FLAC in particular does NOT improve quality:
+// it wraps already-lossy audio in a lossless container (much larger file, zero
+// quality gain). (Opus re-encode was dropped in v1.8.0 — unused.)
+function staticQualityOptions(hasFfmpeg) {
+  var q = [{
+    value: "original",
+    label: "Audio · Original — keeps the source codec",
+    description: "Best quality: the source audio is copied, not re-encoded, into a taggable file. The format follows the source — YouTube is usually Opus ~160k (.ogg), SoundCloud/Bandcamp MP3 128k. Tags embedded."
+  }];
+  if (!hasFfmpeg) return q;
+  q = q.concat(reencodeOptions());
+  // Video download options mirror the streaming resolution choices: best +
+  // per-resolution caps. Each merges the best H.264 video ≤ cap with the best
+  // AAC audio into an .mp4. The host defaults to the first `video:true` option
+  // when the item being downloaded is itself a video.
+  for (var i = 0; i < VIDEO_RESOLUTIONS.length; i++) {
+    var r = VIDEO_RESOLUTIONS[i];
+    q.push({
+      value: r.height === 0 ? "video" : "video-" + r.height,
+      label: "Video · MP4 · " + (r.height === 0 ? "Best" : r.label),
+      video: true,
+      description: (r.height === 0
+        ? "Downloads the best video and merges it with the best audio into an .mp4. "
+        : "Downloads the best video up to " + r.label + " and merges it with the best audio into an .mp4. ")
+        + "Prefers H.264 + AAC so the file plays everywhere — a higher-resolution AV1/VP9 stream is skipped, since most players can't decode those. Sources with no H.264 are saved as .mkv instead."
+    });
+  }
+  return q;
+}
+
+function reencodeOptions() {
+  return [{
+    value: "aac",
+    label: "Audio · AAC (.m4a) — re-encode",
+    description: "Re-encodes the source to AAC. Pick for maximum device compatibility; slight quality loss vs Original. Tags embedded."
+  }, {
+    value: "mp3",
+    label: "Audio · MP3 — re-encode",
+    description: "Re-encodes the source to MP3. Pick for maximum device compatibility; slight quality loss vs Original. Tags embedded."
+  }, {
+    value: "flac",
+    label: "Audio · FLAC — lossless wrap of a lossy source",
+    description: "No quality gain over Original — the source is already lossy, so FLAC only makes the file much larger. Only useful for a uniform-format library. Tags embedded."
+  }];
+}
+
+// The quality options ONE video really offers, from its yt-dlp `formats` — the
+// list the download window shows once it has looked the video up. A fixed list
+// offered "1080p" for a video that tops out at 480p and quietly saved 480p;
+// this one only offers sizes the video has, and names the codec the original
+// audio really is. Mirrors the download selector: H.264 is preferred, so "best"
+// is the tallest H.264 stream when there is one. Null when the formats say
+// nothing usable (the caller keeps the fixed list). Pure; exported for tests.
+function qualityOptionsForFormats(formats, hasFfmpeg) {
+  if (!formats || !formats.length) return null;
+  var bestAudio = null, maxH = 0, maxH264 = 0;
+  for (var i = 0; i < formats.length; i++) {
+    var f = formats[i] || {};
+    var hasV = f.vcodec && f.vcodec !== "none";
+    var hasA = f.acodec && f.acodec !== "none";
+    if (hasA && !hasV) {
+      var br = f.abr || f.tbr || 0;
+      if (!bestAudio || br > (bestAudio.abr || bestAudio.tbr || 0)) bestAudio = f;
+    }
+    if (hasV && f.height) {
+      if (f.height > maxH) maxH = f.height;
+      if (/^(avc1|h264)/i.test(f.vcodec) && f.height > maxH264) maxH264 = f.height;
+    }
+  }
+  if (!bestAudio && !maxH) return null;
+  var audioName = bestAudio ? codecName(bestAudio.acodec) : null;
+  var audioBr = bestAudio && (bestAudio.abr || bestAudio.tbr) ? Math.round(bestAudio.abr || bestAudio.tbr) + " kbps" : null;
+  var q = [{
+    value: "original",
+    label: "Audio · Original" + (audioName ? " — " + [audioName, audioBr].filter(Boolean).join(" ") : " — keeps the source codec"),
+    description: "Best quality: the source audio is copied, not re-encoded, into a taggable file. Tags embedded."
+  }];
+  if (!hasFfmpeg) return q;
+  q = q.concat(reencodeOptions());
+  if (!maxH) return q;
+  var best = maxH264 || maxH;
+  var container = maxH264 ? "MP4" : "MKV";
+  var skipped = maxH264 && maxH > maxH264
+    ? " This video also has " + maxH + "p in AV1/VP9, which most players can't decode, so it is skipped."
+    : "";
+  q.push({
+    value: "video",
+    label: "Video · " + container + " · Best (" + best + "p)",
+    video: true,
+    description: "The best this video offers: " + best + "p " + (maxH264 ? "H.264" : "video") + " merged with the best audio into an ." + container.toLowerCase() + "." + skipped
+  });
+  for (var j = 0; j < VIDEO_RESOLUTIONS.length; j++) {
+    var r = VIDEO_RESOLUTIONS[j];
+    if (r.height === 0 || r.height >= best) continue;
+    q.push({
+      value: "video-" + r.height,
+      label: "Video · MP4 · " + r.label,
+      video: true,
+      description: "A smaller file: the best video up to " + r.label + ", merged with the best audio."
+    });
+  }
+  return q;
 }
 
 // Containers offered to `--merge-output-format`, best-fit first. yt-dlp picks the
@@ -1613,7 +1863,7 @@ function parseMetadataLine(line) {
 function buildDownloadArgs(opts, outDir, seq, embed) {
   var args;
   if (opts.video) {
-    args = ["-f", videoFormatSelector(opts.maxHeight || 0), "--merge-output-format", MERGE_CONTAINERS];
+    args = ["-f", videoFormatSelector(opts.maxHeight || 0), "-S", VIDEO_FORMAT_SORT, "--merge-output-format", MERGE_CONTAINERS];
   } else if (opts.audioFormat) {
     args = ["-x", "--audio-format", opts.audioFormat, "--audio-quality", "0"];
   } else if (embed) {
@@ -1707,9 +1957,9 @@ async function downloadForDownload(api, url, opts, trace) {
     await logExtractionDiagnostics(api, url, trace);
     throw new Error("The download produced no file — often a YouTube restriction; updating yt-dlp usually fixes this.");
   }
-  settle("saved " + last + " after " + attemptNo + " attempt(s) — " +
-    describeChosenFormat(parseChosenFormat(res.stdout)));
-  return { filePath: last, meta: lines.length > 1 ? parseMetadataLine(lines[0]) : {} };
+  var chosen = parseChosenFormat(res.stdout);
+  settle("saved " + last + " after " + attemptNo + " attempt(s) — " + describeChosenFormat(chosen));
+  return { filePath: last, meta: lines.length > 1 ? parseMetadataLine(lines[0]) : {}, chosen: chosen };
 }
 
 // ---------------------------------------------------------------------------
@@ -1827,9 +2077,10 @@ async function getDirectUrl(api, url, isVideo, trace) {
   if (res.exitCode === 0 && res.stdout) {
     var out = parseDirectOutput(res.stdout);
     if (out.url) {
-      var chosen = describeChosenFormat(parseChosenFormat(res.stdout));
+      var picked = parseChosenFormat(res.stdout);
+      var chosen = describeChosenFormat(picked);
       settle("got a stream — " + chosen + (out.headers ? " · " + Object.keys(out.headers).length + " header(s)" : " · no headers"));
-      return { url: out.url, headers: out.headers };
+      return { url: out.url, headers: out.headers, availableAt: picked ? picked.availableAt : null };
     }
   }
   if (res.exitCode !== 0) {
@@ -2222,6 +2473,7 @@ async function enumerateFormats(api, url, maxHeight, trace) {
   }
   try {
     var info = JSON.parse(res.stdout.split("\n")[0]);
+    infoCache[url] = { info: info, at: Date.now() };
     var formats = info.formats || [];
     // The full table, from data this extraction already returned. It is the only
     // record of what the source OFFERED, as opposed to what we ended up playing
@@ -2230,11 +2482,14 @@ async function enumerateFormats(api, url, maxHeight, trace) {
     traceLog(trace, "info", "formats for " + url + "\n" + summarizeFormats(formats, maxHeight || 0));
     var candidates = candidatesFromFormats(formats, maxHeight || 0);
     settle(summarizeCandidates(candidates), candidates.length ? "info" : "warn");
-    return candidates;
   } catch (e) {
     settle("parse failed — " + errText(e), "warn");
     return [];
   }
+  // Same release gate as the direct path: these URLs are fetched by mpv the
+  // moment the host picks one.
+  if (candidates.length) await waitForStreamRelease(latestAvailableAt(formats), trace);
+  return candidates;
 }
 
 // Download the source media to cache/<stem>.<ext>. audio: bestaudio; video:
@@ -2343,6 +2598,9 @@ async function resolvePlayable(api, url, isVideo, fresh, trace) {
     var hit = cacheGet(streamUrlCache, key, Date.now());
     if (hit) {
       cacheSettle("hit — streaming the remembered URL, no yt-dlp call");
+      // A preload can cache a URL seconds before the play asks for it again —
+      // still inside its release wait.
+      await waitForStreamRelease(hit.availableAt, trace);
       return { url: hit.url, downloaded: false, headers: hit.headers };
     }
     cacheSettle("miss");
@@ -2352,8 +2610,9 @@ async function resolvePlayable(api, url, isVideo, fresh, trace) {
       // null = the URL is already near its own deadline, so caching it would
       // only guarantee a dead hit later. Play it now, resolve again next time.
       if (expiresAt) {
-        cachePut(streamUrlCache, key, { url: direct.url, headers: direct.headers || null }, expiresAt, CACHE_MAX_ENTRIES);
+        cachePut(streamUrlCache, key, { url: direct.url, headers: direct.headers || null, availableAt: direct.availableAt || null }, expiresAt, CACHE_MAX_ENTRIES);
       }
+      await waitForStreamRelease(direct.availableAt, trace);
       logLine(api, trace, "info", "signed URL " + (expiresAt
         ? "cached until it expires in " + Math.round((expiresAt - Date.now()) / 60000) + " min"
         : "not cached — already near its own expiry"));
@@ -2410,6 +2669,108 @@ function streamUriResult(playable, isVideo, sourceUrl) {
 // metadata the host already has (e.g. a library track's real title/artist/album),
 // which overrides yt-dlp's guesses; when absent, yt-dlp's own metadata is used.
 // Throws (via downloadForDownload) with a user-facing reason on failure.
+// ---- What the download window is shown before it downloads ----------------
+// The fallback stream resolver's recent picks, per song: the download window
+// offers the upload the user just heard or watched instead of searching again,
+// which could rank a different one first. Session memory, bounded.
+var RECENT_PICK_TTL_MS = 6 * 60 * 60 * 1000;
+var RECENT_PICK_MAX = 60;
+var recentPicks = {};
+
+// Same song, whatever the case or accents. Pure; exported for tests.
+function pickKey(title, artistName, video) {
+  function norm(v) {
+    var t = String(v || "").toLowerCase();
+    if (t.normalize) t = t.normalize("NFKD").replace(/[̀-ͯ]/g, "");
+    return t.replace(/\s+/g, " ").trim();
+  }
+  return norm(title) + "\u0001" + norm(artistName) + "\u0001" + (video ? "v" : "a");
+}
+
+function rememberPick(title, artistName, cand, video, now) {
+  if (!cand || !cand.url) return;
+  recentPicks[pickKey(title, artistName, video)] = { cand: cand, video: !!video, at: now };
+  var keys = Object.keys(recentPicks);
+  if (keys.length <= RECENT_PICK_MAX) return;
+  keys.sort(function (a, b) { return recentPicks[a].at - recentPicks[b].at; });
+  for (var i = 0; i < keys.length - RECENT_PICK_MAX; i++) delete recentPicks[keys[i]];
+}
+
+// The pick of the kind asked for first, else the other kind. Pure over the
+// table; exported for tests.
+function recallPick(table, title, artistName, video, now) {
+  var kinds = video ? [true, false] : [false, true];
+  for (var i = 0; i < kinds.length; i++) {
+    var hit = table[pickKey(title, artistName, kinds[i])];
+    if (hit && now - hit.at < RECENT_PICK_TTL_MS) return hit;
+  }
+  return null;
+}
+
+// One video's full yt-dlp info (`-j`), cached briefly: the preview reads it and
+// a video play has usually just fetched it (enumerateFormats).
+var INFO_CACHE_TTL_MS = 10 * 60 * 1000;
+var infoCache = {};
+
+async function fetchVideoInfo(api, url, trace) {
+  var hit = infoCache[url];
+  if (hit && Date.now() - hit.at < INFO_CACHE_TTL_MS) return hit.info;
+  var res = await execLogged(api, trace, "info-json", ["-j", "--no-warnings", "--no-playlist", url], { cwd: null });
+  if (res.exitCode !== 0 || !res.stdout) {
+    noteBotGate(api, res.stderr);
+    throw new Error(await withOutdatedHint(api, classifyYtdlpError(res.stderr)));
+  }
+  var info = JSON.parse(res.stdout.split("\n")[0]);
+  infoCache[url] = { info: info, at: Date.now() };
+  return info;
+}
+
+// Answer the host's download preview: which upload a download would fetch,
+// and the qualities that upload really has. Throws a user-facing reason.
+async function previewDownload(api, req) {
+  await ensureToolStatus(api);
+  if (!ytDlpVersion) return null;
+  var url = null, note = null, cand = null;
+  var isVideo = !!req.isVideo;
+  var trace = startTrace(api, "download preview",
+    (req.uri || req.title || "") + (req.artistName ? " — " + req.artistName : ""),
+    currentContext({ preferVideo: isVideo }));
+  try {
+    if (req.uri && req.uri.indexOf("ytdlp://") === 0) {
+      var ref = decodeRef(req.uri.substring("ytdlp://".length));
+      if (ref) url = ref.url;
+    } else if (req.uri && req.uri.indexOf("youtube://") === 0) {
+      var yid = req.uri.substring("youtube://".length);
+      if (YT_ID_RE.test(yid)) url = youtubeWatchUrl(yid);
+    } else if (!req.uri && req.title) {
+      var title = stripRemasterSuffix(req.title);
+      var played = recallPick(recentPicks, title, req.artistName, isVideo, Date.now());
+      if (played) {
+        cand = played.cand;
+        note = played.video ? "The same video you just watched" : "The same upload you just listened to";
+      } else {
+        cand = await searchByMetadata(api, title, req.artistName, req.durationSecs, isVideo ? "video" : "audio", trace);
+      }
+      if (cand) url = cand.url;
+    }
+    if (!url) { traceDone(trace, "nothing to preview", "warn"); return null; }
+    var info = await fetchVideoInfo(api, url, trace);
+    var match = {
+      id: encodeRef(url),
+      title: info.title || (cand && cand.title) || url,
+      artistName: info.uploader || info.channel || (cand && cand.uploader) || null,
+      durationSecs: info.duration != null ? info.duration : (cand && cand.durationSecs != null ? cand.durationSecs : null),
+      coverUrl: thumbFor(url, info.thumbnail || (cand && cand.thumbnail))
+    };
+    var qualities = qualityOptionsForFormats(info.formats || [], !!ffmpegVersion);
+    traceDone(trace, "would download " + url);
+    return { match: match, note: note, qualities: qualities };
+  } catch (e) {
+    traceDone(trace, "failed — " + errText(e), "warn");
+    throw e;
+  }
+}
+
 async function resolveDownload(api, url, format, caller, trace) {
   var fmt = format || "original";
   var vf = parseVideoFormat(fmt);
@@ -2448,8 +2809,12 @@ async function resolveDownload(api, url, format, caller, trace) {
   if (meta.year) md.year = meta.year;
 
   traceDone(trace, "downloaded " + dl.filePath + " (" + fmt + ")");
+  // `quality` is shown by the host's download modal (hosts that predate it
+  // ignore the field).
+  var quality = describeDownloadQuality(dl.chosen,
+    { video: isVideo, maxHeight: isVideo ? vf.maxHeight : 0, audioFormat: audioFormat });
   return await withCacheProtection(api, dl.filePath, function () {
-    return { url: "file://" + dl.filePath, headers: null, ext: extOf(dl.filePath) || undefined, metadata: md };
+    return { url: "file://" + dl.filePath, headers: null, ext: extOf(dl.filePath) || undefined, metadata: md, quality: quality };
   });
 }
 
@@ -2501,12 +2866,15 @@ async function activate(api) {
     var fresh = !!(opts && opts.fresh);
     var trace = startTrace(api, "stream resolve by metadata",
       title + (artistName ? " — " + artistName : "") + (durationSecs != null ? " (" + Math.round(durationSecs) + "s)" : ""),
-      currentContext({ preferVideo: preferVideo, externalAudio: !!(opts && opts.externalAudio), fresh: fresh }));
+      currentContext({ preferVideo: preferVideo, externalAudio: !!(opts && opts.externalAudio), fresh: fresh }),
+      opts && opts.signal);
     try {
       // preferVideo → rank with the VIDEO profile (official MV / VEVO); plain
       // audio playback → the AUDIO profile (clean official-audio / Topic).
       var cand = await searchByMetadata(api, title, artistName, durationSecs, preferVideo ? "video" : "audio", trace);
       if (!cand) { traceDone(trace, "no match for “" + title + "”", "warn"); return null; }
+      // So a download of this song offers this upload rather than re-searching.
+      rememberPick(title, artistName, cand, preferVideo, Date.now());
       if (preferVideo) {
         // The host can merge a separate audio track (native mpv engine): hand it
         // the whole menu so it can pair a hi-res video-only stream with an
@@ -2556,7 +2924,8 @@ async function activate(api) {
     // the request itself, not a hint.
     var wantVideo = ref.isVideo || !!(opts && opts.video);
     var trace = startTrace(api, "stream resolve by uri", ref.url + (wantVideo ? " (video)" : " (audio)"),
-      currentContext({ externalAudio: !!(opts && opts.externalAudio), fresh: !!(opts && opts.fresh) }));
+      currentContext({ externalAudio: !!(opts && opts.externalAudio), fresh: !!(opts && opts.fresh) }),
+      opts && opts.signal);
     try {
       // The host can attach a separate audio track (native mpv engine + video):
       // return the full candidate menu so it can pick a hi-res video-only +
@@ -2609,7 +2978,8 @@ async function activate(api) {
     if (!ytDlpVersion) return null;
     if (!YT_ID_RE.test(id)) { api.log("warn", "Legacy youtube:// resolve: bad id " + id, "ytdlp"); return null; }
     var trace = startTrace(api, "stream resolve by legacy uri", youtubeWatchUrl(id) + " (audio)",
-      currentContext({ externalAudio: !!(opts && opts.externalAudio), fresh: !!(opts && opts.fresh) }));
+      currentContext({ externalAudio: !!(opts && opts.externalAudio), fresh: !!(opts && opts.fresh) }),
+      opts && opts.signal);
     try {
       var playable = await resolvePlayable(api, youtubeWatchUrl(id), false, opts && opts.fresh, trace);
       var result = streamUriResult(playable, false, youtubeWatchUrl(id));
@@ -2712,53 +3082,7 @@ async function activate(api) {
 
   // ---- Download provider: qualities ----
   api.downloads.onGetQualities("ytdlp-download", function () {
-    // "Original" keeps the source stream verbatim — the best quality and the
-    // right default. Lossy sources (YouTube tops out at Opus ~160k / AAC ~128k)
-    // have no lossless master to recover, so the re-encode options are only for
-    // users who want a uniform library format. FLAC in particular does NOT
-    // improve quality: it wraps already-lossy audio in a lossless container
-    // (much larger file, zero quality gain). Labels are "Type · Format — note"
-    // (all the old host shows); `description` renders under the picker on newer
-    // hosts. (Opus re-encode was dropped in v1.8.0 — unused.)
-    var q = [{
-      value: "original",
-      label: "Audio · Original — keeps the source codec",
-      description: "Best quality: the source audio is copied, not re-encoded, into a taggable file. The format follows the source — YouTube is usually Opus ~160k (.ogg), SoundCloud/Bandcamp MP3 128k. Tags embedded."
-    }];
-    if (ffmpegVersion) {
-      q.push({
-        value: "aac",
-        label: "Audio · AAC (.m4a) — re-encode",
-        description: "Re-encodes the source to AAC. Pick for maximum device compatibility; slight quality loss vs Original. Tags embedded."
-      });
-      q.push({
-        value: "mp3",
-        label: "Audio · MP3 — re-encode",
-        description: "Re-encodes the source to MP3. Pick for maximum device compatibility; slight quality loss vs Original. Tags embedded."
-      });
-      q.push({
-        value: "flac",
-        label: "Audio · FLAC — lossless wrap of a lossy source",
-        description: "No quality gain over Original — the source is already lossy, so FLAC only makes the file much larger. Only useful for a uniform-format library. Tags embedded."
-      });
-      // Video download options mirror the streaming resolution choices: best +
-      // per-resolution caps. Each merges the best H.264 video ≤ cap with the best
-      // AAC audio into an .mp4. The host defaults to the first `video:true` option
-      // when the item being downloaded is itself a video.
-      for (var i = 0; i < VIDEO_RESOLUTIONS.length; i++) {
-        var r = VIDEO_RESOLUTIONS[i];
-        q.push({
-          value: r.height === 0 ? "video" : "video-" + r.height,
-          label: "Video · MP4 · " + (r.height === 0 ? "Best" : r.label),
-          video: true,
-          description: (r.height === 0
-            ? "Downloads the best video and merges it with the best audio into an .mp4. "
-            : "Downloads the best video up to " + r.label + " and merges it with the best audio into an .mp4. ")
-            + "Prefers H.264 + AAC so the file plays everywhere — a higher-resolution AV1/VP9 stream is skipped, since most players can't decode those. Sources with no H.264 are saved as .mkv instead."
-        });
-      }
-    }
-    return q;
+    return staticQualityOptions(!!ffmpegVersion);
   });
 
   // ---- Download provider: by URI (ytdlp:// or legacy youtube://) ----
@@ -2804,8 +3128,20 @@ async function activate(api) {
       if (!cand) { traceDone(mdTrace, "no match", "warn"); return null; }
       // The host's metadata is authoritative here (a real library track).
       return await resolveDownload(api, cand.url, format, { title: title, artist: artistName, album: albumName }, mdTrace);
-    } catch (e) { console.error("[ytdlp] download resolve failed:", e, e.stack || ""); return null; }
+    } catch (e) {
+      // Propagates like the by-URI path: the host shows the reason (bot
+      // check, region lock) instead of a generic "couldn't find".
+      console.error("[ytdlp] download resolve failed:", e, e.stack || "");
+      throw e;
+    }
   });
+
+  // ---- Download provider: preview (what would be fetched, before fetching) ----
+  if (typeof api.downloads.onPreview === "function") {
+    api.downloads.onPreview("ytdlp-download", function (req) {
+      return previewDownload(api, req || {});
+    });
+  }
 
   // ---- Download provider: interactive (download modal manual search) ----
   api.downloads.onInteractiveSearch("ytdlp-download", async function (query, limit) {
@@ -4793,7 +5129,7 @@ function deactivate() {
   botGateNotified = false; deepDiagnosticsRun = false; lastResolve = null;
   // Drop both caches: a disable/enable cycle is the user's way of saying "start
   // over", and a stale signed URL surviving it would be the first thing to fail.
-  streamUrlCache = {}; searchCache = {};
+  streamUrlCache = {}; searchCache = {}; infoCache = {}; recentPicks = {};
   scoringAudio = null; scoringVideo = null;
   resolveOpen = false;
   tuneOpen = false; tuneProfile = "audio"; tuneQuery = ""; tuneTarget = null;
@@ -4860,11 +5196,20 @@ return {
   _describeContext: describeContext,
   _fmtMs: fmtMs,
   _stderrGist: stderrGist,
+  _startTrace: startTrace,
+  _execLogged: execLogged,
   _summarizeFormats: summarizeFormats,
   _summarizeCandidates: summarizeCandidates,
   _describeCandidate: describeCandidate,
   _parseChosenFormat: parseChosenFormat,
+  _streamReleaseWaitMs: streamReleaseWaitMs,
+  _latestAvailableAt: latestAvailableAt,
   _describeChosenFormat: describeChosenFormat,
+  _describeDownloadQuality: describeDownloadQuality,
+  _staticQualityOptions: staticQualityOptions,
+  _qualityOptionsForFormats: qualityOptionsForFormats,
+  _pickKey: pickKey,
+  _recallPick: recallPick,
   _CHOSEN_FMT_PRINT: CHOSEN_FMT_PRINT,
   // Web indexers.
   _decodeMarkupEntities: decodeMarkupEntities,

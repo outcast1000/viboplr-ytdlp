@@ -354,8 +354,10 @@ test("non-403 download failure does NOT retry", async () => {
       ...BEHAVIOR,
     ]),
   });
-  const r = await api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original");
-  assert.equal(r, null);
+  await assert.rejects(
+    api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original"),
+    /unavailable/,
+  );
   assert.equal(calls, 1, "no retry for non-403 failures");
 });
 
@@ -368,15 +370,17 @@ test("isOlderVersion compares dotted date-style versions", async () => {
   assert.equal(p._isOlderVersion("unknown", "2026.07.04"), false);
 });
 
-test("by-metadata download failure still returns null (chain semantics)", async () => {
+// The host has no provider chain to fall through any more: a by-metadata
+// failure throws its reason so the download window can show it (an older host
+// turns the throw into null itself).
+test("by-metadata download failure throws its reason", async () => {
   const { api } = await activated({
     exec: toolsPresent([
       { match: { cmd: "yt-dlp", argsInclude: ["after_move:filepath"] }, result: { exitCode: 1, stderr: "ERROR: nope" } },
       ...BEHAVIOR,
     ]),
   });
-  const r = await api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original");
-  assert.equal(r, null, "the provider chain must be able to fall through to the next provider");
+  await assert.rejects(api._handlers["meta:ytdlp-download"]("Creep", "Radiohead", null, 213, "original"), /nope/);
 });
 
 test("stream resolve skips cleanly when yt-dlp is unavailable", async () => {

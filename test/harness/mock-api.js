@@ -131,6 +131,7 @@ function makeApi(config) {
       onGetQualities: (id, fn) => { handlers["qual:" + id] = fn; },
       onInteractiveSearch: (id, fn) => { handlers["isearch:" + id] = fn; },
       onInteractiveResolve: (id, fn) => { handlers["iresolve:" + id] = fn; },
+      onPreview: (id, fn) => { handlers["preview:" + id] = fn; },
       enqueue: async (request) => { calls.enqueue.push(request); return calls.enqueue.length; },
     },
     ui: {

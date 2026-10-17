@@ -40,6 +40,13 @@ test("buildDownloadArgs: capped video selector limits height", () => {
   assert.ok(sel.includes("bestvideo*[height<=1080]+bestaudio"));
 });
 
+test("buildDownloadArgs: video ranks by resolution, fps, then bitrate", () => {
+  const args = plugin._buildDownloadArgs({ url: "u", video: true }, "/tmp", 2, true);
+  assert.equal(args[args.indexOf("-S") + 1], "res,fps,tbr");
+  const audio = plugin._buildDownloadArgs({ url: "u" }, "/tmp", 2, true);
+  assert.ok(!audio.includes("-S"), "audio downloads keep yt-dlp's own ranking");
+});
+
 test("parseVideoFormat: 'video' = best, 'video-720' = capped, else not video", () => {
   assert.deepEqual(plugin._parseVideoFormat("video"), { isVideo: true, maxHeight: 0 });
   assert.deepEqual(plugin._parseVideoFormat("video-720"), { isVideo: true, maxHeight: 720 });
@@ -50,11 +57,11 @@ test("parseVideoFormat: 'video' = best, 'video-720' = capped, else not video", (
 test("videoFormatSelector: uncapped vs capped", () => {
   assert.equal(
     plugin._videoFormatSelector(0),
-    "bestvideo*[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo*[vcodec^=h264]+bestaudio[acodec^=aac]/bestvideo*+bestaudio/best"
+    "bestvideo[vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=h264]+bestaudio[acodec^=aac]/bestvideo*+bestaudio/best"
   );
   assert.equal(
     plugin._videoFormatSelector(720),
-    "bestvideo*[vcodec^=avc1][height<=720]+bestaudio[acodec^=mp4a]/bestvideo*[vcodec^=h264][height<=720]+bestaudio[acodec^=aac]/bestvideo*[height<=720]+bestaudio/best[height<=720]"
+    "bestvideo[vcodec^=avc1][height<=720]+bestaudio[acodec^=mp4a]/bestvideo[vcodec^=h264][height<=720]+bestaudio[acodec^=aac]/bestvideo*[height<=720]+bestaudio/best[height<=720]"
   );
 });
 
@@ -210,4 +217,39 @@ test("isProgressLine: matches only our own prefixes, so --print output survives"
   assert.ok(!plugin._isProgressLine("/Users/x/Music/dl.0.mp4"));
   assert.ok(!plugin._isProgressLine("Hey\tPixies\tDoolittle\t1989\tHey"));
   assert.equal(plugin._parseProgressLine("/Users/x/Music/dl.0.mp4", false), null);
+});
+
+// --- describeDownloadQuality: the "Quality" line the host's download modal shows.
+// Fixtures are real CHOSEN_FMT_PRINT lines from yt-dlp 2026.10.10 against
+// Pearl Jam "Alive" (qM0zINtulhM), whose source tops out at 480p.
+const MERGED_480 = "ytdlp-fmt\t135+140\tmp4\tavc1.4D401E\tmp4a.40.2\t480\t713.8689999999999\thttps+https\t135 - 640x480 (480p)+140 - audio only (medium)";
+const OPUS_251 = "ytdlp-fmt\t251\twebm\tnone\topus\tNA\t130.453\thttps\t251 - audio only (medium)";
+
+test("describeDownloadQuality: a capped video that landed below the cap says the source had nothing better", () => {
+  const f = plugin._parseChosenFormat(MERGED_480);
+  assert.equal(plugin._describeDownloadQuality(f, { video: true, maxHeight: 1080 }),
+    "480p · H.264 + AAC · 714 kbps — the best H.264 this source offers up to 1080p");
+});
+
+test("describeDownloadQuality: no note when the cap was reached or there was none", () => {
+  const f = plugin._parseChosenFormat(MERGED_480);
+  assert.equal(plugin._describeDownloadQuality(f, { video: true, maxHeight: 480 }), "480p · H.264 + AAC · 714 kbps");
+  assert.equal(plugin._describeDownloadQuality(f, { video: true, maxHeight: 0 }), "480p · H.264 + AAC · 714 kbps");
+});
+
+test("describeDownloadQuality: a non-H.264 fallback doesn't claim to be the best H.264", () => {
+  const f = { vcodec: "vp09.00.40.08", acodec: "opus", height: 720, tbr: 1500 };
+  assert.equal(plugin._describeDownloadQuality(f, { video: true, maxHeight: 1080 }),
+    "720p · VP9 + Opus · 1500 kbps — the best this source offers up to 1080p");
+});
+
+test("describeDownloadQuality: audio names the source codec, and a re-encode says what it came from", () => {
+  const f = plugin._parseChosenFormat(OPUS_251);
+  assert.equal(plugin._describeDownloadQuality(f, {}), "Opus · 130 kbps");
+  assert.equal(plugin._describeDownloadQuality(f, { audioFormat: "mp3" }), "MP3 re-encoded from Opus · 130 kbps");
+});
+
+test("describeDownloadQuality: null when yt-dlp reported no format", () => {
+  assert.equal(plugin._describeDownloadQuality(null, { video: true }), null);
+  assert.equal(plugin._describeDownloadQuality(plugin._parseChosenFormat("no tag here"), {}), null);
 });
