@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.28.0
+- **Recent tab.** The view has a new 🕘 Recent tab showing what yt-dlp did for the last 25 requests (plays, fallbacks, Watch video, downloads): each step with timings and how it ended. Turn on "Show yt-dlp commands" to see the exact command lines for a bug report. It is kept in memory only and cleared when the plugin is disabled.
+- **The download window shows what it will fetch.** On Viboplr versions that ask for a download preview, the plugin names the upload a download would fetch and offers only the qualities that video really has (no "1080p" for a video that tops out at 480p). A song you just played through the fallback resolver downloads as that same upload instead of being searched again.
+- **The download says what quality it got.** After a download, the modal shows what was actually fetched, e.g. "480p · H.264 + AAC · 714 kbps", and says so when the source had nothing up to the size you picked.
+- **YouTube streams that failed with "loading failed (-13)" now play.** Some YouTube stream URLs only start working a few seconds after they are issued. The plugin now waits until they do before handing them to the player.
+- **Resolves the app gave up on stop.** When Viboplr stops waiting for a resolve (it timed out, or you moved on to another track), the yt-dlp process is killed instead of running on, and the resolve is recorded as cancelled rather than as an error.
+- Video downloads no longer pick YouTube's 360p muxed stream and merge a second audio track onto it, and they rank streams of the same size by frame rate, then bitrate.
+- A failed download by song name now shows the real reason (bot check, region lock) instead of a generic "couldn't find".
+
 ## v1.27.3
 - Web indexer searches, the indexer catalog and seek-preview sheets now identify themselves as `Vibo` instead of using the app's browser-style default, which some company networks (Zscaler) block from a non-browser client. An indexer definition that sets its own User-Agent keeps it.
 
