@@ -168,3 +168,26 @@ test("download by name fetches the upload the fallback resolver just played", as
   const dl = api.calls.exec.find((c) => c.cmd === "yt-dlp" && c.args.includes("https://www.youtube.com/watch?v=qM0zINtulhM") && !c.args.includes("%(urls)s"));
   assert.ok(dl, "the download ran on the played upload");
 });
+
+test("qualityOptionsForFormats: with no H.264 the smaller sizes say MKV too", () => {
+  const q = plugin._qualityOptionsForFormats([
+    { vcodec: "none", acodec: "opus", abr: 128 },
+    { vcodec: "vp9", acodec: "none", height: 1080 },
+  ], true);
+  assert.deepEqual(q.filter((o) => o.video).map((o) => o.label),
+    ["Video · MKV · Best (1080p)", "Video · MKV · 720p", "Video · MKV · 480p"]);
+});
+
+test("a fallback resolve that found no stream is not remembered for downloads", async () => {
+  const SEARCH = "https://www.youtube.com/watch?v=qM0zINtulhM\t341\tPearlJamVEVO\tPearl Jam - Alive (Official Video)\tNA\t9000000";
+  let searches = 0;
+  const { api } = await activatedWith([
+    { match: { cmd: "yt-dlp", argsInclude: ["--flat-playlist"] }, result: () => { searches++; return { exitCode: 0, stdout: SEARCH }; } },
+    { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s"] }, result: { exitCode: 1, stderr: "ERROR: [youtube] x: Video unavailable" } },
+    { match: { cmd: "yt-dlp", argsInclude: ["-j"] }, result: { exitCode: 0, stdout: JSON.stringify(INFO) } },
+  ]);
+  const r = await api._handlers["stream:ytdlp-fallback"]("Alive", "Pearl Jam", null, 341);
+  assert.equal(r, null);
+  const pv = await api._handlers["preview:ytdlp-download"]({ uri: null, title: "Alive", artistName: "Pearl Jam", albumName: null, durationSecs: 341, isVideo: false });
+  assert.equal(pv.note, null, "not offered as the upload just listened to");
+});

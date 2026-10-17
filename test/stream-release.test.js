@@ -98,3 +98,15 @@ test("latestAvailableAt takes the latest across a format list", () => {
   assert.equal(plugin._latestAvailableAt([]), null);
   assert.equal(plugin._latestAvailableAt(null), null);
 });
+
+test("offeredAvailableAt only counts the formats offered as candidates", () => {
+  const formats = [
+    { format_id: "140", url: "https://a/140", available_at: 1792273477 },
+    { format_id: "251", url: "https://a/251" },
+    { format_id: "137", url: "https://a/137" },
+  ];
+  // A gated format that isn't on the menu (filtered by height, say) imposes no wait.
+  assert.equal(plugin._offeredAvailableAt(formats, [{ url: "https://a/251" }, { url: "https://a/137" }]), null);
+  assert.equal(plugin._offeredAvailableAt(formats, [{ url: "https://a/140" }, { url: "https://a/251" }]), 1792273477);
+  assert.equal(plugin._offeredAvailableAt(formats, []), null);
+});

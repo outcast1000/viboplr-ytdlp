@@ -588,6 +588,7 @@ function traceLog(trace, level, msg, isCommand) {
   if (!trace || !trace.api) return;
   if (trace.lines && trace.lines.length < RECENT_LINES_MAX) {
     trace.lines.push({ at: Date.now(), level: level, msg: msg, command: !!isCommand });
+    noteRecentChanged(trace.api);
   }
   trace.api.log(level, "[" + trace.id + "] " + msg, "ytdlp");
 }
@@ -601,7 +602,7 @@ function logLine(api, trace, level, msg, isCommand) {
   else if (api) api.log(level, msg, "ytdlp");
 }
 
-// Redraw the Recent tab as traces start and finish — only while it is showing,
+// Redraw the Recent tab as traces log their steps — only while it is showing,
 // and at most a few times a second (a resolve logs a burst of lines).
 function noteRecentChanged(api) {
   if (!recentOpen || !api || recentRenderTimer) return;
@@ -900,6 +901,16 @@ function latestAvailableAt(formats) {
     if (typeof at === "number" && isFinite(at) && (max === null || at > max)) max = at;
   }
   return max;
+}
+
+// Pure: the latest `available_at` among just the formats offered as
+// `candidates` (matched by URL). One extraction can merge several player
+// clients, and an ungated client's streams shouldn't wait on a gated one's.
+// Exported for tests.
+function offeredAvailableAt(formats, candidates) {
+  var offered = {};
+  for (var i = 0; candidates && i < candidates.length; i++) offered[candidates[i].url] = true;
+  return latestAvailableAt((formats || []).filter(function (f) { return f && offered[f.url]; }));
 }
 
 // Honours the trace's resolve signal like execLogged does: once the host has
@@ -1798,7 +1809,7 @@ function qualityOptionsForFormats(formats, hasFfmpeg) {
     if (r.height === 0 || r.height >= best) continue;
     q.push({
       value: "video-" + r.height,
-      label: "Video · MP4 · " + r.label,
+      label: "Video · " + container + " · " + r.label,
       video: true,
       description: "A smaller file: the best video up to " + r.label + ", merged with the best audio."
     });
@@ -2562,7 +2573,7 @@ async function enumerateFormats(api, url, maxHeight, trace) {
   }
   // Same release gate as the direct path: these URLs are fetched by mpv the
   // moment the host picks one.
-  if (candidates.length) await waitForStreamRelease(latestAvailableAt(formats), trace);
+  if (candidates.length) await waitForStreamRelease(offeredAvailableAt(formats, candidates), trace);
   return candidates;
 }
 
@@ -2889,6 +2900,7 @@ async function resolveDownload(api, url, format, caller, trace) {
     // only closes the trace, so a reader can see the resolve ended here rather
     // than trailing off mid-way.
     var msg = errText(e);
+    if (msg.trim() === "Cancelled") trace.cancelled = true;
     traceDone(trace, msg.trim() === "Cancelled" ? "cancelled by the user" : "failed — " + msg,
       msg.trim() === "Cancelled" ? "info" : "warn");
     throw e;
@@ -2969,8 +2981,6 @@ async function activate(api) {
       // audio playback → the AUDIO profile (clean official-audio / Topic).
       var cand = await searchByMetadata(api, title, artistName, durationSecs, preferVideo ? "video" : "audio", trace);
       if (!cand) { traceDone(trace, "no match for “" + title + "”", "warn"); return null; }
-      // So a download of this song offers this upload rather than re-searching.
-      rememberPick(title, artistName, cand, preferVideo, Date.now());
       if (preferVideo) {
         // The host can merge a separate audio track (native mpv engine): hand it
         // the whole menu so it can pair a hi-res video-only stream with an
@@ -2982,6 +2992,7 @@ async function activate(api) {
           var menu = await enumerateFormats(api, cand.url, maxVideoHeight, trace);
           var selfContained = selfContainedUrl(menu);
           if (menu.length && selfContained) {
+            rememberPick(title, artistName, cand, true, Date.now());
             traceDone(trace, "candidate menu of " + menu.length + " (host picks per its engine)");
             return { url: selfContained, candidates: menu, label: "yt-dlp (video)", sourceUrl: cand.url, video: true };
           }
@@ -2992,6 +3003,7 @@ async function activate(api) {
         // URL is often bound to the User-Agent that minted it, and this path
         // (unlike the by-URI candidate list) has no other way to carry them.
         if (vid) {
+          rememberPick(title, artistName, cand, true, Date.now());
           traceDone(trace, "single video stream" + (vid.downloaded ? " (downloaded)" : ""));
           return { url: vid.url, label: "yt-dlp (video)", sourceUrl: cand.url, video: true, headers: vid.headers || undefined };
         }
@@ -2999,6 +3011,9 @@ async function activate(api) {
       }
       var playable = await resolvePlayable(api, cand.url, false, fresh, trace);
       if (!playable) { traceDone(trace, "no playable stream", "warn"); return null; }
+      // So a download of this song offers this upload rather than re-searching
+      // — only once it gave a stream, and as the kind it really played.
+      rememberPick(title, artistName, cand, false, Date.now());
       traceDone(trace, "audio stream" + (playable.downloaded ? " (downloaded)" : ""));
       return { url: playable.url, label: "yt-dlp", sourceUrl: cand.url, headers: playable.headers || undefined };
     } catch (e) {
@@ -4918,13 +4933,24 @@ var RECENT_KIND_LABELS = {
   "download resolve by metadata": "Download — found by name"
 };
 
+// How each kind of request reads when it ended well ("ok") or came up empty
+// ("warn"). Kinds not listed are playback resolves.
+var RECENT_KIND_STATUS = {
+  "watch video": { ok: "Queued", warn: "No video found" },
+  "download track": { ok: "Opened the download window", warn: "No match found" },
+  "download preview": { ok: "Previewed", warn: "Couldn't preview" },
+  "download resolve": { ok: "Downloaded", warn: "Not downloaded" },
+  "download resolve by metadata": { ok: "Downloaded", warn: "Not downloaded" }
+};
+
 // Pure: what a trace reads as at a glance. Exported for tests.
 function recentStatus(trace) {
   if (!trace.result) return { icon: "⏳", label: "Running" };
   if (trace.cancelled) return { icon: "⊘", label: "Cancelled" };
   if (trace.result.level === "error") return { icon: "✕", label: "Failed" };
-  if (trace.result.level === "warn") return { icon: "⚠", label: "Nothing playable" };
-  return { icon: "✓", label: "Handed to the app" };
+  var labels = RECENT_KIND_STATUS[trace.kind] || { ok: "Handed to the app", warn: "Nothing playable" };
+  if (trace.result.level === "warn") return { icon: "⚠", label: labels.warn };
+  return { icon: "✓", label: labels.ok };
 }
 
 function pad2(n) { return n < 10 ? "0" + n : String(n); }
@@ -5439,6 +5465,7 @@ return {
   _appendRecentView: appendRecentView,
   _waitForStreamRelease: waitForStreamRelease,
   _latestAvailableAt: latestAvailableAt,
+  _offeredAvailableAt: offeredAvailableAt,
   _describeChosenFormat: describeChosenFormat,
   _describeDownloadQuality: describeDownloadQuality,
   _staticQualityOptions: staticQualityOptions,

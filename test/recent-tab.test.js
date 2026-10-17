@@ -122,3 +122,34 @@ test("the tab lists requests newest first, with their log escaped", () => {
   assert.ok(pre.includes("odd &lt;script&gt; in a title"), pre);
   assert.ok(!pre.includes("<script>"));
 });
+
+test("recentStatus names the outcome in the words of each kind of request", () => {
+  const done = (kind, level) => plugin._recentStatus({ kind, result: { level } });
+  assert.equal(done("download resolve", "info").label, "Downloaded");
+  assert.equal(done("download resolve by metadata", "warn").label, "Not downloaded");
+  assert.equal(done("download preview", "info").label, "Previewed");
+  assert.equal(done("download preview", "warn").label, "Couldn't preview");
+  assert.equal(done("watch video", "warn").label, "No video found");
+  assert.equal(done("download track", "info").label, "Opened the download window");
+  assert.equal(done("stream resolve by uri", "info").label, "Handed to the app");
+  assert.equal(done("stream resolve by uri", "warn").label, "Nothing playable");
+  assert.equal(done("download resolve", "error").label, "Failed");
+});
+
+test("the open Recent tab redraws as a running request logs its steps", async () => {
+  const { makeApi } = require("./harness/mock-api.js");
+  const api = makeApi({ exec: [
+    { match: { cmd: "yt-dlp", argsInclude: ["--version"] }, result: { exitCode: 0, stdout: "2026.01.01" } },
+    { match: { cmd: "yt-dlp", argsInclude: ["-f"] }, result: { exitCode: 0, stdout: "https://x\n" } },
+  ] });
+  const p = loadPlugin();
+  await p.activate(api);
+  api._handlers["action:ytdlp-source"]({ tabId: "__recent" });
+  const trace = p._startTrace(api, "stream resolve by uri", "https://www.youtube.com/watch?v=x (audio)", {});
+  await new Promise((r) => setTimeout(r, 350));
+  const before = api.calls.setViewData.length;
+  await p._execLogged(api, trace, "direct-url", ["-f", "140"], { cwd: null });
+  await new Promise((r) => setTimeout(r, 350));
+  assert.ok(api.calls.setViewData.length > before, "redrawn while still running");
+  p.deactivate();
+});
