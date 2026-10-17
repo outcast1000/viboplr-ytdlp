@@ -44,6 +44,50 @@ test("never holds a URL longer than the cap", () => {
   assert.equal(plugin._streamReleaseWaitMs(NOW / 1000 + 3600, NOW), 15000);
 });
 
+// ---------------------------------------------------------------------------
+// The wait honours the host's resolve signal (see resolve-abort.test.js)
+// ---------------------------------------------------------------------------
+
+function traceWith(signal) {
+  const logs = [];
+  const api = { log: (level, msg) => logs.push(level + " " + msg) };
+  return { trace: plugin._startTrace(api, "stream resolve by uri", "x", {}, signal), logs };
+}
+const secsFromNow = (s) => Date.now() / 1000 + s;
+
+test("a cancel during the release wait ends it at once with Cancelled", async () => {
+  const ctrl = new AbortController();
+  const { trace, logs } = traceWith(ctrl.signal);
+  const t0 = Date.now();
+  const wait = plugin._waitForStreamRelease(secsFromNow(10), trace);
+  setTimeout(() => ctrl.abort(), 20);
+  await assert.rejects(wait, /Cancelled/);
+  assert.ok(Date.now() - t0 < 2000, "did not sleep out the 10s wait");
+  assert.ok(logs.some((l) => /release the stream → cancelled/.test(l)), logs.join("\n"));
+});
+
+test("a resolve already cancelled does not start the wait", async () => {
+  const ctrl = new AbortController();
+  ctrl.abort();
+  const { trace } = traceWith(ctrl.signal);
+  const t0 = Date.now();
+  await assert.rejects(plugin._waitForStreamRelease(secsFromNow(10), trace), /Cancelled/);
+  assert.ok(Date.now() - t0 < 500);
+});
+
+test("an uncancelled wait completes, and nothing to wait for never throws", async () => {
+  const ctrl = new AbortController();
+  const { trace, logs } = traceWith(ctrl.signal);
+  // available_at already passed, margin still to go: a short real wait
+  await plugin._waitForStreamRelease(secsFromNow(-0.15), trace);
+  assert.ok(logs.some((l) => /release the stream → waited/.test(l)), logs.join("\n"));
+  // Aborted, but no wait needed — the URL is handed over as it would be anyway.
+  ctrl.abort();
+  await plugin._waitForStreamRelease(null, trace);
+  // No trace at all (older call sites), no signal: plain wait.
+  await plugin._waitForStreamRelease(secsFromNow(-0.2), null);
+});
+
 test("latestAvailableAt takes the latest across a format list", () => {
   assert.equal(plugin._latestAvailableAt([
     { format_id: "251", available_at: 1792273477 },

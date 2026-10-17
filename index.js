@@ -515,6 +515,17 @@ function maybeDeepDiagnostics(api, url, stderr, trace) {
 // the primitives underneath them are also called from paths that have none.
 var traceSeq = 0;
 
+// The "Recent" tab: the last RECENT_MAX traces kept whole — the request, every
+// step, the yt-dlp commands and the outcome — so a user can see what happened
+// to a track without digging through the app log. Memory only (a resolve names
+// what the user played); cleared on deactivate. Oldest first.
+var RECENT_MAX = 25;
+var RECENT_LINES_MAX = 400;
+var recentTraces = [];
+var recentOpen = false;          // the Recent tab is showing
+var recentShowCommands = false;  // include the yt-dlp command lines
+var recentRenderTimer = null;
+
 function errText(e) { return e && e.message ? e.message : String(e); }
 
 // Pure: a duration a human reads at a glance. Sub-second work is the
@@ -571,8 +582,13 @@ function currentContext(extra) {
   return ctx;
 }
 
-function traceLog(trace, level, msg) {
+// `isCommand` marks the exec plumbing (the argv, the exit line) so the Recent
+// tab can fold it away by default; the app log gets every line regardless.
+function traceLog(trace, level, msg, isCommand) {
   if (!trace || !trace.api) return;
+  if (trace.lines && trace.lines.length < RECENT_LINES_MAX) {
+    trace.lines.push({ at: Date.now(), level: level, msg: msg, command: !!isCommand });
+  }
   trace.api.log(level, "[" + trace.id + "] " + msg, "ytdlp");
 }
 
@@ -580,9 +596,19 @@ function traceLog(trace, level, msg) {
 // isn't. The primitives below are also reachable from paths that own no trace,
 // and a line that vanished on those paths would be a worse bug than an
 // unattributed one.
-function logLine(api, trace, level, msg) {
-  if (trace && trace.api) traceLog(trace, level, msg);
+function logLine(api, trace, level, msg, isCommand) {
+  if (trace && trace.api) traceLog(trace, level, msg, isCommand);
   else if (api) api.log(level, msg, "ytdlp");
+}
+
+// Redraw the Recent tab as traces start and finish — only while it is showing,
+// and at most a few times a second (a resolve logs a burst of lines).
+function noteRecentChanged(api) {
+  if (!recentOpen || !api || recentRenderTimer) return;
+  recentRenderTimer = setTimeout(function () {
+    recentRenderTimer = null;
+    if (recentOpen) renderSearchView(api);
+  }, 300);
 }
 
 // Open a trace: one header line naming what is being resolved, one context line.
@@ -591,9 +617,15 @@ function logLine(api, trace, level, msg) {
 // see execLogged.
 function startTrace(api, kind, subject, ctx, signal) {
   traceSeq++;
-  var trace = { api: api, id: "r" + traceSeq, n: 0, startedAt: Date.now(), signal: signal || null };
+  var trace = {
+    api: api, id: "r" + traceSeq, n: 0, startedAt: Date.now(), signal: signal || null,
+    kind: kind, subject: subject, lines: [], result: null, cancelled: false
+  };
+  recentTraces.push(trace);
+  if (recentTraces.length > RECENT_MAX) recentTraces.splice(0, recentTraces.length - RECENT_MAX);
   traceLog(trace, "info", kind + " — " + subject);
   traceLog(trace, "info", "  " + describeContext(ctx));
+  noteRecentChanged(api);
   return trace;
 }
 
@@ -612,7 +644,22 @@ function traceStep(trace, name) {
 
 function traceDone(trace, outcome, level) {
   if (!trace) return;
+  trace.result = { outcome: outcome, level: level || "info", at: Date.now() };
   traceLog(trace, level || "info", "done: " + outcome + " (total " + fmtMs(Date.now() - trace.startedAt) + ")");
+  noteRecentChanged(trace.api);
+}
+
+// A resolve the host stopped waiting for (its timeout, or the play moved on)
+// ends in a "Cancelled" throw. That is the host's decision, not a failure, so
+// it is recorded as such rather than as "threw — Cancelled".
+function traceCancelledOrThrew(trace, what, e) {
+  if (errText(e).trim() === "Cancelled") {
+    trace.cancelled = true;
+    traceDone(trace, "cancelled — the app stopped waiting for this " + what, "info");
+    return true;
+  }
+  traceDone(trace, what + " threw — " + errText(e), "error");
+  return false;
 }
 
 // The first ERROR: line of a stderr blob, else its first non-empty line —
@@ -669,7 +716,7 @@ async function execLogged(api, trace, label, args, opts) {
     };
     opts = withStart;
   }
-  logLine(api, trace, "info", "run " + label + ": " + formatCmd("yt-dlp", args));
+  logLine(api, trace, "info", "run " + label + ": " + formatCmd("yt-dlp", args), true);
   var res;
   try {
     res = await api.system.exec("yt-dlp", args, opts);
@@ -688,9 +735,10 @@ async function execLogged(api, trace, label, args, opts) {
   var outcome = "exit " + res.exitCode + " in " + fmtMs(Date.now() - t0);
   if (res.exitCode !== 0) {
     var gist = stderrGist(res.stderr);
+    // A failed exit is news, not plumbing — it stays visible in the Recent tab.
     traceLog(trace, "warn", label + ": " + outcome + (gist ? " — " + gist : ""));
   } else {
-    traceLog(trace, "info", label + ": " + outcome);
+    traceLog(trace, "info", label + ": " + outcome, true);
   }
   return res;
 }
@@ -854,11 +902,37 @@ function latestAvailableAt(formats) {
   return max;
 }
 
+// Honours the trace's resolve signal like execLogged does: once the host has
+// stopped waiting, the wait ends at once and throws "Cancelled", rather than
+// sleeping on to hand a URL to nobody.
 async function waitForStreamRelease(availableAt, trace) {
   var ms = streamReleaseWaitMs(availableAt, Date.now());
   if (!ms) return;
+  var signal = trace && trace.signal;
+  if (signal && signal.aborted) {
+    traceLog(trace, "info", "release wait skipped — the host stopped waiting for this resolve");
+    throw new Error("Cancelled");
+  }
   var settle = traceStep(trace, "wait for YouTube to release the stream");
-  await delay(ms);
+  var cancelled = await new Promise(function (resolve) {
+    var onAbort = null;
+    var timer = setTimeout(function () {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
+      resolve(false);
+    }, ms);
+    if (signal) {
+      onAbort = function () {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        resolve(true);
+      };
+      signal.addEventListener("abort", onAbort);
+    }
+  });
+  if (cancelled) {
+    settle("cancelled — the host stopped waiting for this resolve", "info");
+    throw new Error("Cancelled");
+  }
   settle("waited " + (ms / 1000).toFixed(1) + "s (available_at " + availableAt + ")");
 }
 
@@ -2906,8 +2980,9 @@ async function activate(api) {
       traceDone(trace, "audio stream" + (playable.downloaded ? " (downloaded)" : ""));
       return { url: playable.url, label: "yt-dlp", sourceUrl: cand.url, headers: playable.headers || undefined };
     } catch (e) {
-      traceDone(trace, "stream resolve threw — " + errText(e), "error");
-      console.error("[ytdlp] stream resolve failed:", e, (e && e.stack) || "");
+      if (!traceCancelledOrThrew(trace, "stream resolve", e)) {
+        console.error("[ytdlp] stream resolve failed:", e, (e && e.stack) || "");
+      }
       return null;
     }
   });
@@ -2946,8 +3021,9 @@ async function activate(api) {
         result ? "info" : "warn");
       return result;
     } catch (e) {
-      traceDone(trace, "uri resolve threw — " + errText(e), "error");
-      console.error("[ytdlp] uri resolve failed:", e, (e && e.stack) || "");
+      if (!traceCancelledOrThrew(trace, "uri resolve", e)) {
+        console.error("[ytdlp] uri resolve failed:", e, (e && e.stack) || "");
+      }
       return null;
     }
   });
@@ -2986,8 +3062,9 @@ async function activate(api) {
       traceDone(trace, result ? "single stream" : "no playable stream", result ? "info" : "warn");
       return result;
     } catch (e) {
-      traceDone(trace, "legacy uri resolve threw — " + errText(e), "error");
-      console.error("[ytdlp] legacy youtube:// resolve failed:", e, (e && e.stack) || "");
+      if (!traceCancelledOrThrew(trace, "legacy uri resolve", e)) {
+        console.error("[ytdlp] legacy youtube:// resolve failed:", e, (e && e.stack) || "");
+      }
       return null;
     }
   });
@@ -3189,10 +3266,11 @@ async function activate(api) {
   api.ui.onAction("ytdlp-source", function (data) {
     // The `tabs` control dispatches { tabId }, not { value } (that's `select`).
     var s = data && (data.tabId || data.value);
-    if (s === "__tune") { tuneOpen = true; resolveOpen = false; renderSearchView(api); return; }
-    if (s === "__resolve") { resolveOpen = true; tuneOpen = false; renderSearchView(api); return; }
+    if (s === "__recent") { recentOpen = true; tuneOpen = false; resolveOpen = false; renderSearchView(api); return; }
+    if (s === "__tune") { tuneOpen = true; resolveOpen = false; recentOpen = false; renderSearchView(api); return; }
+    if (s === "__resolve") { resolveOpen = true; tuneOpen = false; recentOpen = false; renderSearchView(api); return; }
     if (s && SOURCES[s]) {
-      tuneOpen = false; resolveOpen = false;
+      tuneOpen = false; resolveOpen = false; recentOpen = false;
       searchSource = s; api.storage.set("searchSource", s); renderSearchView(api);
     }
   });
@@ -3429,6 +3507,13 @@ async function activate(api) {
   });
   api.ui.onAction("ytdlp-clear-resolve", function () {
     lastResolve = null; renderSearchView(api);
+  });
+  api.ui.onAction("ytdlp-recent-clear", function () {
+    recentTraces = []; renderSearchView(api);
+  });
+  api.ui.onAction("ytdlp-recent-commands", function (data) {
+    recentShowCommands = !!(data && data.value);
+    renderSearchView(api);
   });
 
   // ---- Settings: web indexers ----
@@ -4782,6 +4867,102 @@ function buildResultRow(c, pos, opts) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// The "Recent" tab — what yt-dlp did for each recent request, newest first.
+// ---------------------------------------------------------------------------
+
+var RECENT_KIND_LABELS = {
+  "stream resolve by metadata": "Playback fallback — found by name",
+  "stream resolve by uri": "Play a yt-dlp track",
+  "stream resolve by legacy uri": "Play an old YouTube link",
+  "watch video": "Watch YouTube video",
+  "download track": "Download",
+  "download preview": "Download — check what will be fetched",
+  "download resolve": "Download",
+  "download resolve by metadata": "Download — found by name"
+};
+
+// Pure: what a trace reads as at a glance. Exported for tests.
+function recentStatus(trace) {
+  if (!trace.result) return { icon: "⏳", label: "Running" };
+  if (trace.cancelled) return { icon: "⊘", label: "Cancelled" };
+  if (trace.result.level === "error") return { icon: "✕", label: "Failed" };
+  if (trace.result.level === "warn") return { icon: "⚠", label: "Nothing playable" };
+  return { icon: "✓", label: "Handed to the app" };
+}
+
+function pad2(n) { return n < 10 ? "0" + n : String(n); }
+function clockTime(ms) {
+  var d = new Date(ms);
+  return pad2(d.getHours()) + ":" + pad2(d.getMinutes()) + ":" + pad2(d.getSeconds());
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// Pure: one trace's step lines as "+2.6s  text", oldest first. The header
+// (request + context) is the section's own title/meta, so the first two lines
+// are skipped; the exec plumbing is kept only on request. Exported for tests.
+function recentTraceLines(trace, showCommands) {
+  var out = [];
+  var lines = trace.lines || [];
+  for (var i = 2; i < lines.length; i++) {
+    var l = lines[i];
+    if (l.command && !showCommands) continue;
+    var mark = l.level === "error" ? "✕ " : l.level === "warn" ? "⚠ " : "  ";
+    out.push("+" + ((l.at - trace.startedAt) / 1000).toFixed(1) + "s " + mark + l.msg);
+  }
+  return out;
+}
+
+// Pure: the one-line summary under a trace's title. Exported for tests.
+function recentTraceMeta(trace, now) {
+  var parts = [RECENT_KIND_LABELS[trace.kind] || trace.kind, clockTime(trace.startedAt)];
+  var end = trace.result ? trace.result.at : now;
+  parts.push((trace.result ? "took " : "running for ") + fmtMs(end - trace.startedAt));
+  var st = recentStatus(trace);
+  parts.push(st.label + (trace.result ? " — " + trace.result.outcome : ""));
+  return parts.join(" · ");
+}
+
+function appendRecentView(children) {
+  children.push({
+    type: "toolbar", title: "Recent requests",
+    buttons: recentTraces.length ? [{ label: "Clear", action: "ytdlp-recent-clear", icon: "✕" }] : []
+  });
+  children.push({
+    type: "toggle", label: "Show yt-dlp commands", action: "ytdlp-recent-commands", checked: recentShowCommands,
+    description: "Include each yt-dlp command line and its exit status — what to paste into a bug report."
+  });
+  if (!recentTraces.length) {
+    children.push({
+      type: "text", className: "ds-empty",
+      content: "Nothing yet. Every time the app asks yt-dlp for a track — to play a YouTube result, to stand in for a song it can't find elsewhere, to watch a video or to download — the steps it took show up here."
+    });
+    return;
+  }
+  children.push({
+    type: "text", className: "ds-empty",
+    content: "What yt-dlp did for the last " + recentTraces.length + " request(s), newest first. “Handed to the app” means yt-dlp found a stream; whether it then played shows on the track's row in the queue — click a “Couldn't play” note there for the player's side."
+  });
+  var now = Date.now();
+  for (var i = recentTraces.length - 1; i >= 0; i--) {
+    var t = recentTraces[i];
+    var st = recentStatus(t);
+    var lines = recentTraceLines(t, recentShowCommands);
+    var body = [{ type: "text", className: "ds-empty", content: recentTraceMeta(t, now) }];
+    if (lines.length) {
+      body.push({
+        type: "text",
+        content: "<pre style=\"white-space:pre-wrap;word-break:break-word;margin:4px 0 0;font-size:11px;line-height:1.45\">" +
+          escapeHtml(lines.join("\n")) + "</pre>"
+      });
+    }
+    children.push({ type: "section", title: st.icon + " " + t.subject, children: body });
+  }
+}
+
 // The "Last resolve" tab: the candidates the most recent AUTOMATED resolve
 // (playback/download fallback or "Watch YouTube video") considered, ranked by
 // the profile it used, with the winning pick ✓ and the same per-signal
@@ -4928,13 +5109,21 @@ function renderSearchView(api) {
     var k = SOURCE_ORDER[i];
     sourceTabs.push({ id: k, label: SOURCES[k].label });
   }
+  sourceTabs.push({ id: "__recent", label: "🕘 Recent" });
   if (debugScoring) {
     sourceTabs.push({ id: "__tune", label: "🔧 Tuning" });
     sourceTabs.push({ id: "__resolve", label: "🧭 Last resolve" });
   }
-  var activeTab = (resolveOpen && debugScoring) ? "__resolve"
+  var activeTab = recentOpen ? "__recent"
+    : (resolveOpen && debugScoring) ? "__resolve"
     : (tuneOpen && debugScoring) ? "__tune" : searchSource;
   children.push({ type: "tabs", tabs: sourceTabs, activeTab: activeTab, action: "ytdlp-source" });
+
+  if (recentOpen) {
+    appendRecentView(children);
+    api.ui.setViewData("ytdlp-search", { type: "layout", direction: "vertical", children: children }, { scrollKey: "__recent" });
+    return;
+  }
 
   // The debug tabs replace the search UI within the same sidebar item.
   if (tuneOpen && debugScoring) {
@@ -5132,6 +5321,8 @@ function deactivate() {
   streamUrlCache = {}; searchCache = {}; infoCache = {}; recentPicks = {};
   scoringAudio = null; scoringVideo = null;
   resolveOpen = false;
+  recentTraces = []; recentOpen = false; recentShowCommands = false;
+  if (recentRenderTimer) { clearTimeout(recentRenderTimer); recentRenderTimer = null; }
   tuneOpen = false; tuneProfile = "audio"; tuneQuery = ""; tuneTarget = null;
   tuneResults = null; tuneBusy = false; tuneParamText = {}; tuneTargetRaw = null;
   // Web indexers: in-memory state only — disables and custom defs reload from
@@ -5203,6 +5394,14 @@ return {
   _describeCandidate: describeCandidate,
   _parseChosenFormat: parseChosenFormat,
   _streamReleaseWaitMs: streamReleaseWaitMs,
+  _recentStatus: recentStatus,
+  _recentTraceLines: recentTraceLines,
+  _recentTraceMeta: recentTraceMeta,
+  _recentTraces: function () { return recentTraces; },
+  _traceDone: traceDone,
+  _traceCancelledOrThrew: traceCancelledOrThrew,
+  _appendRecentView: appendRecentView,
+  _waitForStreamRelease: waitForStreamRelease,
   _latestAvailableAt: latestAvailableAt,
   _describeChosenFormat: describeChosenFormat,
   _describeDownloadQuality: describeDownloadQuality,
