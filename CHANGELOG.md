@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.28.1
+- The Recent tab now updates while a request is running, and each request's outcome is worded for what it was: "Downloaded", "Previewed", "Queued", "No video found" and so on. A download you cancelled shows as cancelled.
+- The wait for a YouTube stream to be released now applies only to the streams actually offered to the player, so a video is no longer held up by a stream it wasn't going to use.
+- In the download window, the smaller video sizes say MKV when the video has no H.264, matching the "Best" option.
+- A song is only offered as "the same upload you just listened to" when it actually played, and as audio or video according to how it played.
+
 ## v1.28.0
 - **Recent tab.** The view has a new 🕘 Recent tab showing what yt-dlp did for the last 25 requests (plays, fallbacks, Watch video, downloads): each step with timings and how it ended. Turn on "Show yt-dlp commands" to see the exact command lines for a bug report. It is kept in memory only and cleared when the plugin is disabled.
 - **The download window shows what it will fetch.** On Viboplr versions that ask for a download preview, the plugin names the upload a download would fetch and offers only the qualities that video really has (no "1080p" for a video that tops out at 480p). A song you just played through the fallback resolver downloads as that same upload instead of being searched again.

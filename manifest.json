@@ -1,7 +1,7 @@
 {
   "id": "ytdlp",
   "name": "yt-dlp",
-  "version": "1.28.0",
+  "version": "1.28.1",
   "author": "Viboplr",
   "description": "Play and download audio and video from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via yt-dlp. Search the web directly with built-in and user-defined web indexers. Replaces the YouTube plugin.",
   "minAppVersion": "1.0.85",
