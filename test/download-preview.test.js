@@ -132,3 +132,39 @@ test("preview surfaces yt-dlp's reason when the lookup fails", async () => {
     /unavailable/,
   );
 });
+
+test("slimInfo keeps only what the preview reads", () => {
+  const big = { ...INFO, description: "x".repeat(10000), formats: [{ ...ALIVE_FORMATS[1], url: "https://signed.example/very-long", http_headers: { a: "b" } }] };
+  const slim = plugin._slimInfo(big);
+  assert.deepEqual(Object.keys(slim).sort(), ["channel", "duration", "formats", "thumbnail", "title", "uploader"]);
+  assert.deepEqual(slim.formats, [{ vcodec: "none", acodec: "opus", height: undefined, abr: 130.45, tbr: undefined }]);
+  assert.equal(slim.title, INFO.title);
+});
+
+async function activatedWith(extra) {
+  const api = makeApi({ exec: toolsPresent(extra) });
+  const p = loadPlugin();
+  await p.activate(api);
+  await new Promise((r) => setTimeout(r, 5));
+  return { api, p };
+}
+
+test("download by name fetches the upload the fallback resolver just played", async () => {
+  const SEARCH = "https://www.youtube.com/watch?v=qM0zINtulhM\t341\tPearlJamVEVO\tPearl Jam - Alive (Official Video)\tNA\t9000000";
+  let searches = 0;
+  const { api, p } = await activatedWith([
+    { match: { cmd: "yt-dlp", argsInclude: ["--flat-playlist"] }, result: () => { searches++; return { exitCode: 0, stdout: SEARCH }; } },
+    { match: { cmd: "yt-dlp", argsInclude: ["%(urls)s"] }, result: { exitCode: 0, stdout: "https://direct.example/a.m4a\n{}" } },
+  ]);
+  await api._handlers["stream:ytdlp-fallback"]("Alive", "Pearl Jam", null, 341);
+  assert.equal(searches, 1);
+  // The download itself fails in the mock; what matters is which URL it ran on.
+  await api._handlers["meta:ytdlp-download"]("Alive", "Pearl Jam", null, 341, "original").catch(() => {});
+  assert.equal(searches, 1, "no second search");
+  // The search cache would also spare a second exec — the trace shows whether
+  // the download searched at all.
+  const t = p._recentTraces().find((x) => x.kind === "download resolve by metadata");
+  assert.ok(!t.lines.some((l) => /search/i.test(l.msg)), t.lines.map((l) => l.msg).join("\n"));
+  const dl = api.calls.exec.find((c) => c.cmd === "yt-dlp" && c.args.includes("https://www.youtube.com/watch?v=qM0zINtulhM") && !c.args.includes("%(urls)s"));
+  assert.ok(dl, "the download ran on the played upload");
+});

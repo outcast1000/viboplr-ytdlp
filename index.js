@@ -2547,7 +2547,7 @@ async function enumerateFormats(api, url, maxHeight, trace) {
   }
   try {
     var info = JSON.parse(res.stdout.split("\n")[0]);
-    infoCache[url] = { info: info, at: Date.now() };
+    rememberInfo(url, info, Date.now());
     var formats = info.formats || [];
     // The full table, from data this extraction already returned. It is the only
     // record of what the source OFFERED, as opposed to what we ended up playing
@@ -2781,22 +2781,44 @@ function recallPick(table, title, artistName, video, now) {
   return null;
 }
 
-// One video's full yt-dlp info (`-j`), cached briefly: the preview reads it and
-// a video play has usually just fetched it (enumerateFormats).
+// One video's yt-dlp info (`-j`), cached briefly: the preview reads it and a
+// video play has usually just fetched it (enumerateFormats). Only what the
+// preview reads is kept — a YouTube `-j` runs to a megabyte, most of it signed
+// URLs and per-format detail — and the cache is bounded like the others.
 var INFO_CACHE_TTL_MS = 10 * 60 * 1000;
+var INFO_CACHE_MAX = 20;
 var infoCache = {};
 
+// Pure: the slice of a `-j` info dict the preview uses. Exported for tests.
+function slimInfo(info) {
+  var formats = [];
+  var src = (info && info.formats) || [];
+  for (var i = 0; i < src.length; i++) {
+    var f = src[i] || {};
+    formats.push({ vcodec: f.vcodec, acodec: f.acodec, height: f.height, abr: f.abr, tbr: f.tbr });
+  }
+  return {
+    title: info.title, uploader: info.uploader, channel: info.channel,
+    duration: info.duration, thumbnail: info.thumbnail, formats: formats
+  };
+}
+
+function rememberInfo(url, info, now) {
+  var slim = slimInfo(info);
+  cachePut(infoCache, url, slim, now + INFO_CACHE_TTL_MS, INFO_CACHE_MAX);
+  return slim;
+}
+
 async function fetchVideoInfo(api, url, trace) {
-  var hit = infoCache[url];
-  if (hit && Date.now() - hit.at < INFO_CACHE_TTL_MS) return hit.info;
+  var hit = cacheGet(infoCache, url, Date.now());
+  if (hit) return hit;
   var res = await execLogged(api, trace, "info-json", ["-j", "--no-warnings", "--no-playlist", url], { cwd: null });
   if (res.exitCode !== 0 || !res.stdout) {
     noteBotGate(api, res.stderr);
     throw new Error(await withOutdatedHint(api, classifyYtdlpError(res.stderr)));
   }
   var info = JSON.parse(res.stdout.split("\n")[0]);
-  infoCache[url] = { info: info, at: Date.now() };
-  return info;
+  return rememberInfo(url, info, Date.now());
 }
 
 // Answer the host's download preview: which upload a download would fetch,
@@ -3191,21 +3213,35 @@ async function activate(api) {
     await ensureToolStatus(api);
     if (!ytDlpVersion) return null;
     title = stripRemasterSuffix(title);
+    var mdTrace = null;
     try {
       // Downloads are audio unless a video format was requested — match the
       // scoring profile so a video download ranks toward the actual MV.
       var dlProfile = parseVideoFormat(format).isVideo ? "video" : "audio";
-      var mdTrace = startTrace(api, "download resolve by metadata",
+      mdTrace = startTrace(api, "download resolve by metadata",
         title + (artistName ? " — " + artistName : "") + " as " + (format || "original"),
         // A download's cap comes from the requested format, not the streaming
         // setting — reporting the latter here would name a limit that isn't
         // in force.
         currentContext({ preferVideo: dlProfile === "video", maxHeight: parseVideoFormat(format).maxHeight }));
-      var cand = await searchByMetadata(api, title, artistName, durationSecs, dlProfile, mdTrace);
+      // The upload the user just heard or watched, if any — the one the
+      // download preview offered — rather than a fresh search that could rank
+      // a different one first.
+      var played = recallPick(recentPicks, title, artistName, dlProfile === "video", Date.now());
+      var cand;
+      if (played) {
+        cand = played.cand;
+        logLine(api, mdTrace, "info", "using the " + (played.video ? "video" : "upload") + " just played — " + cand.url);
+      } else {
+        cand = await searchByMetadata(api, title, artistName, durationSecs, dlProfile, mdTrace);
+      }
       if (!cand) { traceDone(mdTrace, "no match", "warn"); return null; }
       // The host's metadata is authoritative here (a real library track).
       return await resolveDownload(api, cand.url, format, { title: title, artist: artistName, album: albumName }, mdTrace);
     } catch (e) {
+      // resolveDownload closes the trace itself; anything before it (the
+      // search) would otherwise leave it "Running" in the Recent tab.
+      if (mdTrace && !mdTrace.result) traceDone(mdTrace, "failed — " + errText(e), "warn");
       // Propagates like the by-URI path: the host shows the reason (bot
       // check, region lock) instead of a generic "couldn't find".
       console.error("[ytdlp] download resolve failed:", e, e.stack || "");
@@ -5409,6 +5445,7 @@ return {
   _qualityOptionsForFormats: qualityOptionsForFormats,
   _pickKey: pickKey,
   _recallPick: recallPick,
+  _slimInfo: slimInfo,
   _CHOSEN_FMT_PRINT: CHOSEN_FMT_PRINT,
   // Web indexers.
   _decodeMarkupEntities: decodeMarkupEntities,
