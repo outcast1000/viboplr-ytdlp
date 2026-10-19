@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.29.0
+- The plugin now tells Viboplr how to install and update yt-dlp itself, instead of Viboplr knowing about yt-dlp. Nothing changes on screen: yt-dlp is still in Extensions → Tools, installed and kept up to date the same way. Older Viboplr versions ignore it.
+
 ## v1.28.1
 - The Recent tab now updates while a request is running, and each request's outcome is worded for what it was: "Downloaded", "Previewed", "Queued", "No video found" and so on. A download you cancelled shows as cancelled.
 - The wait for a YouTube stream to be released now applies only to the streams actually offered to the player, so a video is no longer held up by a stream it wasn't going to use.
