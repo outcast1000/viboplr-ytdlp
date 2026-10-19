@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.30.0
+- **Install the missing tools from the view.** When ffmpeg is missing, the view's header has an **Install ffmpeg** button; when yt-dlp is missing, the banner has **Install yt-dlp**. Each opens Viboplr's own install dialog (one-click install where Viboplr can manage the tool, otherwise the command for your system), and the view notices within a few seconds once the tool is installed — no reload needed. Messages that pointed to "Settings → Dependencies" now say Extensions → Tools, where that list moved.
+- On the next Viboplr release the dialog says ffmpeg is "needed" rather than "required", since everything except merging and conversion works without it.
+
 ## v1.29.0
 - The plugin now tells Viboplr how to install and update yt-dlp itself, instead of Viboplr knowing about yt-dlp. Nothing changes on screen: yt-dlp is still in Extensions → Tools, installed and kept up to date the same way. Older Viboplr versions ignore it.
 

@@ -416,7 +416,7 @@ async function withOutdatedHint(api, message) {
   try {
     var dep = await api.system.getDependency("yt-dlp");
     if (dep && dep.installed && dep.latest && isOlderVersion(dep.version, dep.latest)) {
-      return message + " Installed yt-dlp " + dep.version + " is outdated (latest " + dep.latest + ") — update it in Settings → Dependencies.";
+      return message + " Installed yt-dlp " + dep.version + " is outdated (latest " + dep.latest + ") — update it in Extensions → Tools.";
     }
   } catch (e) { console.error("[ytdlp] outdated-hint lookup failed:", e); }
   return message;
@@ -1582,7 +1582,7 @@ async function searchByMetadata(api, title, artistName, durationSecs, profileKin
 async function watchVideoFor(api, title, artistName) {
   await ensureToolStatus(api);
   if (!ytDlpVersion) {
-    api.ui.showNotification("yt-dlp isn't installed — see Settings → Dependencies.");
+    api.ui.showNotification("yt-dlp isn't installed — see Extensions → Tools.");
     return;
   }
   var clean = stripRemasterSuffix((title || "").trim());
@@ -1621,7 +1621,7 @@ async function watchVideoFor(api, title, artistName) {
 async function downloadTrackFor(api, target) {
   await ensureToolStatus(api);
   if (!ytDlpVersion) {
-    api.ui.showNotification("yt-dlp isn't installed — see Settings → Dependencies.");
+    api.ui.showNotification("yt-dlp isn't installed — see Extensions → Tools.");
     return;
   }
   var clean = stripRemasterSuffix((target.title || "").trim());
@@ -2010,7 +2010,7 @@ async function downloadForDownload(api, url, opts, trace) {
       // not a broken install, so it must not be reported as one — rethrow it
       // verbatim and let the host recognise its own cancellation.
       if (msg.trim() === "Cancelled") throw e;
-      throw new Error("yt-dlp could not be run — check Settings → Dependencies.");
+      throw new Error("yt-dlp could not be run — check Extensions → Tools.");
     }
   };
   var settle = traceStep(trace, "download " + (opts.video ? "video" : opts.audioFormat ? "audio → " + opts.audioFormat : "audio (original)"));
@@ -3138,7 +3138,7 @@ async function activate(api) {
       }
       var limit = Math.min(25, Math.max(1, parseInt(args.limit, 10) || 10));
       await ensureToolStatus(api);
-      if (!ytDlpVersion) throw new Error("yt-dlp is not installed — the user can install it in Settings → Dependencies");
+      if (!ytDlpVersion) throw new Error("yt-dlp is not installed — the user can install it in Extensions → Tools");
       var cands = await runSearch(api, isHttpUrl(query) ? "link" : source, query, limit);
       return {
         results: cands.slice(0, limit).map(function (c) {
@@ -3158,7 +3158,7 @@ async function activate(api) {
       var url = typeof args.url === "string" ? args.url.trim() : "";
       if (!isHttpUrl(url)) throw new Error('"url" (http/https) is required — get one from the search tool or the user');
       await ensureToolStatus(api);
-      if (!ytDlpVersion) throw new Error("yt-dlp is not installed — the user can install it in Settings → Dependencies");
+      if (!ytDlpVersion) throw new Error("yt-dlp is not installed — the user can install it in Extensions → Tools");
       // A single video becomes one row; a playlist/album/set URL fans out into
       // its entries (capped at LINK_MAX) — same path as the sidebar Link tab.
       var full = await runSearchFull(api, "link", url, LINK_MAX);
@@ -3384,6 +3384,9 @@ async function activate(api) {
     tuneBusy = false; renderSearchView(api);
   });
 
+  api.ui.onAction("ytdlp-install-ffmpeg", function () { requestTool(api, "ffmpeg"); });
+  api.ui.onAction("ytdlp-install-ytdlp", function () { requestTool(api, "yt-dlp", "The yt-dlp plugin"); });
+
   api.ui.onAction("ytdlp-search-submit", async function (data) {
     // Click while THIS tab's search is running = cancel. A search started from
     // another tab is just superseded by the new one (generation bump below).
@@ -3496,7 +3499,7 @@ async function activate(api) {
   api.ui.onAction("ytdlp-download", function (data) {
     var chosen = selectedResults(data);
     if (chosen.length === 0) return;
-    if (!ytDlpVersion) { api.ui.showNotification("yt-dlp isn't installed — see Settings → Dependencies."); return; }
+    if (!ytDlpVersion) { api.ui.showNotification("yt-dlp isn't installed — see Extensions → Tools."); return; }
     var tracks = [];
     for (var i = 0; i < chosen.length; i++) {
       var t = buildTrack(chosen[i], false); // audio ref; modal offers Video (MP4)
@@ -4842,7 +4845,9 @@ function webIndexerSettingsRows() {
 // ---------------------------------------------------------------------------
 // Pure: the host-drawn header over the sidebar view (api.ui.setViewHeader).
 // It says whether yt-dlp works, in one word, plus which tools it found; the fix
-// for a missing yt-dlp stays in makeMissingDepNote's banner. `null` = nothing
+// for a missing yt-dlp stays in makeMissingDepNote's banner. A missing ffmpeg
+// is no problem worth a banner (everything still works, minus merging and
+// conversion), so its install button sits in the header. `null` = nothing
 // known yet (the manifest's subtitle stands).
 var VIEW_HEADER_SUBTITLE = "YouTube, SoundCloud, Bandcamp and 1000+ other sites";
 function viewHeaderFor(t) {
@@ -4856,7 +4861,7 @@ function viewHeaderFor(t) {
   return {
     subtitle: sub,
     status: outdated ? { variant: "warning", label: "Update available" } : { variant: "success", label: "Ready" },
-    actions: []
+    actions: t.ffmpeg ? [] : [{ label: "Install ffmpeg", action: "ytdlp-install-ffmpeg", variant: "secondary" }]
   };
 }
 
@@ -4875,8 +4880,53 @@ function pushViewHeader(api) {
 
 function makeMissingDepNote() {
   if (!statusLoaded || ytDlpVersion) return null;
-  return { type: "text", className: "ds-banner ds-banner--error",
-    content: "yt-dlp isn't installed. Install it from Settings → Dependencies to search, play or download." };
+  return {
+    type: "layout", direction: "horizontal", className: "ds-banner ds-banner--error",
+    children: [
+      { type: "text", content: "yt-dlp isn't installed, so this plugin can't search, play or download." },
+      { type: "button", label: "Install yt-dlp", action: "ytdlp-install-ytdlp", variant: "accent" }
+    ]
+  };
+}
+
+// Install a missing tool: the host's own install dialog for it (it refuses a
+// tool this manifest doesn't list), then a few minutes of re-reading the host's
+// status, since the host tells a plugin nothing when an install finishes and
+// the status is otherwise read once per activation. Cache-only reads, so the
+// polling costs nothing; it stops as soon as the tool is there.
+var toolRecheckIntervalMs = 3000;
+var TOOL_RECHECK_LIMIT = 100; // × 3s ≈ 5 minutes
+var toolRecheckTimer = null;
+
+function toolInstalled(name) {
+  return name === "ffmpeg" ? !!ffmpegVersion : !!ytDlpVersion;
+}
+
+function requestTool(api, name, feature) {
+  var payload = { name: name };
+  if (feature) payload.feature = feature;
+  api.ui.requestAction("require-dependency", payload);
+  watchToolStatus(api, name);
+}
+
+function watchToolStatus(api, name) {
+  if (toolRecheckTimer) clearTimeout(toolRecheckTimer);
+  var left = TOOL_RECHECK_LIMIT;
+  function tick() {
+    toolRecheckTimer = null;
+    loadToolStatus(api).then(function () {
+      if (toolInstalled(name)) {
+        renderSettings(api);
+        renderSearchView(api);
+        return;
+      }
+      left -= 1;
+      if (left > 0) toolRecheckTimer = setTimeout(tick, toolRecheckIntervalMs);
+    }).catch(function (e) {
+      api.log("warn", "Couldn't re-read " + name + " status: " + (e && e.message ? e.message : e), "ytdlp");
+    });
+  }
+  toolRecheckTimer = setTimeout(tick, toolRecheckIntervalMs);
 }
 
 // Build one track-row-list item from a search/resolve candidate at display
@@ -5375,6 +5425,7 @@ function renderSettings(api) {
 
 function deactivate() {
   ytDlpVersion = null; ffmpegVersion = null; statusLoaded = false;
+  if (toolRecheckTimer) { clearTimeout(toolRecheckTimer); toolRecheckTimer = null; }
   inFlightFiles = {}; lastSourceFile = null;
   tabState = {}; searching = false; searchingSource = null; searchGen = 0;
   botGateNotified = false; deepDiagnosticsRun = false; lastResolve = null;
@@ -5444,6 +5495,7 @@ return {
   _videoFormatSelector: videoFormatSelector,
   _dropSoundcloudPreviews: dropSoundcloudPreviews,
   _loadToolStatus: loadToolStatus,
+  _setToolRecheckInterval: function (ms) { toolRecheckIntervalMs = ms; },
   _viewHeaderFor: viewHeaderFor,
   _engineLabel: engineLabel,
   _describeContext: describeContext,
