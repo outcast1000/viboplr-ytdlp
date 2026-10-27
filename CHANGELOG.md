@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.31.0
+- **A song whose YouTube upload won't stream now plays from another upload.** Some uploads have every stream refused by YouTube (HTTP 403) however often the link is renewed, while the browser still plays them. When Viboplr retries such a stream, the plugin now checks the new link first, and if it's refused too it plays the next search result instead of the same upload again. A refused upload is skipped for 30 minutes and is never replayed from the link cache. A ytdlp:// track names a single upload, so it fails cleanly instead.
+- The Recent tab and the log now show the yt-dlp version that is installed now. After an update from Extensions → Tools they kept showing the version from when the plugin started.
+
 ## v1.30.0
 - **Install the missing tools from the view.** When ffmpeg is missing, the view's header has an **Install ffmpeg** button; when yt-dlp is missing, the banner has **Install yt-dlp**. Each opens Viboplr's own install dialog (one-click install where Viboplr can manage the tool, otherwise the command for your system), and the view notices within a few seconds once the tool is installed — no reload needed. Messages that pointed to "Settings → Dependencies" now say Extensions → Tools, where that list moved.
 - On the next Viboplr release the dialog says ffmpeg is "needed" rather than "required", since everything except merging and conversion works without it.

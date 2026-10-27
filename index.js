@@ -358,8 +358,24 @@ async function loadToolStatus(api) {
     ffmpegVersion = "unknown";
   }
   statusLoaded = true;
+  statusLoadedAt = Date.now();
 }
-async function ensureToolStatus(api) { if (!statusLoaded) await loadToolStatus(api); }
+
+// Re-read now and then, not once per session: the user updates yt-dlp from
+// Extensions → Tools while we run, and a status read at activation kept
+// reporting the old version in every trace for the rest of the session. The
+// host's answer is cache-only, so a re-read costs one IPC round trip.
+var TOOL_STATUS_TTL_MS = 60 * 1000;
+var statusLoadedAt = 0;
+
+// Pure; exported for tests.
+function toolStatusStale(loaded, loadedAt, now) {
+  return !loaded || now - loadedAt >= TOOL_STATUS_TTL_MS;
+}
+
+async function ensureToolStatus(api) {
+  if (toolStatusStale(statusLoaded, statusLoadedAt, Date.now())) await loadToolStatus(api);
+}
 
 // Map yt-dlp stderr to a user-facing reason — the host download modal shows
 // thrown messages, so the real cause reaches the user instead of a generic
@@ -1541,16 +1557,22 @@ function recordResolve(api, info) {
 // the given profile ("audio" | "video"), record the resolve for the debug panel
 // and return the winner (or null). `target` is the known duration in secs (or
 // null); `resolveKind` is the human label shown in the panel.
-async function resolvePick(api, source, query, target, profileKind, resolveKind, trace) {
+// `skip(url)`, when given, passes over the candidates it returns true for (the
+// playback fallback's refused sources) and takes the best one left.
+async function resolvePick(api, source, query, target, profileKind, resolveKind, trace, skip) {
   var settle = traceStep(trace, "search " + source + " for “" + query + "”" +
     (target != null ? " (target " + Math.round(target) + "s)" : ""));
   var candidates = await runSearchRaw(api, source, query, 7, trace);
   var ranked = rankByProfile(candidates, profileFor(profileKind), target);
-  var cand = ranked.length ? ranked[0] : null;
+  var picked = pickUnskipped(ranked, skip);
+  var cand = picked.cand;
+  var skipNote = picked.skipped ? "; passed over " + picked.skipped + " refused upload(s)" : "";
   var pick = cand
     ? ranked.length + " hit(s); " + profileKind + " profile chose " + cand.url +
-      " (score " + cand._profileScore.score.toFixed(2) + ")"
-    : "no usable results (parsed 0 valid candidates)";
+      " (score " + cand._profileScore.score.toFixed(2) + ")" + skipNote
+    : ranked.length
+      ? ranked.length + " hit(s), every one refused" + skipNote
+      : "no usable results (parsed 0 valid candidates)";
   settle(pick, cand ? "info" : "warn");
   // Without a trace this is a search run from the sidebar or the tuner, where
   // the pick is still the one line worth keeping.
@@ -1562,16 +1584,31 @@ async function resolvePick(api, source, query, target, profileKind, resolveKind,
   return cand;
 }
 
+// The best-ranked candidate `skip` doesn't rule out, and how many it passed
+// over. Pure; exported for tests.
+function pickUnskipped(ranked, skip) {
+  var skipped = 0;
+  for (var i = 0; i < ranked.length; i++) {
+    if (skip && skip(ranked[i].url)) { skipped++; continue; }
+    return { cand: ranked[i], skipped: skipped };
+  }
+  return { cand: null, skipped: skipped };
+}
+
 // Resolve a track that has no direct source of its own (played from Spotify, a
 // library miss, or a metadata download) via the configurable fallback source
 // (YouTube by default). `profileKind` selects the scoring profile — "audio" for
 // ordinary playback/downloads, "video" when the host wants a video stream.
-async function searchByMetadata(api, title, artistName, durationSecs, profileKind, trace) {
+// `opts.skipRefused` passes over uploads whose streams the site refused.
+async function searchByMetadata(api, title, artistName, durationSecs, profileKind, trace, opts) {
   var query = artistName ? title + " " + artistName : title;
+  var skip = opts && opts.skipRefused
+    ? function (url) { return isRefusedSource(refusedSources, url, Date.now()); }
+    : null;
   return resolvePick(api, resolverSource, query,
     durationSecs != null ? durationSecs : null,
     profileKind === "video" ? "video" : "audio",
-    "Playback / download fallback", trace);
+    "Playback / download fallback", trace, skip);
 }
 
 // Context-menu "Watch YouTube video": search YouTube by the track's metadata and
@@ -2660,8 +2697,68 @@ async function withCacheProtection(api, filePath, work) {
   }
 }
 
+// ---- Sources whose streams the site refuses --------------------------------
+// Some uploads have every stream URL refused (HTTP 403) however often it is
+// minted — YouTube binding its PO token to the video id is one cause — while
+// the browser plays them fine. A fresh URL can't help there, so the host's
+// retries used to replay the same upload three times and give up. A refused
+// source is remembered for a while: the metadata resolver moves on to the next
+// search result, and nothing serves a cached URL of it.
+var REFUSED_SOURCE_TTL_MS = 30 * 60 * 1000;
+var REFUSED_SOURCE_MAX = 100;
+var refusedSources = {};
+
+// Pure over the table; exported for tests.
+function isRefusedSource(table, url, now) {
+  var at = table[url];
+  return at != null && now - at < REFUSED_SOURCE_TTL_MS;
+}
+
+function markRefusedSource(table, url, now) {
+  table[url] = now;
+  var keys = Object.keys(table);
+  if (keys.length <= REFUSED_SOURCE_MAX) return;
+  keys.sort(function (a, b) { return table[a] - table[b]; });
+  for (var i = 0; i < keys.length - REFUSED_SOURCE_MAX; i++) delete table[keys[i]];
+}
+
+// What a probe's status says about the stream: "refused" only for an answer
+// that a new URL of the same source won't change. Anything else (a timeout, a
+// 5xx, a network error) proves nothing, and the stream is handed over as it
+// always was. Pure; exported for tests.
+function probeVerdict(status) {
+  if (status === 200 || status === 206) return "ok";
+  if (status === 401 || status === 403 || status === 410) return "refused";
+  return "unknown";
+}
+
+var STREAM_PROBE_TIMEOUT_MS = 8000;
+
+// Ask for the stream's first byte, with the headers the engine will send. Only
+// on the host's retry (`fresh`): a first play costs nothing extra, and by then
+// one URL of this source has already failed, so the question is worth a request.
+async function probeStream(api, streamUrl, headers, trace) {
+  if (!api.network || typeof api.network.fetch !== "function") return "unknown";
+  var settle = traceStep(trace, "check the stream answers");
+  var h = {};
+  if (headers) for (var k in headers) if (Object.prototype.hasOwnProperty.call(headers, k)) h[k] = headers[k];
+  h.Range = "bytes=0-0";
+  try {
+    var resp = await api.network.fetch(streamUrl, { method: "GET", headers: h, timeoutMs: STREAM_PROBE_TIMEOUT_MS });
+    var verdict = probeVerdict(resp.status);
+    settle("HTTP " + resp.status + (verdict === "refused" ? " — the site refuses this upload's streams" : ""),
+      verdict === "refused" ? "warn" : "info");
+    return verdict;
+  } catch (e) {
+    settle("no answer (" + errText(e) + ") — handing the stream over anyway", "warn");
+    return "unknown";
+  }
+}
+
 // Resolve a source URL to a PLAYABLE url. Returns { url, downloaded, headers }
-// or null. `headers` is set only for a direct stream (a downloaded file needs
+// or null. On the host's retry (`fresh`) it can also return { refused: true }:
+// the newly minted URL was refused too, so the source is marked refused and
+// not cached — the caller should try another source or give up. `headers` is set only for a direct stream (a downloaded file needs
 // none) and only when the source asked for some.
 //
 // "stream" mode returns a direct URL only — it does NOT fall back to downloading
@@ -2678,8 +2775,12 @@ async function resolvePlayable(api, url, isVideo, fresh, trace) {
     // play. A signed URL that has been refused stays refused, so the remembered
     // one is worse than useless here: serving it would burn the retry and make
     // the failure look permanent. Drop it and mint a new one.
-    if (fresh) delete streamUrlCache[key];
-    var cacheSettle = traceStep(trace, "signed-URL cache" + (fresh ? " (dropped: host asked for a fresh URL)" : ""));
+    // A refused source's remembered URL is refused too: the host gave up on it
+    // without telling us, and serving it on the next play replayed the failure.
+    var refused = isRefusedSource(refusedSources, url, Date.now());
+    if (fresh || refused) delete streamUrlCache[key];
+    var cacheSettle = traceStep(trace, "signed-URL cache" + (fresh ? " (dropped: host asked for a fresh URL)"
+      : refused ? " (dropped: this source's streams were refused)" : ""));
     var hit = cacheGet(streamUrlCache, key, Date.now());
     if (hit) {
       cacheSettle("hit — streaming the remembered URL, no yt-dlp call");
@@ -2691,6 +2792,22 @@ async function resolvePlayable(api, url, isVideo, fresh, trace) {
     cacheSettle("miss");
     var direct = await getDirectUrl(api, url, isVideo, trace);
     if (direct && direct.url) {
+      // A source already known to be refused is checked on an ordinary play
+      // too, so it costs one request instead of the host's three retries — and
+      // plays again as soon as the site lets it.
+      if (fresh || refused) {
+        // Probe after the release wait: before it, YouTube refuses with the
+        // same 403 a refused source gets.
+        await waitForStreamRelease(direct.availableAt, trace);
+        var verdict = await probeStream(api, direct.url, direct.headers, trace);
+        if (verdict === "refused") {
+          markRefusedSource(refusedSources, url, Date.now());
+          logLine(api, trace, "warn", "fresh URL refused as well — not caching it; " + url + " is skipped for "
+            + Math.round(REFUSED_SOURCE_TTL_MS / 60000) + " min");
+          return { refused: true };
+        }
+        if (verdict === "ok") delete refusedSources[url];
+      }
       var expiresAt = streamUrlExpiry(direct.url, Date.now());
       // null = the URL is already near its own deadline, so caching it would
       // only guarantee a dead hit later. Play it now, resolve again next time.
@@ -2926,6 +3043,65 @@ async function resolveDownload(api, url, format, caller, trace) {
   });
 }
 
+// How many further uploads one fallback resolve tries after a refused one. Each
+// costs a stream extraction (~6–12s) and the host gives a resolver 60s.
+var MAX_REFUSED_ALTERNATES = 2;
+
+// One pass of the metadata fallback resolver over one search result: the
+// host's answer, null (no stream — don't try another upload), or
+// { refused: true } (the site refuses this upload's streams — try another).
+async function resolveFallbackCandidate(api, cand, title, artistName, preferVideo, opts, fresh, trace) {
+  if (preferVideo) {
+    // The host can merge a separate audio track (native mpv engine): hand it
+    // the whole menu so it can pair a hi-res video-only stream with an
+    // audio-only one. Without this the answer is whatever `getDirectUrl`
+    // finds with `best[ext=mp4]/best` — a MUXED stream — and YouTube's only
+    // muxed format is itag 18 at 360p, so "Watch YouTube video" was capped
+    // there on every engine no matter how good the source was.
+    if (opts && opts.externalAudio && playbackMode === "stream") {
+      var menu = await enumerateFormats(api, cand.url, maxVideoHeight, trace);
+      var selfContained = selfContainedUrl(menu);
+      if (menu.length && selfContained) {
+        // The menu isn't cached, so it is new on every resolve; on the host's
+        // retry, check one stream of it before handing the whole menu over.
+        if (fresh && await probeStream(api, selfContained, menuHeadersFor(menu, selfContained), trace) === "refused") {
+          markRefusedSource(refusedSources, cand.url, Date.now());
+          return { refused: true };
+        }
+        rememberPick(title, artistName, cand, true, Date.now());
+        traceDone(trace, "candidate menu of " + menu.length + " (host picks per its engine)");
+        return { url: selfContained, candidates: menu, label: "yt-dlp (video)", sourceUrl: cand.url, video: true };
+      }
+      traceLog(trace, "warn", "no usable candidates — falling back to a single muxed stream");
+    }
+    var vid = await resolvePlayable(api, cand.url, true, fresh, trace);
+    if (vid && vid.refused) return vid;
+    // `headers` rides along so the host can hand them to mpv: a signed CDN
+    // URL is often bound to the User-Agent that minted it, and this path
+    // (unlike the by-URI candidate list) has no other way to carry them.
+    if (vid) {
+      rememberPick(title, artistName, cand, true, Date.now());
+      traceDone(trace, "single video stream" + (vid.downloaded ? " (downloaded)" : ""));
+      return { url: vid.url, label: "yt-dlp (video)", sourceUrl: cand.url, video: true, headers: vid.headers || undefined };
+    }
+    traceLog(trace, "warn", "no video stream — falling back to audio");
+  }
+  var playable = await resolvePlayable(api, cand.url, false, fresh, trace);
+  if (playable && playable.refused) return playable;
+  if (!playable) { traceDone(trace, "no playable stream", "warn"); return null; }
+  // So a download of this song offers this upload rather than re-searching
+  // — only once it gave a stream, and as the kind it really played.
+  rememberPick(title, artistName, cand, false, Date.now());
+  traceDone(trace, "audio stream" + (playable.downloaded ? " (downloaded)" : ""));
+  return { url: playable.url, label: "yt-dlp", sourceUrl: cand.url, headers: playable.headers || undefined };
+}
+
+// The headers of the menu entry whose URL is `url`. Pure; exported for tests.
+function menuHeadersFor(menu, url) {
+  for (var i = 0; i < menu.length; i++) if (menu[i].url === url) return menu[i].headers || null;
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // Activation
 // ---------------------------------------------------------------------------
@@ -2977,45 +3153,27 @@ async function activate(api) {
       currentContext({ preferVideo: preferVideo, externalAudio: !!(opts && opts.externalAudio), fresh: fresh }),
       opts && opts.signal);
     try {
-      // preferVideo → rank with the VIDEO profile (official MV / VEVO); plain
-      // audio playback → the AUDIO profile (clean official-audio / Topic).
-      var cand = await searchByMetadata(api, title, artistName, durationSecs, preferVideo ? "video" : "audio", trace);
-      if (!cand) { traceDone(trace, "no match for “" + title + "”", "warn"); return null; }
-      if (preferVideo) {
-        // The host can merge a separate audio track (native mpv engine): hand it
-        // the whole menu so it can pair a hi-res video-only stream with an
-        // audio-only one. Without this the answer is whatever `getDirectUrl`
-        // finds with `best[ext=mp4]/best` — a MUXED stream — and YouTube's only
-        // muxed format is itag 18 at 360p, so "Watch YouTube video" was capped
-        // there on every engine no matter how good the source was.
-        if (opts && opts.externalAudio && playbackMode === "stream") {
-          var menu = await enumerateFormats(api, cand.url, maxVideoHeight, trace);
-          var selfContained = selfContainedUrl(menu);
-          if (menu.length && selfContained) {
-            rememberPick(title, artistName, cand, true, Date.now());
-            traceDone(trace, "candidate menu of " + menu.length + " (host picks per its engine)");
-            return { url: selfContained, candidates: menu, label: "yt-dlp (video)", sourceUrl: cand.url, video: true };
-          }
-          traceLog(trace, "warn", "no usable candidates — falling back to a single muxed stream");
+      // Each pass takes the best upload not known to be refused. A pass ends in
+      // a stream, in nothing (no match / no stream — final), or in a refusal:
+      // the source is then marked and the next pass takes the next search
+      // result, which the search cache answers without another yt-dlp run. A
+      // later upload is checked as well, since it is no more trusted than the
+      // first; that is what the `fresh` passed on below is for.
+      for (var pass = 0; pass <= MAX_REFUSED_ALTERNATES; pass++) {
+        // preferVideo → rank with the VIDEO profile (official MV / VEVO); plain
+        // audio playback → the AUDIO profile (clean official-audio / Topic).
+        var cand = await searchByMetadata(api, title, artistName, durationSecs, preferVideo ? "video" : "audio",
+          trace, { skipRefused: true });
+        if (!cand) {
+          traceDone(trace, pass ? "every upload found was refused" : "no match for “" + title + "”", "warn");
+          return null;
         }
-        var vid = await resolvePlayable(api, cand.url, true, fresh, trace);
-        // `headers` rides along so the host can hand them to mpv: a signed CDN
-        // URL is often bound to the User-Agent that minted it, and this path
-        // (unlike the by-URI candidate list) has no other way to carry them.
-        if (vid) {
-          rememberPick(title, artistName, cand, true, Date.now());
-          traceDone(trace, "single video stream" + (vid.downloaded ? " (downloaded)" : ""));
-          return { url: vid.url, label: "yt-dlp (video)", sourceUrl: cand.url, video: true, headers: vid.headers || undefined };
-        }
-        traceLog(trace, "warn", "no video stream — falling back to audio");
+        var answer = await resolveFallbackCandidate(api, cand, title, artistName, preferVideo, opts, fresh || pass > 0, trace);
+        if (!answer || !answer.refused) return answer;
+        traceLog(trace, "warn", "trying the next search result");
       }
-      var playable = await resolvePlayable(api, cand.url, false, fresh, trace);
-      if (!playable) { traceDone(trace, "no playable stream", "warn"); return null; }
-      // So a download of this song offers this upload rather than re-searching
-      // — only once it gave a stream, and as the kind it really played.
-      rememberPick(title, artistName, cand, false, Date.now());
-      traceDone(trace, "audio stream" + (playable.downloaded ? " (downloaded)" : ""));
-      return { url: playable.url, label: "yt-dlp", sourceUrl: cand.url, headers: playable.headers || undefined };
+      traceDone(trace, "gave up after " + (MAX_REFUSED_ALTERNATES + 1) + " refused uploads", "warn");
+      return null;
     } catch (e) {
       if (!traceCancelledOrThrew(trace, "stream resolve", e)) {
         console.error("[ytdlp] stream resolve failed:", e, (e && e.stack) || "");
@@ -3054,7 +3212,9 @@ async function activate(api) {
       }
       var playable = await resolvePlayable(api, ref.url, wantVideo, opts && opts.fresh, trace);
       var result = streamUriResult(playable, wantVideo, ref.url);
-      traceDone(trace, result ? "single stream" + (playable.downloaded ? " (downloaded)" : "") : "no playable stream",
+      // A ytdlp:// track names one upload, so a refused one has no other to try.
+      traceDone(trace, result ? "single stream" + (playable.downloaded ? " (downloaded)" : "")
+        : playable && playable.refused ? "the site refuses this upload's streams" : "no playable stream",
         result ? "info" : "warn");
       return result;
     } catch (e) {
@@ -3096,7 +3256,9 @@ async function activate(api) {
     try {
       var playable = await resolvePlayable(api, youtubeWatchUrl(id), false, opts && opts.fresh, trace);
       var result = streamUriResult(playable, false, youtubeWatchUrl(id));
-      traceDone(trace, result ? "single stream" : "no playable stream", result ? "info" : "warn");
+      traceDone(trace, result ? "single stream"
+        : playable && playable.refused ? "the site refuses this upload's streams" : "no playable stream",
+        result ? "info" : "warn");
       return result;
     } catch (e) {
       if (!traceCancelledOrThrew(trace, "legacy uri resolve", e)) {
@@ -5424,7 +5586,8 @@ function renderSettings(api) {
 }
 
 function deactivate() {
-  ytDlpVersion = null; ffmpegVersion = null; statusLoaded = false;
+  ytDlpVersion = null; ffmpegVersion = null; statusLoaded = false; statusLoadedAt = 0;
+  refusedSources = {};
   if (toolRecheckTimer) { clearTimeout(toolRecheckTimer); toolRecheckTimer = null; }
   inFlightFiles = {}; lastSourceFile = null;
   tabState = {}; searching = false; searchingSource = null; searchGen = 0;
@@ -5496,6 +5659,19 @@ return {
   _dropSoundcloudPreviews: dropSoundcloudPreviews,
   _loadToolStatus: loadToolStatus,
   _setToolRecheckInterval: function (ms) { toolRecheckIntervalMs = ms; },
+  _toolStatusStale: toolStatusStale,
+  _TOOL_STATUS_TTL_MS: TOOL_STATUS_TTL_MS,
+  _isRefusedSource: isRefusedSource,
+  _markRefusedSource: markRefusedSource,
+  _REFUSED_SOURCE_TTL_MS: REFUSED_SOURCE_TTL_MS,
+  _REFUSED_SOURCE_MAX: REFUSED_SOURCE_MAX,
+  _probeVerdict: probeVerdict,
+  _pickUnskipped: pickUnskipped,
+  _menuHeadersFor: menuHeadersFor,
+  _resolvePlayable: resolvePlayable,
+  _resolveFallbackCandidate: resolveFallbackCandidate,
+  _refusedSources: function () { return refusedSources; },
+  _setPlaybackMode: function (m) { playbackMode = m; },
   _viewHeaderFor: viewHeaderFor,
   _engineLabel: engineLabel,
   _describeContext: describeContext,
