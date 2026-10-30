@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.31.1
+- Each AI tool now says what it is about (its category), so Viboplr's in-app assistant can offer it alongside the app's own tools of the same kind instead of sending every tool at once. Viboplr versions that don't know the field ignore it.
+- The search tool is marked read-only — it finds videos and changes nothing — so an AI assistant can search without the "Plugin actions" permission and without asking you first; playing still asks. The AI notes now say Extensions → Tools (not Settings → Dependencies) and name the app's plugin_actions tool instead of an HTTP route.
+
 ## v1.31.0
 - **A song whose YouTube upload won't stream now plays from another upload.** Some uploads have every stream refused by YouTube (HTTP 403) however often the link is renewed, while the browser still plays them. When Viboplr retries such a stream, the plugin now checks the new link first, and if it's refused too it plays the next search result instead of the same upload again. A refused upload is skipped for 30 minutes and is never replayed from the link cache. A ytdlp:// track names a single upload, so it fails cleanly instead.
 - The Recent tab and the log now show the yt-dlp version that is installed now. After an update from Extensions → Tools they kept showing the version from when the plugin started.
