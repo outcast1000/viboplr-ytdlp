@@ -1,7 +1,7 @@
 {
   "id": "ytdlp",
   "name": "yt-dlp",
-  "version": "1.31.1",
+  "version": "1.31.2",
   "author": "Viboplr",
   "description": "Play and download audio and video from YouTube, SoundCloud, Bandcamp, Vimeo and 1000+ other sites via yt-dlp. Search the web directly with built-in and user-defined web indexers. Replaces the YouTube plugin.",
   "minAppVersion": "1.0.85",
@@ -80,7 +80,9 @@
           "name": "search",
           "description": "Search YouTube or SoundCloud via yt-dlp — returns candidates (title/artist/duration/url). Slow (a yt-dlp run, ~3-10s). A URL as the query lists what's playable there instead",
           "readOnly": true,
-          "categories": ["catalog"],
+          "categories": [
+            "catalog"
+          ],
           "inputSchema": {
             "type": "object",
             "properties": {
@@ -108,7 +110,10 @@
         {
           "name": "play_url",
           "description": "Play (or enqueue) a URL yt-dlp can handle — a video/track URL plays it, a playlist/album/set URL plays all its entries. Streams resolve at play time",
-          "categories": ["catalog", "playback"],
+          "categories": [
+            "catalog",
+            "playback"
+          ],
           "inputSchema": {
             "type": "object",
             "properties": {

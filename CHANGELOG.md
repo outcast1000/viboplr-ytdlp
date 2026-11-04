@@ -1,5 +1,9 @@
 # Changelog
 
+## v1.31.2
+- The download window offers the video qualities (and the AAC / MP3 / FLAC re-encodes) the first time it opens. Before, the first look after Viboplr started could show only "Audio · Original", even with ffmpeg installed. Installing ffmpeg from the view updates the list too.
+
+
 ## v1.31.1
 - Each AI tool now says what it is about (its category), so Viboplr's in-app assistant can offer it alongside the app's own tools of the same kind instead of sending every tool at once. Viboplr versions that don't know the field ignore it.
 - The search tool is marked read-only — it finds videos and changes nothing — so an AI assistant can search without the "Plugin actions" permission and without asking you first; playing still asks. The AI notes now say Extensions → Tools (not Settings → Dependencies) and name the app's plugin_actions tool instead of an HTTP route.
