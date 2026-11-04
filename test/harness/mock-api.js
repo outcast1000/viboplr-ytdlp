@@ -66,7 +66,7 @@ function execMatches(entry, cmd, args) {
 
 function makeApi(config) {
   config = config || {};
-  const calls = { exec: [], log: [], setViewData: [], playTracks: [], insertTracks: [], enqueue: [], requestAction: [], showNotification: [] };
+  const calls = { exec: [], log: [], setViewData: [], playTracks: [], insertTracks: [], enqueue: [], requestAction: [], showNotification: [], qualitiesPrimes: [] };
   const handlers = {};
   const storage = makeStorage(config.storage);
   const execRules = config.exec || [];
@@ -128,7 +128,12 @@ function makeApi(config) {
     downloads: {
       onResolveByUri: (id, fn) => { handlers["uri:" + id] = fn; },
       onResolveByMetadata: (id, fn) => { handlers["meta:" + id] = fn; },
-      onGetQualities: (id, fn) => { handlers["qual:" + id] = fn; },
+      // Like the host: the answer at registration is what a worker plugin's
+      // first read gets (usePlugins primes its qualities cache here).
+      onGetQualities: (id, fn) => {
+        handlers["qual:" + id] = fn;
+        try { calls.qualitiesPrimes.push(fn()); } catch (e) { calls.qualitiesPrimes.push(e); }
+      },
       onInteractiveSearch: (id, fn) => { handlers["isearch:" + id] = fn; },
       onInteractiveResolve: (id, fn) => { handlers["iresolve:" + id] = fn; },
       onPreview: (id, fn) => { handlers["preview:" + id] = fn; },

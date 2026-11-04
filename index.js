@@ -359,6 +359,9 @@ async function loadToolStatus(api) {
   }
   statusLoaded = true;
   statusLoadedAt = Date.now();
+  // The download qualities depend on ffmpeg; re-prime the host's cache of
+  // them whenever its presence changes (first load included).
+  if (qualitiesHaveFfmpeg !== !!ffmpegVersion) registerQualities(api);
 }
 
 // Re-read now and then, not once per session: the user updates yt-dlp from
@@ -3357,9 +3360,7 @@ async function activate(api) {
   }
 
   // ---- Download provider: qualities ----
-  api.downloads.onGetQualities("ytdlp-download", function () {
-    return staticQualityOptions(!!ffmpegVersion);
-  });
+  registerQualities(api);
 
   // ---- Download provider: by URI (ytdlp:// or legacy youtube://) ----
   api.downloads.onResolveByUri("ytdlp-download", async function (uri, format) {
@@ -3925,6 +3926,23 @@ async function activate(api) {
       renderSearchView(api);
     });
   }, 0);
+}
+
+// The download qualities handler. The host reads it synchronously from a
+// cache it fills when the handler is registered (a worker plugin can only
+// answer asynchronously, so each read returns the PREVIOUS answer). Registered
+// at activation the cache holds the audio-only list (ffmpeg isn't known yet),
+// so the first Download modal / MCP listQualities saw no video options at all.
+// loadToolStatus registers again whenever ffmpeg's presence changes (the first
+// load, an install from the view), which re-primes the cache with the real
+// list; re-registering replaces the old handler (same key).
+// The ffmpeg presence the host's cached list was primed with (null = never).
+var qualitiesHaveFfmpeg = null;
+function registerQualities(api) {
+  qualitiesHaveFfmpeg = !!ffmpegVersion;
+  api.downloads.onGetQualities("ytdlp-download", function () {
+    return staticQualityOptions(!!ffmpegVersion);
+  });
 }
 
 // Deliberately NOT a host global-search (Cmd+K) provider. It was one from
@@ -5587,6 +5605,7 @@ function renderSettings(api) {
 
 function deactivate() {
   ytDlpVersion = null; ffmpegVersion = null; statusLoaded = false; statusLoadedAt = 0;
+  qualitiesHaveFfmpeg = null;
   refusedSources = {};
   if (toolRecheckTimer) { clearTimeout(toolRecheckTimer); toolRecheckTimer = null; }
   inFlightFiles = {}; lastSourceFile = null;

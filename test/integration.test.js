@@ -110,6 +110,20 @@ test("qualities: original always; transcodes + video only when ffmpeg present", 
   assert.deepEqual(q2.map((x) => x.value), ["original"]);
 });
 
+// The host serves a worker plugin's qualities from a cache primed when the
+// handler registers. Registered only at activation (before ffmpeg is known),
+// that cache held the audio-only list, so the first Download modal / MCP
+// listQualities offered no video. The plugin re-registers once the tool
+// status has loaded, so the latest prime carries the full list.
+test("qualities: re-primed with the video options once ffmpeg is known", async () => {
+  const { api } = await activated({ exec: toolsPresent(BEHAVIOR) });
+  const primes = api.calls.qualitiesPrimes;
+  assert.ok(primes.length >= 2, "registered again after the tool status loaded");
+  assert.deepEqual(primes[0].map((x) => x.value), ["original"], "activation prime predates ffmpeg");
+  const last = primes[primes.length - 1].map((x) => x.value);
+  assert.ok(last.includes("video") && last.includes("video-1080"), "latest prime offers video");
+});
+
 // A ytdlp:// audio track (sidebar search, a saved playlist of one)
 // resolves here, not through the metadata fallback. A single URL string cannot
 // carry headers, so when the stream needs them the answer is a one-element
