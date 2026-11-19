@@ -1,8 +1,9 @@
 // Some uploads have every stream URL refused (HTTP 403) however often it is
 // minted, while the browser still plays them. The host's retries replayed the
-// same upload three times and gave up; these pin that, on a retry, the plugin
-// checks the fresh URL, moves on to the next search result when it is refused,
-// and never serves a cached URL of a refused upload again.
+// same upload three times and gave up; these pin that the plugin checks every
+// URL it mints (a first play included, since the host stops the playing track
+// to load what we hand it), moves on to the next search result when one is
+// refused, and never serves a cached URL of a refused upload again.
 
 const { test } = require("node:test");
 const assert = require("node:assert");
@@ -80,24 +81,37 @@ test("pickUnskipped takes the best candidate the skip rule leaves", () => {
   assert.deepEqual(plugin._pickUnskipped(ranked, () => true), { cand: null, skipped: 2 });
 });
 
-test("a first play is not probed", async () => {
-  const { resolve, probes } = await activated(["aaaaaaaaaaa"]);
-  const r = await resolve();
-  assert.ok(r.url.includes("aaaaaaaaaaa"));
-  assert.equal(probes.length, 0);
-});
-
-test("on the host's retry, a refused upload is passed over for the next search result", async () => {
+test("a first play checks its stream and passes a refused upload over for the next search result", async () => {
   const { api, resolve, probes } = await activated(["aaaaaaaaaaa"]);
-  await resolve();
-  const r = await resolve({ fresh: true });
-  assert.ok(r.url.includes("bbbbbbbbbbb"), "plays the second upload");
+  const r = await resolve();
+  assert.ok(r.url.includes("bbbbbbbbbbb"), "never hands over A's refused URL");
   assert.equal(r.sourceUrl, B);
-  assert.deepEqual(directCalls(api), [A, A, B]);
-  assert.equal(probes.length, 2, "the fresh A and the alternate B are both checked");
+  assert.deepEqual(directCalls(api), [A, B]);
+  assert.equal(probes.length, 2, "A and the alternate B are both checked");
   assert.equal(probes[0].init.headers.Range, "bytes=0-0");
   assert.equal(probes[0].init.headers["User-Agent"], "UA", "probed with the engine's headers");
   assert.equal(api.calls.exec.filter((c) => c.args.includes("--flat-playlist")).length, 1, "the search is served from cache");
+});
+
+test("a URL served from the cache is not checked again", async () => {
+  const { api, resolve, probes } = await activated([]);
+  await resolve();
+  assert.equal(probes.length, 1);
+  const r = await resolve();
+  assert.ok(r.url.includes("aaaaaaaaaaa"));
+  assert.equal(probes.length, 1, "checked when it was minted, not on the cache hit");
+  assert.deepEqual(directCalls(api), [A]);
+});
+
+test("on the host's retry, an upload refused since the first play is passed over", async () => {
+  const refused = [];
+  const { api, resolve, probes } = await activated(refused);
+  await resolve();
+  refused.push("aaaaaaaaaaa");
+  const r = await resolve({ fresh: true });
+  assert.ok(r.url.includes("bbbbbbbbbbb"), "plays the second upload");
+  assert.deepEqual(directCalls(api), [A, A, B], "the retry mints A again rather than serving the cached URL");
+  assert.equal(probes.length, 3);
 });
 
 test("after a refusal the next play goes straight to another upload, never the cached URL", async () => {
@@ -135,10 +149,12 @@ test("a probe that gets no answer hands the stream over as before", async () => 
 });
 
 test("a refused ytdlp:// track, which names one upload, resolves to nothing", async () => {
-  const { api, plugin } = await activated(["aaaaaaaaaaa"]);
+  const refused = [];
+  const { api, plugin } = await activated(refused);
   const id = plugin._encodeRef(A, false).slice("ytdlp://".length);
   const first = await api._handlers["streamuri:ytdlp"](id, null, {});
   assert.ok(first.candidates[0].url.includes("aaaaaaaaaaa"));
+  refused.push("aaaaaaaaaaa");
   const retry = await api._handlers["streamuri:ytdlp"](id, null, { fresh: true });
   assert.equal(retry, null);
   // The next ordinary play neither serves the URL cached before the refusal

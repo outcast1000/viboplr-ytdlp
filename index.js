@@ -2737,9 +2737,14 @@ function probeVerdict(status) {
 
 var STREAM_PROBE_TIMEOUT_MS = 8000;
 
-// Ask for the stream's first byte, with the headers the engine will send. Only
-// on the host's retry (`fresh`): a first play costs nothing extra, and by then
-// one URL of this source has already failed, so the question is worth a request.
+// Ask for the stream's first byte, with the headers the engine will send.
+// Every newly minted URL is checked, a first play included. Handing over an
+// unchecked one cost more than the request: the host stops the track that is
+// playing to load it, so a refused URL meant the music cut out at once and
+// stayed silent through the retry's whole re-resolve (30s+ when the next
+// uploads were refused too). Checked here, the playing track carries on while
+// we move to the next upload. A URL served from the cache isn't checked again,
+// because it was checked when it was minted.
 async function probeStream(api, streamUrl, headers, trace) {
   if (!api.network || typeof api.network.fetch !== "function") return "unknown";
   var settle = traceStep(trace, "check the stream answers");
@@ -2759,9 +2764,9 @@ async function probeStream(api, streamUrl, headers, trace) {
 }
 
 // Resolve a source URL to a PLAYABLE url. Returns { url, downloaded, headers }
-// or null. On the host's retry (`fresh`) it can also return { refused: true }:
-// the newly minted URL was refused too, so the source is marked refused and
-// not cached — the caller should try another source or give up. `headers` is set only for a direct stream (a downloaded file needs
+// or null. It can also return { refused: true }: the newly minted URL was
+// refused, so the source is marked refused and not cached, and the caller
+// should try another source or give up. `headers` is set only for a direct stream (a downloaded file needs
 // none) and only when the source asked for some.
 //
 // "stream" mode returns a direct URL only — it does NOT fall back to downloading
@@ -2795,22 +2800,19 @@ async function resolvePlayable(api, url, isVideo, fresh, trace) {
     cacheSettle("miss");
     var direct = await getDirectUrl(api, url, isVideo, trace);
     if (direct && direct.url) {
-      // A source already known to be refused is checked on an ordinary play
-      // too, so it costs one request instead of the host's three retries — and
-      // plays again as soon as the site lets it.
-      if (fresh || refused) {
-        // Probe after the release wait: before it, YouTube refuses with the
-        // same 403 a refused source gets.
-        await waitForStreamRelease(direct.availableAt, trace);
-        var verdict = await probeStream(api, direct.url, direct.headers, trace);
-        if (verdict === "refused") {
-          markRefusedSource(refusedSources, url, Date.now());
-          logLine(api, trace, "warn", "fresh URL refused as well — not caching it; " + url + " is skipped for "
-            + Math.round(REFUSED_SOURCE_TTL_MS / 60000) + " min");
-          return { refused: true };
-        }
-        if (verdict === "ok") delete refusedSources[url];
+      // Every newly minted URL is checked before it is handed over (see
+      // probeStream). A known-refused source plays again as soon as the site
+      // serves it. Probe after the release wait, because before it YouTube
+      // refuses with the same 403 a refused source gets.
+      await waitForStreamRelease(direct.availableAt, trace);
+      var verdict = await probeStream(api, direct.url, direct.headers, trace);
+      if (verdict === "refused") {
+        markRefusedSource(refusedSources, url, Date.now());
+        logLine(api, trace, "warn", "URL refused — not caching it; " + url + " is skipped for "
+          + Math.round(REFUSED_SOURCE_TTL_MS / 60000) + " min");
+        return { refused: true };
       }
+      if (verdict === "ok") delete refusedSources[url];
       var expiresAt = streamUrlExpiry(direct.url, Date.now());
       // null = the URL is already near its own deadline, so caching it would
       // only guarantee a dead hit later. Play it now, resolve again next time.
@@ -3065,9 +3067,9 @@ async function resolveFallbackCandidate(api, cand, title, artistName, preferVide
       var menu = await enumerateFormats(api, cand.url, maxVideoHeight, trace);
       var selfContained = selfContainedUrl(menu);
       if (menu.length && selfContained) {
-        // The menu isn't cached, so it is new on every resolve; on the host's
-        // retry, check one stream of it before handing the whole menu over.
-        if (fresh && await probeStream(api, selfContained, menuHeadersFor(menu, selfContained), trace) === "refused") {
+        // The menu isn't cached, so it is new on every resolve. Check one of its
+        // streams before handing over the whole menu (see probeStream).
+        if (await probeStream(api, selfContained, menuHeadersFor(menu, selfContained), trace) === "refused") {
           markRefusedSource(refusedSources, cand.url, Date.now());
           return { refused: true };
         }
@@ -3159,9 +3161,8 @@ async function activate(api) {
       // Each pass takes the best upload not known to be refused. A pass ends in
       // a stream, in nothing (no match / no stream — final), or in a refusal:
       // the source is then marked and the next pass takes the next search
-      // result, which the search cache answers without another yt-dlp run. A
-      // later upload is checked as well, since it is no more trusted than the
-      // first; that is what the `fresh` passed on below is for.
+      // result, which the search cache answers without another yt-dlp run. Every
+      // newly minted URL is checked, whichever pass minted it.
       for (var pass = 0; pass <= MAX_REFUSED_ALTERNATES; pass++) {
         // preferVideo → rank with the VIDEO profile (official MV / VEVO); plain
         // audio playback → the AUDIO profile (clean official-audio / Topic).
@@ -3171,7 +3172,7 @@ async function activate(api) {
           traceDone(trace, pass ? "every upload found was refused" : "no match for “" + title + "”", "warn");
           return null;
         }
-        var answer = await resolveFallbackCandidate(api, cand, title, artistName, preferVideo, opts, fresh || pass > 0, trace);
+        var answer = await resolveFallbackCandidate(api, cand, title, artistName, preferVideo, opts, fresh, trace);
         if (!answer || !answer.refused) return answer;
         traceLog(trace, "warn", "trying the next search result");
       }

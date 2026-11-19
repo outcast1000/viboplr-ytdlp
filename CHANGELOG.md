@@ -1,5 +1,8 @@
 # Changelog
 
+## v1.31.3
+- **The playing song no longer cuts out for a stream YouTube refuses.** The plugin now checks every new stream link before handing it to Viboplr, on the first play too, not only when Viboplr retries. Before, a refused link (HTTP 403) stopped the song that was playing straight away and left silence while the retry searched for another upload, which could take 30 seconds or more. Now the playing song carries on while the plugin moves to the next upload. The check costs one small request (usually under a second) and a link served from the cache isn't checked again.
+
 ## v1.31.2
 - The download window offers the video qualities (and the AAC / MP3 / FLAC re-encodes) the first time it opens. Before, the first look after Viboplr started could show only "Audio · Original", even with ffmpeg installed. Installing ffmpeg from the view updates the list too.
 
